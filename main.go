@@ -67,7 +67,7 @@ type config struct {
 	breakerFor     time.Duration // fail fast this long after a failure burst
 	failThreshold  int           // consecutive failures that trip the breaker
 	orphanAbove    uint64        // bytes: VRAM still held while the port is dead
-	notifyCmd      []string      // optional notifier: argv, message appended
+	rcService      string        // absolute path to rc-service (the restarter)
 }
 
 // envOr resolves a setting: the flag when given, else the environment variable, else
@@ -132,7 +132,7 @@ func loadConfig() config {
 		fMax      = flag.Int("restart-max", 0, "restarts allowed inside the window (env STADI_RESTART_MAX)")
 		fBreaker  = flag.String("breaker", "", "fail fast for this long after a failure burst (env STADI_BREAKER)")
 		fFails    = flag.Int("fail-threshold", 0, "consecutive failures that trip the breaker (env STADI_FAIL_THRESHOLD)")
-		fNotify   = flag.String("notify-cmd", "", "notifier command line, message appended (env STADI_NOTIFY_CMD)")
+		fRCSvc    = flag.String("rc-service", "", "path to rc-service, used to restart the router (env STADI_RC_SERVICE)")
 		fVersion  = flag.Bool("version", false, "print the version and exit")
 	)
 	flag.Parse()
@@ -170,8 +170,25 @@ func loadConfig() config {
 		breakerFor:     envOrDur(*fBreaker, "STADI_BREAKER", 20*time.Second),
 		failThreshold:  envOrInt(*fFails, "STADI_FAIL_THRESHOLD", 2),
 		orphanAbove:    uint64(1 << 30),
-		notifyCmd:      strings.Fields(envOr(*fNotify, "STADI_NOTIFY_CMD", "")),
+		rcService:      envOr(*fRCSvc, "STADI_RC_SERVICE", defaultRCService()),
 	}
+}
+
+// defaultRCService resolves the OpenRC client at startup. The warning for a reason:
+// a service started by supervise-daemon may have a PATH that does not include /sbin,
+// and a restarter that cannot be found is exactly the failure this file exists to
+// remove -- so resolve it once, absolutely, instead of trusting the environment.
+func defaultRCService() string {
+	if p, err := exec.LookPath("rc-service"); err == nil {
+		return p
+	}
+	for _, p := range []string{"/sbin/rc-service", "/usr/sbin/rc-service", "/bin/rc-service"} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	log.Printf("warning: rc-service was not found; the restart action will fail (set STADI_RC_SERVICE)")
+	return "rc-service"
 }
 
 // envOrInt is envOr's integer sibling: the flag when given, else the variable, else

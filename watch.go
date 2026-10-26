@@ -36,9 +36,9 @@ import (
 type llmWatch struct {
 	mu sync.Mutex
 
-	fails     int       // consecutive failures since the last success
-	openUntil time.Time // breaker: fail fast until this moment
-	restarts  []time.Time
+	fails      int       // consecutive failures since the last success
+	openUntil  time.Time // breaker: fail fast until this moment
+	restarts   []time.Time
 	restarting bool // a restart goroutine is in flight
 	degraded   bool // budget spent; stop restarting, keep failing fast politely
 	orphaned   bool // router down but its VRAM was never released
@@ -172,40 +172,25 @@ func (b *broker) recoverLLM(reason string) {
 					"restarting cannot free an orphaned context", float64(used)/(1<<30))
 				log.Printf("watch: %s", detail)
 				b.llm.markOrphaned(detail)
-				b.notify("stadi: " + detail)
 				return
 			}
 		}
 
 		log.Printf("watch: restarting %s after: %s", b.cfg.llmService, reason)
-		if out, err := exec.Command("rc-service", "--user", b.cfg.llmService, "restart").CombinedOutput(); err != nil {
+		if out, err := exec.Command(b.cfg.rcService, "--user", b.cfg.llmService, "restart").CombinedOutput(); err != nil {
 			detail := fmt.Sprintf("restart of %s failed: %v: %s", b.cfg.llmService, err, trim(string(out), 300))
 			log.Printf("watch: %s", detail)
-			b.llm.markOrphaned(detail) // no further attempts; a human decides
-			b.notify("stadi: " + detail)
+			b.llm.markOrphaned(detail) // no further attempts: a human decides
 			return
 		}
 		if err := waitPort(b.cfg.llm, b.cfg.llmRestartWait); err != nil {
 			detail := fmt.Sprintf("%s did not come back on %s within %s: %v",
 				b.cfg.llmService, b.cfg.llm, b.cfg.llmRestartWait, err)
 			log.Printf("watch: %s", detail)
-			b.notify("stadi: " + detail)
 			return
 		}
 		log.Printf("watch: %s is back on %s (%s)", b.cfg.llmService, b.cfg.llm, vramString())
 	}()
-}
-
-// notify runs an optional notifier (STADI_NOTIFY_CMD), best effort. An alerting path
-// that can break the broker would be worse than no alerting.
-func (b *broker) notify(msg string) {
-	if len(b.cfg.notifyCmd) == 0 {
-		return
-	}
-	args := append(append([]string{}, b.cfg.notifyCmd[1:]...), msg)
-	if err := exec.Command(b.cfg.notifyCmd[0], args...).Run(); err != nil {
-		log.Printf("watch: notifier failed: %v", err)
-	}
 }
 
 func trim(s string, n int) string {
