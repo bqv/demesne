@@ -58,6 +58,16 @@ type config struct {
 	sdBin     string
 	sdArgs    []string
 	sdLogDir  string
+
+	// LLM watch (watch.go). Traffic-driven: no timer, no health probe.
+	llmService     string        // the user service that owns the router
+	llmRestartWait time.Duration // how long a restart may take to become dialable
+	restartWindow  time.Duration // the budget's window
+	restartMax     int           // restarts allowed inside the window
+	breakerFor     time.Duration // fail fast this long after a failure burst
+	failThreshold  int           // consecutive failures that trip the breaker
+	orphanAbove    uint64        // bytes: VRAM still held while the port is dead
+	notifyCmd      []string      // optional notifier: argv, message appended
 }
 
 // envOr resolves a setting: the flag when given, else the environment variable, else
@@ -116,6 +126,13 @@ func loadConfig() config {
 		fSDBin    = flag.String("sd-bin", "", "sd-server binary (env STADI_SD_BIN; default: looked up on PATH)")
 		fSDArgs   = flag.String("sd-args", "", "the child's whole command line, space separated (env STADI_SD_ARGS)")
 		fSDLogDir = flag.String("sd-log-dir", "", "directory for the child's stdout/stderr (env STADI_SD_LOG_DIR)")
+		fLLMSvc   = flag.String("llm-service", "", "user service that owns the llama router (env STADI_LLM_SERVICE)")
+		fLLMWait  = flag.String("llm-restart-wait", "", "how long a router restart may take to answer (env STADI_LLM_RESTART_WAIT)")
+		fWin      = flag.String("restart-window", "", "window for the restart budget (env STADI_RESTART_WINDOW)")
+		fMax      = flag.Int("restart-max", 0, "restarts allowed inside the window (env STADI_RESTART_MAX)")
+		fBreaker  = flag.String("breaker", "", "fail fast for this long after a failure burst (env STADI_BREAKER)")
+		fFails    = flag.Int("fail-threshold", 0, "consecutive failures that trip the breaker (env STADI_FAIL_THRESHOLD)")
+		fNotify   = flag.String("notify-cmd", "", "notifier command line, message appended (env STADI_NOTIFY_CMD)")
 		fVersion  = flag.Bool("version", false, "print the version and exit")
 	)
 	flag.Parse()
@@ -145,7 +162,31 @@ func loadConfig() config {
 		sdBin:     envOr(*fSDBin, "STADI_SD_BIN", defaultSDBin()),
 		sdArgs:    args,
 		sdLogDir:  envOr(*fSDLogDir, "STADI_SD_LOG_DIR", defaultLogDir()),
+
+		llmService:     envOr(*fLLMSvc, "STADI_LLM_SERVICE", "llama"),
+		llmRestartWait: envOrDur(*fLLMWait, "STADI_LLM_RESTART_WAIT", 3*time.Minute),
+		restartWindow:  envOrDur(*fWin, "STADI_RESTART_WINDOW", 30*time.Minute),
+		restartMax:     envOrInt(*fMax, "STADI_RESTART_MAX", 2),
+		breakerFor:     envOrDur(*fBreaker, "STADI_BREAKER", 20*time.Second),
+		failThreshold:  envOrInt(*fFails, "STADI_FAIL_THRESHOLD", 2),
+		orphanAbove:    uint64(1 << 30),
+		notifyCmd:      strings.Fields(envOr(*fNotify, "STADI_NOTIFY_CMD", "")),
 	}
+}
+
+// envOrInt is envOr's integer sibling: the flag when given, else the variable, else
+// the default (and a non-positive result never disables a safety rule silently).
+func envOrInt(flagVal int, key string, def int) int {
+	if flagVal > 0 {
+		return flagVal
+	}
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			return n
+		}
+		log.Printf("warning: %s=%q is not a positive integer; using %d", key, v, def)
+	}
+	return def
 }
 
 // vramUsed reads the card's VRAM counter. The box has TWO GPUs (the 7900 XT and a
@@ -198,6 +239,8 @@ type broker struct {
 	timer *time.Timer
 
 	media int64 // media requests in flight, so a chat request can wait politely
+
+	llm *llmWatch // the LLM-side health policy (watch.go); its own mutex
 
 	sdProxy  *httputil.ReverseProxy
 	llmProxy *httputil.ReverseProxy
@@ -449,7 +492,10 @@ func isMetadata(p string) bool {
 	return false
 }
 
-func reverseProxy(b *broker, base string) *httputil.ReverseProxy {
+// reverseProxy builds the pass-through. isLLM adds the watch: a failed dial or a
+// stream that broke mid-body is the strongest possible evidence about the router, and
+// it arrives before any probe could fire, so the policy hangs off this edge.
+func reverseProxy(b *broker, base string, isLLM bool) *httputil.ReverseProxy {
 	target, err := url.Parse(base)
 	if err != nil {
 		log.Fatalf("bad target %q: %v", base, err)
@@ -460,7 +506,22 @@ func reverseProxy(b *broker, base string) *httputil.ReverseProxy {
 	p.FlushInterval = -1
 	p.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		log.Printf("%s %s -> %s: %v", r.Method, r.URL.Path, base, err)
+		if isLLM {
+			if restart := b.llm.fail(err, b.cfg.failThreshold, b.cfg.breakerFor); restart {
+				b.recoverLLM(err.Error())
+			}
+		}
 		http.Error(w, "stadi: upstream failed: "+err.Error(), http.StatusBadGateway)
+	}
+	if isLLM {
+		// Any answer below 500 means the engine really answered -- a streamed 200 is
+		// worth more than a health check, because it proves the model ran.
+		p.ModifyResponse = func(resp *http.Response) error {
+			if resp.StatusCode < 500 {
+				b.llm.ok()
+			}
+			return nil
+		}
 	}
 	return p
 }
@@ -505,6 +566,15 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case isMetadata(r.URL.Path):
 		b.llmProxy.ServeHTTP(w, r)
 	default:
+		// The breaker: once the router has failed a burst of requests, refuse new ones
+		// quickly instead of dialling a dead port once per client and letting each wait
+		// out its own timeout. A successful request clears it (see reverseProxy).
+		if open, wait := b.llm.failing(); open {
+			w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())))
+			http.Error(w, "stadi: the llama engine is failing; retry shortly (see /status)",
+				http.StatusServiceUnavailable)
+			return
+		}
 		// A chat request wants the card. If a render is in flight, wait a bounded
 		// while for it to finish -- then say so plainly instead of killing it.
 		if n := atomic.LoadInt64(&b.media); n > 0 {
@@ -544,6 +614,7 @@ func (b *broker) status(w http.ResponseWriter) {
 		"media_in_flight": atomic.LoadInt64(&b.media),
 		"idle_timeout_s":  b.cfg.idle.Seconds(),
 		"vram_used_gib":   float64(used) / (1 << 30),
+		"llm_health":      b.llm.snapshot(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
@@ -565,9 +636,9 @@ func main() {
 	log.SetPrefix("stadi: ")
 	cfg := loadConfig()
 
-	b := &broker{cfg: cfg}
-	b.sdProxy = reverseProxy(b, cfg.sd)
-	b.llmProxy = reverseProxy(b, cfg.llm)
+	b := &broker{cfg: cfg, llm: newLLMWatch()}
+	b.sdProxy = reverseProxy(b, cfg.sd, false)
+	b.llmProxy = reverseProxy(b, cfg.llm, true)
 
 	log.Printf("listening on %s | llm %s | sd %s | idle %s | vram %s",
 		cfg.listen, cfg.llm, cfg.sd, cfg.idle, vramString())
