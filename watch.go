@@ -115,6 +115,16 @@ func (w *llmWatch) budget(now time.Time, window time.Duration, max int) bool {
 	return true
 }
 
+// restarted clears the breaker once the service is listening again. The restart is
+// the strongest evidence available without a request, and leaving the breaker to run
+// out its window would keep answering 503 for the rest of it after a real recovery.
+func (w *llmWatch) restarted() {
+	w.mu.Lock()
+	w.fails = 0
+	w.openUntil = time.Time{}
+	w.mu.Unlock()
+}
+
 func (w *llmWatch) restartDone() {
 	w.mu.Lock()
 	w.restarting = false
@@ -189,6 +199,7 @@ func (b *broker) recoverLLM(reason string) {
 			log.Printf("watch: %s", detail)
 			return
 		}
+		b.llm.restarted()
 		log.Printf("watch: %s is back on %s (%s)", b.cfg.llmService, b.cfg.llm, vramString())
 	}()
 }
