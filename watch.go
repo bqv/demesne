@@ -1,8 +1,8 @@
-// stadi watch: the LLM-side health policy.
+// demesne watch: the LLM-side health policy.
 //
-// Why it lives in stadi: stadi sits on every request path, so it sees a dead or
-// wedged llama router on the first request that fails -- earlier and with better
-// evidence than any out-of-band probe, which has to wait for its own timer.
+// Why it lives here: demesne sits on every request path, so it sees a dead or wedged
+// llama router on the first request that fails -- earlier and with better evidence than
+// any out-of-band probe, which has to wait for its own timer.
 //
 // The motivating incident (2026-10-26):
 //
@@ -11,23 +11,33 @@
 //	21:46:38..21:46:59 five more refusals, ~15 GiB of VRAM still allocated
 //	(no restart; the card stayed hostage until the service was restarted at 22:16)
 //
-// The proxy knew 24 ms into the incident and only wrote it to a log. This file is
-// the policy that turns that knowledge into an action.
+// The proxy knew 24 ms into the incident and only wrote it to a log. This file is the
+// policy that turns that knowledge into an action.
 //
-// Deliberately traffic-driven: no tickers, no health probes, no allocation while
-// idle. A breaker plus one bounded restart, and a refusal to restart in a loop.
+// Deliberately traffic-driven: no tickers, no health probes, no allocation while idle.
+// A breaker plus one bounded restart, and a refusal to restart in a loop.
 //
-// What it will NOT do: reset the GPU driver, unload or choose a model, or kill the
-// sd child. If the router is gone and its VRAM never came back, the honest answer is
+// What it will NOT do: reset the GPU driver, unload or choose a model, or kill the sd
+// child. If the router is gone and its VRAM never came back, the honest answer is
 // "orphaned context, a restart cannot fix this" and a human decides -- a restart loop
 // would only burn disk and hide the fault.
-
+//
+// TWO ACTORS, ONE EVENT (fixed in the fork). This policy used to ask `rc-service --user
+// llama restart` for a router that supervise-daemon was already respawning every 5 s.
+// When demesne owns the router there is one actor: the supervisor, which restarts on
+// exit by itself. A death here is therefore a KILL of a wedged child, not a start, and
+// the supervisor does the rest. Only an engine left to OpenRC still takes the old path.
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os/exec"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -115,9 +125,9 @@ func (w *llmWatch) budget(now time.Time, window time.Duration, max int) bool {
 	return true
 }
 
-// restarted clears the breaker once the service is listening again. The restart is
-// the strongest evidence available without a request, and leaving the breaker to run
-// out its window would keep answering 503 for the rest of it after a real recovery.
+// restarted clears the breaker once the service is listening again. The restart is the
+// strongest evidence available without a request, and leaving the breaker to run out
+// its window would keep answering 503 for the rest of it after a real recovery.
 func (w *llmWatch) restarted() {
 	w.mu.Lock()
 	w.fails = 0
@@ -160,47 +170,111 @@ func (w *llmWatch) snapshot() map[string]any {
 	return s
 }
 
-// recoverLLM is the only mutation in this file: restart the llama service, then check
-// whether the card actually came back. It runs in its own goroutine so the failed
-// request returns immediately instead of waiting out a model load.
-func (b *broker) recoverLLM(reason string) {
-	if !b.llm.budget(time.Now(), b.cfg.restartWindow, b.cfg.restartMax) {
+// ------------------------------------------------------------- the router, itself
+
+// unloadLLM asks the router to drop every model it has resident. The router's unload is
+// async and force-kills a loading child, so its own answer is the authority. That is
+// what makes a resident router compatible with a media child: one gives the card back
+// by unloading, the other only by exiting.
+func (d *demesne) unloadLLM() {
+	ids, err := routerModels(d.cfg.llama.url)
+	if err != nil {
+		log.Printf("warning: cannot list router models: %v", err)
+		return
+	}
+	if len(ids) == 0 {
+		return
+	}
+	for _, id := range ids {
+		body := strings.NewReader(`{"model":` + strconv.Quote(id) + `}`)
+		req, err := http.NewRequest(http.MethodPost, d.cfg.llama.url+"/models/unload", body)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			log.Printf("unload %s: %v", id, err)
+			continue
+		}
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		resp.Body.Close()
+		log.Printf("unload %s -> %s %s", id, resp.Status, trim(string(msg), 200))
+	}
+}
+
+func routerModels(base string) ([]string, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(base + "/v1/models")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var payload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(payload.Data))
+	for _, m := range payload.Data {
+		ids = append(ids, m.ID)
+	}
+	return ids, nil
+}
+
+// recoverLLM is the only mutation in this file. It runs in its own goroutine so the
+// failed request returns immediately instead of waiting out a model load.
+func (d *demesne) recoverLLM(reason string) {
+	if !d.llm.budget(time.Now(), d.cfg.restartWindow, d.cfg.restartMax) {
 		log.Printf("watch: llama failed (%s) but no restart is allowed now "+
 			"(budget spent, or an earlier restart is still finishing) -- failing fast", reason)
 		return
 	}
 	go func() {
-		defer b.llm.restartDone()
+		defer d.llm.restartDone()
 
 		// Orphaned context: the engine is gone but the driver still holds its VRAM.
-		// Seen at 21:46 today: port dead, ~15 GiB still allocated. Restarting into
-		// that state cannot succeed -- llama would fail to allocate and we would be
-		// restarting in a loop, so say what it is and stop.
-		if !portAlive(b.cfg.llm) {
-			if used, err := vramUsed(); err == nil && used > b.cfg.orphanAbove {
+		// Seen at 21:46: port dead, ~15 GiB still allocated. Restarting into that state
+		// cannot succeed -- llama would fail to allocate and we would be restarting in a
+		// loop, so say what it is and stop.
+		if !portAlive(d.cfg.llama.url) {
+			if used, err := vramUsed(); err == nil && used > d.cfg.orphanAbove {
 				detail := fmt.Sprintf("llama is not listening but %.2f GiB of VRAM is still allocated; "+
 					"restarting cannot free an orphaned context", float64(used)/(1<<30))
 				log.Printf("watch: %s", detail)
-				b.llm.markOrphaned(detail)
+				d.llm.markOrphaned(detail)
 				return
 			}
 		}
 
-		log.Printf("watch: restarting %s after: %s", b.cfg.llmService, reason)
-		if out, err := exec.Command(b.cfg.rcService, "--user", b.cfg.llmService, "restart").CombinedOutput(); err != nil {
-			detail := fmt.Sprintf("restart of %s failed: %v: %s", b.cfg.llmService, err, trim(string(out), 300))
-			log.Printf("watch: %s", detail)
-			b.llm.markOrphaned(detail) // no further attempts: a human decides
+		if s := d.slotByName("llama"); s != nil && s.spec.own() {
+			// demesne owns the router: the supervisor is the only actor that starts it,
+			// so the useful thing here is to take down a child that is not answering.
+			// If it is already gone, this is a no-op and the supervisor is already
+			// dealing with it -- which is the double restart, removed.
+			log.Printf("watch: restarting the llama child after: %s", reason)
+			d.evict(s, "the watch decided the router is wedged")
 			return
 		}
-		if err := waitPort(b.cfg.llm, b.cfg.llmRestartWait); err != nil {
+
+		log.Printf("watch: restarting %s after: %s", d.cfg.llmService, reason)
+		if out, err := exec.Command(d.cfg.rcService, "--user", d.cfg.llmService, "restart").CombinedOutput(); err != nil {
+			detail := fmt.Sprintf("restart of %s failed: %v: %s", d.cfg.llmService, err, trim(string(out), 300))
+			log.Printf("watch: %s", detail)
+			d.llm.markOrphaned(detail) // no further attempts: a human decides
+			return
+		}
+		if err := waitPort(d.cfg.llama.url, d.cfg.llmRestartWait, d.done); err != nil {
 			detail := fmt.Sprintf("%s did not come back on %s within %s: %v",
-				b.cfg.llmService, b.cfg.llm, b.cfg.llmRestartWait, err)
+				d.cfg.llmService, d.cfg.llama.url, d.cfg.llmRestartWait, err)
 			log.Printf("watch: %s", detail)
 			return
 		}
-		b.llm.restarted()
-		log.Printf("watch: %s is back on %s (%s)", b.cfg.llmService, b.cfg.llm, vramString())
+		d.llm.restarted()
+		log.Printf("watch: %s is back on %s (%s)", d.cfg.llmService, d.cfg.llama.url, vramString())
 	}()
 }
 

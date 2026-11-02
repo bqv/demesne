@@ -1,22 +1,27 @@
-// stadi -- a GPU slot broker for the box's single 20 GiB card.
+// demesne -- the part of a manor the lord keeps in his own hand: the resident set.
 //
-// Both local engines want the whole card and cannot share it:
+// demesne is the single owner of the local-inference estate on this box. Four engines
+// run here and three of them contend for something scarce:
 //
-//   - the llama router keeps a resident rung (17.6-19.7 GiB of 19.98);
-//   - stable-diffusion.cpp's DiT wants ~15.8 GiB, and unlike the router it has no
-//     way to give it back: sd-server holds its weights until the PROCESS exits.
+//	llama   :55555  the llama.cpp router. Keeps a resident rung: 17.6-19.7 GiB of 19.98.
+//	sd      :55557  stable-diffusion.cpp. A DiT wants ~12.5 GiB and it CANNOT unload --
+//	                there is no flag and no endpoint, only the process exiting frees
+//	                the weights (measured 12.5 GiB -> 0.03 GiB).
+//	llamb   :55556  the aux router on the second card (GT 1030). Supervised, not routed:
+//	                its clients address it directly.
+//	whisper :55559  whisper.cpp, CPU-only. It used to claim 55557 as well -- the port
+//	                story slot.go settles.
 //
-// Neither knows the other exists, so whichever runs first wins and the other OOMs
-// mid-load. stadi sits in front of both and owns the slot:
+// The rules are in slot.go; this file is configuration, routing, /status and the
+// operator's CLI.
 //
-//	media request    -> unload the router's models, spawn an sd-server child, proxy
-//	chat request     -> stop the child, wait for the VRAM to actually return, proxy
-//	metadata request -> proxy untouched (the router's /v1/models loads nothing)
-//
-// The child is stopped after IDLE with no media request, so the card is never held
-// hostage. Because stadi is an OpenRC service it lives outside the sandbox, which
-// is what makes starting sd-server possible at all: a sandboxed session cannot run
-// rc-service, and sd-cli cannot see /dev/dri. stadi needs neither.
+// stadi's duties survive unchanged: the proxy in front of the router, the LLM breaker,
+// idle eviction of the media child, /status. What changes is that demesne fork/execs
+// the engines it owns instead of asking rc-service to do it, so there is ONE actor per
+// restart -- the double restart (supervise-daemon respawning llama every 5 s while
+// recoverLLM asked rc-service for the same thing) cannot happen. An engine can still be
+// left to OpenRC: give it no command line and it stays policyExternal, routed and never
+// touched.
 //
 // No third-party code: stdlib only, so it builds with no module cache and no network.
 package main
@@ -26,9 +31,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -44,140 +47,151 @@ import (
 	"time"
 )
 
-const version = "0.2.0"
+const version = "0.3.0" // 0.2.0 was stadi at ad49321; the fork line starts here
 
-type config struct {
-	listen    string        // where stadi itself listens
-	llm       string        // the llama router
-	sd        string        // where the sd child is expected to come up
-	idle      time.Duration // kill the child after this long with no media request
-	busyWait  time.Duration // how long a chat request waits for a render to finish
-	vramWait  time.Duration // how long to wait for VRAM to return
-	loadWait  time.Duration // how long to wait for the sd child's port
-	freeBelow uint64        // bytes: "the card is free" threshold
-	sdBin     string
-	sdArgs    []string
-	sdLogDir  string
+// The environment keeps stadi's names working, because conf.d/stadi already exports
+// them and a rename that breaks the deployed service at boot is not a rename, it is an
+// outage. DEMESNE_* wins; STADI_* is read with a note.
+const (
+	envPrefix    = "DEMESNE_"
+	legacyPrefix = "STADI_"
+)
 
-	// LLM watch (watch.go). Traffic-driven: no timer, no health probe.
-	llmService     string        // the user service that owns the router
-	llmRestartWait time.Duration // how long a restart may take to become dialable
-	restartWindow  time.Duration // the budget's window
-	restartMax     int           // restarts allowed inside the window
-	breakerFor     time.Duration // fail fast this long after a failure burst
-	failThreshold  int           // consecutive failures that trip the breaker
-	orphanAbove    uint64        // bytes: VRAM still held while the port is dead
-	rcService      string        // absolute path to rc-service (the restarter)
+// ---------------------------------------------------------------- configuration
+
+// engineConfig is one engine's static configuration: where it answers, what to run,
+// and the memory fence that used to live in its init script.
+type engineConfig struct {
+	url    string
+	bin    string
+	args   []string
+	env    []string
+	cgroup memLimit
 }
 
-// envOr resolves a setting: the flag when given, else the environment variable, else
-// the built-in default. Flags win, but an existing conf.d of env vars keeps working
-// unchanged, so the service needs no flag plumbing to stay correct.
-func envOr(flagVal, key, def string) string {
+type config struct {
+	listen                    string // where demesne itself listens
+	sd, llama, llamb, whisper engineConfig
+	idle                      time.Duration // evict an on-demand child after this
+	whisperIdle               time.Duration
+	busyWait                  time.Duration // a chat request waits this long for a render
+	vramWait                  time.Duration // bound on waiting for the card to return
+	loadWait                  time.Duration // bound on a child's port appearing
+	freeBelow                 uint64        // bytes: "the card is free" threshold
+	orphanAbove               uint64        // bytes: VRAM still held while the port is dead
+	logDir                    string
+	cgroupRoot                string
+	cgroupPrepare             string // cgroup-prepare helper (root, via sudo -n)
+	cgroupJoin                string
+	restartDelay              time.Duration // first delay between resident restarts
+
+	// LLM watch (watch.go). Traffic-driven: no timer, no health probe.
+	llmService     string        // legacy: the OpenRC service that owns the router
+	llmRestartWait time.Duration // how long a legacy restart may take to become dialable
+	restartWindow  time.Duration
+	restartMax     int
+	breakerFor     time.Duration
+	failThreshold  int
+	rcService      string // absolute path to rc-service (the legacy restarter)
+}
+
+// envString resolves a setting: the flag when given, else DEMESNE_<key>, else
+// STADI_<key> (with a note), else the default. Flags win, but an existing conf.d keeps
+// working unchanged, so the service needs no flag plumbing to stay correct.
+func envString(flagVal, key, def string) string {
 	if flagVal != "" {
 		return flagVal
 	}
-	if e := os.Getenv(key); e != "" {
-		return e
+	if v := os.Getenv(envPrefix + key); v != "" {
+		return v
+	}
+	if v := os.Getenv(legacyPrefix + key); v != "" {
+		log.Printf("note: %s%s is the old name for %s%s; both are read for now",
+			legacyPrefix, key, envPrefix, key)
+		return v
 	}
 	return def
 }
 
-func envOrDur(flagVal, key string, def time.Duration) time.Duration {
-	s := envOr(flagVal, key, "")
+func envDur(flagVal, key string, def time.Duration) time.Duration {
+	s := envString(flagVal, key, "")
 	if s == "" {
 		return def
 	}
 	d, err := time.ParseDuration(s)
 	if err != nil {
-		log.Printf("bad duration %q (flag or %s), using %s", s, key, def)
+		log.Printf("bad duration %q (flag or %s%s), using %s", s, envPrefix, key, def)
 		return def
 	}
 	return d
 }
 
+// envInt is envDur's integer sibling: a non-positive result never silently disables a
+// safety rule.
+func envInt(flagVal int, key string, def int) int {
+	if flagVal > 0 {
+		return flagVal
+	}
+	for _, name := range []string{envPrefix + key, legacyPrefix + key} {
+		v := os.Getenv(name)
+		if v == "" {
+			continue
+		}
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			return n
+		}
+		log.Printf("warning: %s=%q is not a positive integer; using %d", name, v, def)
+		return def
+	}
+	return def
+}
+
+func fields(s string) []string { return strings.Fields(s) }
+
+// memLimitFor reads a slot's memory fence from the environment. Env-only on purpose:
+// these are set once in conf.d/demesne, never typed on a command line, and there are
+// three of them per slot.
+func memLimitFor(root, slot string) memLimit {
+	m := memLimit{
+		leaf:     filepath.Join(root, slot),
+		high:     envRaw(slot + "_MEMORY_HIGH"),
+		max:      envRaw(slot + "_MEMORY_MAX"),
+		swapHigh: envRaw(slot + "_SWAP_HIGH"),
+	}
+	if m.high == "" && m.max == "" && m.swapHigh == "" {
+		return memLimit{}
+	}
+	return m
+}
+
+func envRaw(key string) string {
+	if v := os.Getenv(envPrefix + key); v != "" {
+		return v
+	}
+	return os.Getenv(legacyPrefix + strings.ToUpper(key))
+}
+
 // defaultLogDir follows the XDG cache location rather than assuming a home path.
-// A hardcoded /home/... is how a tool becomes wrong on someone else's machine.
 func defaultLogDir() string {
 	if d, err := os.UserCacheDir(); err == nil {
-		return filepath.Join(d, "stadi")
+		return filepath.Join(d, "demesne")
 	}
-	return filepath.Join(os.TempDir(), "stadi")
+	return filepath.Join(os.TempDir(), "demesne")
 }
 
-// defaultSDBin finds sd-server on PATH instead of assuming /usr/bin.
-func defaultSDBin() string {
-	if p, err := exec.LookPath("sd-server"); err == nil {
+// defaultBin finds a binary on PATH instead of assuming /usr/bin. Empty when absent:
+// for the engines demesne may adopt, "not installed" must mean "not adopted", never
+// "adopted a name that does not resolve".
+func defaultBin(name string) string {
+	if p, err := exec.LookPath(name); err == nil {
 		return p
 	}
-	return "sd-server"
+	return ""
 }
 
-func loadConfig() config {
-	var (
-		fListen   = flag.String("listen", "", "address to listen on (env STADI_LISTEN)")
-		fLLM      = flag.String("llm", "", "llama router base URL (env STADI_LLM)")
-		fSD       = flag.String("sd", "", "URL the sd child comes up on (env STADI_SD)")
-		fIdle     = flag.String("idle", "", "stop the child after this long with no media request (env STADI_IDLE)")
-		fBusyWait = flag.String("busy-wait", "", "how long a chat request waits for a render (env STADI_BUSY_WAIT)")
-		fVramWait = flag.String("vram-wait", "", "bound on waiting for the card to come back (env STADI_VRAM_WAIT)")
-		fLoadWait = flag.String("load-wait", "", "bound on the child's port appearing (env STADI_LOAD_WAIT)")
-		fFreeGiB  = flag.Float64("free-gib", 2, "treat the card as free below this many GiB used")
-		fSDBin    = flag.String("sd-bin", "", "sd-server binary (env STADI_SD_BIN; default: looked up on PATH)")
-		fSDArgs   = flag.String("sd-args", "", "the child's whole command line, space separated (env STADI_SD_ARGS)")
-		fSDLogDir = flag.String("sd-log-dir", "", "directory for the child's stdout/stderr (env STADI_SD_LOG_DIR)")
-		fLLMSvc   = flag.String("llm-service", "", "user service that owns the llama router (env STADI_LLM_SERVICE)")
-		fLLMWait  = flag.String("llm-restart-wait", "", "how long a router restart may take to answer (env STADI_LLM_RESTART_WAIT)")
-		fWin      = flag.String("restart-window", "", "window for the restart budget (env STADI_RESTART_WINDOW)")
-		fMax      = flag.Int("restart-max", 0, "restarts allowed inside the window (env STADI_RESTART_MAX)")
-		fBreaker  = flag.String("breaker", "", "fail fast for this long after a failure burst (env STADI_BREAKER)")
-		fFails    = flag.Int("fail-threshold", 0, "consecutive failures that trip the breaker (env STADI_FAIL_THRESHOLD)")
-		fRCSvc    = flag.String("rc-service", "", "path to rc-service, used to restart the router (env STADI_RC_SERVICE)")
-		fVersion  = flag.Bool("version", false, "print the version and exit")
-	)
-	flag.Parse()
-	if *fVersion {
-		fmt.Println("stadi " + version)
-		os.Exit(0)
-	}
-
-	raw := envOr(*fSDArgs, "STADI_SD_ARGS", "")
-	args := strings.Fields(raw)
-	if len(args) == 0 {
-		log.Fatal("no sd-server command line given: pass --sd-args \"...\" or set STADI_SD_ARGS")
-	}
-	freeGiB := *fFreeGiB
-	if freeGiB <= 0 {
-		freeGiB = 2
-	}
-	return config{
-		listen:    envOr(*fListen, "STADI_LISTEN", "127.0.0.1:55558"),
-		llm:       envOr(*fLLM, "STADI_LLM", "http://127.0.0.1:55555"),
-		sd:        envOr(*fSD, "STADI_SD", "http://127.0.0.1:55557"),
-		idle:      envOrDur(*fIdle, "STADI_IDLE", 5*time.Minute),
-		busyWait:  envOrDur(*fBusyWait, "STADI_BUSY_WAIT", 2*time.Minute),
-		vramWait:  envOrDur(*fVramWait, "STADI_VRAM_WAIT", 45*time.Second),
-		loadWait:  envOrDur(*fLoadWait, "STADI_LOAD_WAIT", 15*time.Minute),
-		freeBelow: uint64(freeGiB * float64(1<<30)),
-		sdBin:     envOr(*fSDBin, "STADI_SD_BIN", defaultSDBin()),
-		sdArgs:    args,
-		sdLogDir:  envOr(*fSDLogDir, "STADI_SD_LOG_DIR", defaultLogDir()),
-
-		llmService:     envOr(*fLLMSvc, "STADI_LLM_SERVICE", "llama"),
-		llmRestartWait: envOrDur(*fLLMWait, "STADI_LLM_RESTART_WAIT", 3*time.Minute),
-		restartWindow:  envOrDur(*fWin, "STADI_RESTART_WINDOW", 30*time.Minute),
-		restartMax:     envOrInt(*fMax, "STADI_RESTART_MAX", 2),
-		breakerFor:     envOrDur(*fBreaker, "STADI_BREAKER", 20*time.Second),
-		failThreshold:  envOrInt(*fFails, "STADI_FAIL_THRESHOLD", 2),
-		orphanAbove:    uint64(1 << 30),
-		rcService:      envOr(*fRCSvc, "STADI_RC_SERVICE", defaultRCService()),
-	}
-}
-
-// defaultRCService resolves the OpenRC client at startup. The warning for a reason:
-// a service started by supervise-daemon may have a PATH that does not include /sbin,
-// and a restarter that cannot be found is exactly the failure this file exists to
-// remove -- so resolve it once, absolutely, instead of trusting the environment.
+// defaultRCService resolves the OpenRC client. The warning is for a reason: a service
+// started by supervise-daemon may have a PATH without /sbin, and a restarter that
+// cannot be found is exactly the failure this file exists to remove.
 func defaultRCService() string {
 	if p, err := exec.LookPath("rc-service"); err == nil {
 		return p
@@ -187,28 +201,254 @@ func defaultRCService() string {
 			return p
 		}
 	}
-	log.Printf("warning: rc-service was not found; the restart action will fail (set STADI_RC_SERVICE)")
+	log.Printf("warning: rc-service was not found; the legacy restart action will fail")
 	return "rc-service"
 }
 
-// envOrInt is envOr's integer sibling: the flag when given, else the variable, else
-// the default (and a non-positive result never disables a safety rule silently).
-func envOrInt(flagVal int, key string, def int) int {
-	if flagVal > 0 {
-		return flagVal
+func loadConfig() config {
+	var (
+		fListen  = flag.String("listen", "", "address to listen on (env "+envPrefix+"LISTEN)")
+		fLLM     = flag.String("llm", "", "the llama router's base URL (env "+envPrefix+"LLM)")
+		fSD      = flag.String("sd", "", "URL the sd child comes up on (env "+envPrefix+"SD)")
+		fLlamb   = flag.String("llamb", "", "the auxiliary router's base URL (env "+envPrefix+"LLAMB)")
+		fWhisper = flag.String("whisper", "", "URL the whisper child comes up on (env "+envPrefix+"WHISPER)")
+
+		fIdle        = flag.String("idle", "", "evict an on-demand child after this long with no request (env "+envPrefix+"IDLE)")
+		fWhisperIdle = flag.String("whisper-idle", "", "the same for whisper (env "+envPrefix+"WHISPER_IDLE)")
+		fBusyWait    = flag.String("busy-wait", "", "how long a chat request waits for a render (env "+envPrefix+"BUSY_WAIT)")
+		fVramWait    = flag.String("vram-wait", "", "bound on waiting for the card to come back (env "+envPrefix+"VRAM_WAIT)")
+		fLoadWait    = flag.String("load-wait", "", "bound on a child's port appearing (env "+envPrefix+"LOAD_WAIT)")
+		fFreeGiB     = flag.Float64("free-gib", 2, "treat the card as free below this many GiB used")
+		fRestartWait = flag.String("restart-delay", "", "first delay between resident restarts (env "+envPrefix+"RESTART_DELAY)")
+
+		fLogDir    = flag.String("log-dir", "", "directory for demesne's and the children's logs (env "+envPrefix+"LOG_DIR)")
+		fSDLogDir  = flag.String("sd-log-dir", "", "deprecated: use -log-dir")
+		fCgroup    = flag.String("cgroup-root", "", "delegated cgroup v2 subtree for the slots (env "+envPrefix+"CGROUP_ROOT)")
+		fCgPrepare = flag.String("cgroup-prepare", "", "cgroup-prepare helper, run via sudo -n (env "+envPrefix+"CGROUP_PREPARE)")
+		fCgJoin    = flag.String("cgroup-join", "", "cgroup-join helper, run via sudo -n (env "+envPrefix+"CGROUP_JOIN)")
+
+		fSDBin  = flag.String("sd-bin", "", "sd-server binary (env "+envPrefix+"SD_BIN; default: PATH)")
+		fSDArgs = flag.String("sd-args", "", "the sd child's whole command line (env "+envPrefix+"SD_ARGS)")
+		fSDEnv  = flag.String("sd-env", "", "extra KEY=VALUE for the sd child (env "+envPrefix+"SD_ENV)")
+
+		fLlamaBin  = flag.String("llama-bin", "", "adopt the llama router: its binary (env "+envPrefix+"LLAMA_BIN; empty = leave it to OpenRC)")
+		fLlamaArgs = flag.String("llama-args", "", "the router's whole command line (env "+envPrefix+"LLAMA_ARGS)")
+		fLlamaEnv  = flag.String("llama-env", "", "extra KEY=VALUE for the router (env "+envPrefix+"LLAMA_ENV)")
+
+		fLlambBin  = flag.String("llamb-bin", "", "adopt the aux router: its binary (env "+envPrefix+"LLAMB_BIN; empty = leave it to OpenRC)")
+		fLlambArgs = flag.String("llamb-args", "", "the aux router's whole command line (env "+envPrefix+"LLAMB_ARGS)")
+		fLlambEnv  = flag.String("llamb-env", "", "extra KEY=VALUE for the aux router (env "+envPrefix+"LLAMB_ENV)")
+
+		fWhisperBin  = flag.String("whisper-bin", "", "adopt whisper: its binary (env "+envPrefix+"WHISPER_BIN)")
+		fWhisperArgs = flag.String("whisper-args", "", "whisper's whole command line (env "+envPrefix+"WHISPER_ARGS)")
+		fWhisperEnv  = flag.String("whisper-env", "", "extra KEY=VALUE for whisper (env "+envPrefix+"WHISPER_ENV)")
+
+		fLLMSvc  = flag.String("llm-service", "", "legacy: the OpenRC service that owns the router (env "+envPrefix+"LLM_SERVICE)")
+		fLLMWait = flag.String("llm-restart-wait", "", "legacy: how long a router restart may take to answer (env "+envPrefix+"LLM_RESTART_WAIT)")
+		fWin     = flag.String("restart-window", "", "window for the restart budget (env "+envPrefix+"RESTART_WINDOW)")
+		fMax     = flag.Int("restart-max", 0, "restarts allowed inside the window (env "+envPrefix+"RESTART_MAX)")
+		fBreaker = flag.String("breaker", "", "fail fast for this long after a failure burst (env "+envPrefix+"BREAKER)")
+		fFails   = flag.Int("fail-threshold", 0, "consecutive failures that trip the breaker (env "+envPrefix+"FAIL_THRESHOLD)")
+		fRCSvc   = flag.String("rc-service", "", "path to rc-service, used by the legacy restarter (env "+envPrefix+"RC_SERVICE)")
+		fVersion = flag.Bool("version", false, "print the version and exit")
+	)
+	flag.Parse()
+
+	if *fVersion {
+		fmt.Println("demesne " + version)
+		os.Exit(0)
 	}
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
-			return n
-		}
-		log.Printf("warning: %s=%q is not a positive integer; using %d", key, v, def)
+
+	logDir := envString(*fLogDir, "LOG_DIR", "")
+	if logDir == "" {
+		// conf.d/stadi passes --sd-log-dir; the name is now too narrow, but breaking
+		// a deployed flag set to win an argument about spelling is a bad trade.
+		logDir = envString(*fSDLogDir, "SD_LOG_DIR", "")
 	}
-	return def
+	if logDir == "" {
+		logDir = defaultLogDir()
+	}
+
+	freeGiB := *fFreeGiB
+	if freeGiB <= 0 {
+		freeGiB = 2
+	}
+	cgroupRoot := envString(*fCgroup, "CGROUP_ROOT", "/sys/fs/cgroup/demesne")
+
+	return config{
+		listen: envString(*fListen, "LISTEN", "127.0.0.1:55558"),
+		sd: engineConfig{
+			url:    envString(*fSD, "SD", "http://127.0.0.1:55557"),
+			bin:    envString(*fSDBin, "SD_BIN", defaultBin("sd-server")),
+			args:   fields(envString(*fSDArgs, "SD_ARGS", "")),
+			env:    fields(envString(*fSDEnv, "SD_ENV", "")),
+			cgroup: memLimitFor(cgroupRoot, "sd"),
+		},
+		llama: engineConfig{
+			url:    envString(*fLLM, "LLM", "http://127.0.0.1:55555"),
+			bin:    envString(*fLlamaBin, "LLAMA_BIN", ""),
+			args:   fields(envString(*fLlamaArgs, "LLAMA_ARGS", "")),
+			env:    fields(envString(*fLlamaEnv, "LLAMA_ENV", "")),
+			cgroup: memLimitFor(cgroupRoot, "llama"),
+		},
+		llamb: engineConfig{
+			url:    envString(*fLlamb, "LLAMB", "http://127.0.0.1:55556"),
+			bin:    envString(*fLlambBin, "LLAMB_BIN", ""),
+			args:   fields(envString(*fLlambArgs, "LLAMB_ARGS", "")),
+			env:    fields(envString(*fLlambEnv, "LLAMB_ENV", "")),
+			cgroup: memLimitFor(cgroupRoot, "llamb"),
+		},
+		whisper: engineConfig{
+			url:    envString(*fWhisper, "WHISPER", "http://127.0.0.1:55559"),
+			bin:    envString(*fWhisperBin, "WHISPER_BIN", ""),
+			args:   fields(envString(*fWhisperArgs, "WHISPER_ARGS", "")),
+			env:    fields(envString(*fWhisperEnv, "WHISPER_ENV", "")),
+			cgroup: memLimitFor(cgroupRoot, "whisper"),
+		},
+		idle:          envDur(*fIdle, "IDLE", 5*time.Minute),
+		whisperIdle:   envDur(*fWhisperIdle, "WHISPER_IDLE", 10*time.Minute),
+		busyWait:      envDur(*fBusyWait, "BUSY_WAIT", 2*time.Minute),
+		vramWait:      envDur(*fVramWait, "VRAM_WAIT", 45*time.Second),
+		loadWait:      envDur(*fLoadWait, "LOAD_WAIT", 15*time.Minute),
+		freeBelow:     uint64(freeGiB * float64(1<<30)),
+		orphanAbove:   uint64(1 << 30),
+		logDir:        logDir,
+		cgroupRoot:    cgroupRoot,
+		cgroupPrepare: envString(*fCgPrepare, "CGROUP_PREPARE", defaultBin("cgroup-prepare")),
+		cgroupJoin:    envString(*fCgJoin, "CGROUP_JOIN", defaultBin("cgroup-join")),
+		restartDelay:  envDur(*fRestartWait, "RESTART_DELAY", 5*time.Second),
+
+		llmService:     envString(*fLLMSvc, "LLM_SERVICE", "llama"),
+		llmRestartWait: envDur(*fLLMWait, "LLM_RESTART_WAIT", 3*time.Minute),
+		restartWindow:  envDur(*fWin, "RESTART_WINDOW", 30*time.Minute),
+		restartMax:     envInt(*fMax, "RESTART_MAX", 2),
+		breakerFor:     envDur(*fBreaker, "BREAKER", 20*time.Second),
+		failThreshold:  envInt(*fFails, "FAIL_THRESHOLD", 2),
+		rcService:      envString(*fRCSvc, "RC_SERVICE", defaultRCService()),
+	}
 }
 
-// vramUsed reads the card's VRAM counter. The box has TWO GPUs (the 7900 XT and a
-// GT 1030), and /dev/dri node numbers move between boots, so pick the device with
-// the largest total rather than hardcoding a card index.
+// validate refuses the configurations that cannot be true. The first is the sd
+// command line (there is no sensible default for it); the rest are the invariants the
+// slot model relies on: one slot per port, and one resident holder of a card per group.
+func (c config) validate(slots []*slot) error {
+	if len(c.sd.args) == 0 {
+		return fmt.Errorf("no sd-server command line given: pass -sd-args \"...\" or set %sSD_ARGS", envPrefix)
+	}
+	ports := map[int]string{}
+	for _, s := range slots {
+		if s.spec.url == "" {
+			continue
+		}
+		p := s.port()
+		if p == 0 {
+			return fmt.Errorf("%s: cannot read a port from %q", s.spec.name, s.spec.url)
+		}
+		if other, taken := ports[p]; taken {
+			return fmt.Errorf("two slots claim port %d: %s and %s. A port belongs to exactly "+
+				"one slot; move one of them (whisper is CPU-only and does not need 55557)",
+				p, other, s.spec.name)
+		}
+		ports[p] = s.spec.name
+	}
+	card := map[string]string{}
+	for _, s := range slots {
+		if s.spec.policy != policyResident || !s.spec.vram || s.spec.group == "" {
+			continue
+		}
+		if other, taken := card[s.spec.group]; taken {
+			return fmt.Errorf("%s and %s would both keep the card in group %q: at most one "+
+				"resident holder per exclusivity group", other, s.spec.name, s.spec.group)
+		}
+		card[s.spec.group] = s.spec.name
+	}
+	return nil
+}
+
+// buildSlots turns the configuration into the estate. This is the whole slot model in
+// data: the lifecycle in slot.go is generic, and a fifth engine is a literal here.
+func buildSlots(c config) []slotSpec {
+	resident := func(name string, e engineConfig, group string, routed bool, idle time.Duration) slotSpec {
+		own := e.bin != ""
+		pol := policyResident
+		if !own {
+			pol = policyExternal
+		}
+		return slotSpec{
+			name: name, url: e.url, bin: e.bin, args: e.args, env: e.env,
+			group: group, vram: true, policy: pol, idle: idle,
+			routed: routed, fallback: true, cgroup: e.cgroup,
+		}
+	}
+	whisperPolicy := policyOnDemand
+	if c.whisper.bin == "" {
+		whisperPolicy = policyExternal // exists as a route, answers 503, never spawns
+	}
+	return []slotSpec{
+		// The router: resident, and it keeps the card by keeping models.
+		resident("llama", c.llama, "gpu", true, 0),
+		// The media child: on demand, because it has no other way to give the card back.
+		{
+			name: "sd", url: c.sd.url, bin: c.sd.bin, args: c.sd.args, env: c.sd.env,
+			group: "gpu", vram: true, policy: policyOnDemand, idle: c.idle,
+			routed: true, fallback: false, cgroup: c.sd.cgroup,
+		},
+		// CPU-only and therefore in no group: it contends for neither the card nor a
+		// conversation about it. Its port is its own business (55559), which is what
+		// ends the 55557 collision instead of arbitrating it at runtime.
+		{
+			name: "whisper", url: c.whisper.url, bin: c.whisper.bin,
+			args: c.whisper.args, env: c.whisper.env,
+			group: "", vram: false, policy: whisperPolicy, idle: c.whisperIdle,
+			routed: true, fallback: false, cgroup: c.whisper.cgroup,
+		},
+		// The second card's router: supervised, not routed. Its callers address 55556
+		// directly; demesne owns it because something has to own the restart.
+		resident("llamb", c.llamb, "aux", false, 0),
+	}
+}
+
+// ----------------------------------------------------------------------- estate
+
+type demesne struct {
+	cfg   config
+	slots []*slot
+	index map[string]*slot
+
+	transition sync.Mutex // one transition at a time; never held across a proxy
+	proxies    map[string]*httputil.ReverseProxy
+	llm        *llmWatch
+
+	done    chan struct{}
+	closing atomic.Bool
+}
+
+func newDemesne(cfg config) *demesne {
+	d := &demesne{
+		cfg:     cfg,
+		index:   map[string]*slot{},
+		proxies: map[string]*httputil.ReverseProxy{},
+		llm:     newLLMWatch(),
+		done:    make(chan struct{}),
+	}
+	for _, spec := range buildSlots(cfg) {
+		s := &slot{spec: spec}
+		d.slots = append(d.slots, s)
+		d.index[spec.name] = s
+	}
+	for _, s := range d.slots {
+		d.proxies[s.spec.name] = reverseProxy(d, s.spec.url, s.spec.name == "llama")
+	}
+	return d
+}
+
+func (d *demesne) slotByName(name string) *slot { return d.index[name] }
+
+// ------------------------------------------------------------------- the card
+
+// vramUsed reads the 20 GiB card's counter. The box has more than one GPU, and
+// /dev/dri node numbers move between boots, so pick the device with the largest total
+// rather than hardcoding a card index.
 func vramUsed() (uint64, error) {
 	totals, err := filepath.Glob("/sys/class/drm/card*/device/mem_info_vram_total")
 	if err != nil || len(totals) == 0 {
@@ -247,217 +487,6 @@ func vramString() string {
 	return fmt.Sprintf("%.3f GiB", float64(used)/(1<<30))
 }
 
-type broker struct {
-	cfg config
-
-	mu    sync.Mutex // serialises slot transitions, never held across a proxy
-	child *exec.Cmd
-	up    bool
-	timer *time.Timer
-
-	media int64 // media requests in flight, so a chat request can wait politely
-
-	llm *llmWatch // the LLM-side health policy (watch.go); its own mutex
-
-	sdProxy  *httputil.ReverseProxy
-	llmProxy *httputil.ReverseProxy
-}
-
-// ---------------------------------------------------------------- slot: sd child
-
-func (b *broker) ensureChild() error {
-	if b.up && portAlive(b.cfg.sd) {
-		b.touch()
-		return nil
-	}
-	if portAlive(b.cfg.sd) {
-		return fmt.Errorf("%s is already served by a process stadi does not own "+
-			"(stop the sd service first: rc-service --user sd stop)", b.cfg.sd)
-	}
-	b.unloadLLM()
-
-	if err := waitVRAMBelow(b.cfg.freeBelow, b.cfg.vramWait); err != nil {
-		log.Printf("warning: %v (continuing: the child may still get the card)", err)
-	}
-
-	if err := os.MkdirAll(b.cfg.sdLogDir, 0o755); err != nil {
-		return fmt.Errorf("log dir: %w", err)
-	}
-	out, err := os.OpenFile(filepath.Join(b.cfg.sdLogDir, "stadi-sd.log"),
-		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return fmt.Errorf("open child stdout: %w", err)
-	}
-	errf, err := os.OpenFile(filepath.Join(b.cfg.sdLogDir, "stadi-sd.err"),
-		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		out.Close()
-		return fmt.Errorf("open child stderr: %w", err)
-	}
-
-	cmd := exec.Command(b.cfg.sdBin, b.cfg.sdArgs...)
-	cmd.Stdout, cmd.Stderr = out, errf
-	// One process group, so stopping the child also stops anything it forked.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	log.Printf("starting the sd child: %s %s", b.cfg.sdBin, strings.Join(b.cfg.sdArgs, " "))
-	if err := cmd.Start(); err != nil {
-		out.Close()
-		errf.Close()
-		return fmt.Errorf("start sd child: %w", err)
-	}
-	b.child, b.up = cmd, true
-	go func() { // reap, and notice a crash without waiting for a request to fail
-		err := cmd.Wait()
-		out.Close()
-		errf.Close()
-		b.mu.Lock()
-		if b.child == cmd {
-			b.child, b.up = nil, false
-		}
-		b.mu.Unlock()
-		log.Printf("sd child (pid %d) exited: %v", cmd.Process.Pid, err)
-	}()
-
-	if err := waitPort(b.cfg.sd, b.cfg.loadWait); err != nil {
-		b.stopChild()
-		return fmt.Errorf("sd child never came up on %s: %w", b.cfg.sd, err)
-	}
-	log.Printf("sd child ready on %s (pid %d), vram %s", b.cfg.sd, cmd.Process.Pid, vramString())
-	b.touch()
-	return nil
-}
-
-func (b *broker) stopChild() {
-	if b.timer != nil {
-		b.timer.Stop()
-		b.timer = nil
-	}
-	if b.child == nil || b.child.Process == nil {
-		b.up = false
-		return
-	}
-	pid := b.child.Process.Pid
-	log.Printf("stopping the sd child (pid %d), vram %s", pid, vramString())
-	// SIGTERM the whole group, then SIGKILL if it will not go. sd-server frees its
-	// weights on exit (measured: 12.5 GiB -> 0.03 GiB), which is the entire point.
-	_ = syscall.Kill(-pid, syscall.SIGTERM)
-	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) {
-		if !portAlive(b.cfg.sd) {
-			break
-		}
-		time.Sleep(250 * time.Millisecond)
-	}
-	if portAlive(b.cfg.sd) {
-		log.Printf("sd child %d ignored SIGTERM; killing", pid)
-		_ = syscall.Kill(-pid, syscall.SIGKILL)
-	}
-	b.child, b.up = nil, false
-	if err := waitVRAMBelow(b.cfg.freeBelow, b.cfg.vramWait); err != nil {
-		log.Printf("warning after stopping the child: %v", err)
-	} else {
-		log.Printf("card released, vram %s", vramString())
-	}
-}
-
-// touch (re)arms the idle timer: after cfg.idle with no media request the child goes
-// away by itself, so the card is never left held.
-func (b *broker) touch() {
-	if b.timer != nil {
-		b.timer.Stop()
-	}
-	b.timer = time.AfterFunc(b.cfg.idle, func() {
-		b.mu.Lock()
-		defer b.mu.Unlock()
-		if b.child == nil {
-			return
-		}
-		if atomic.LoadInt64(&b.media) > 0 {
-			// A render is still in flight; start the clock again rather than killing it.
-			b.touch()
-			return
-		}
-		log.Printf("no media request for %s; releasing the card", b.cfg.idle)
-		b.stopChild()
-	})
-}
-
-// -------------------------------------------------------------------- slot: llama
-
-// unloadLLM asks the router to drop every model it has resident. The router's unload
-// is async and force-kills a loading child, so its own answer is the authority.
-func (b *broker) unloadLLM() {
-	ids, err := routerModels(b.cfg.llm)
-	if err != nil {
-		log.Printf("warning: cannot list router models: %v", err)
-		return
-	}
-	for _, id := range ids {
-		body := strings.NewReader(`{"model":` + strconv.Quote(id) + `}`)
-		req, err := http.NewRequest(http.MethodPost, b.cfg.llm+"/models/unload", body)
-		if err != nil {
-			continue
-		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			log.Printf("unload %s: %v", id, err)
-			continue
-		}
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		resp.Body.Close()
-		log.Printf("unload %s -> %s %s", id, resp.Status, strings.TrimSpace(string(msg)))
-	}
-}
-
-func routerModels(base string) ([]string, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(base + "/v1/models")
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	var payload struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
-		return nil, err
-	}
-	ids := make([]string, 0, len(payload.Data))
-	for _, m := range payload.Data {
-		ids = append(ids, m.ID)
-	}
-	return ids, nil
-}
-
-// ------------------------------------------------------------------------ helpers
-
-func portAlive(base string) bool {
-	u, err := url.Parse(base)
-	if err != nil {
-		return false
-	}
-	c, err := net.DialTimeout("tcp", u.Host, 750*time.Millisecond)
-	if err != nil {
-		return false
-	}
-	c.Close()
-	return true
-}
-
-func waitPort(base string, limit time.Duration) error {
-	deadline := time.Now().Add(limit)
-	for time.Now().Before(deadline) {
-		if portAlive(base) {
-			return nil
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	return fmt.Errorf("timed out after %s", limit)
-}
-
 func waitVRAMBelow(limit uint64, howLong time.Duration) error {
 	deadline := time.Now().Add(howLong)
 	var last uint64
@@ -475,44 +504,55 @@ func waitVRAMBelow(limit uint64, howLong time.Duration) error {
 		float64(last)/(1<<30), howLong, float64(limit)/(1<<30))
 }
 
-// ---------------------------------------------------------------- routing + proxy
+// -------------------------------------------------------------------- routing
 
-// Generation paths actually LOAD the model, so they may spawn the child and they refresh
-// the idle clock. Observation paths only ever REPORT on it: /sdapi/v1/progress, /options,
-// /sd-models, /samplers and friends. Keeping the two apart matters, because a monitoring
-// loop polling /progress would otherwise spawn the child and pin the card forever -- the
-// exact thing the idle timer exists to undo.
-//
-// The upshot is that "is sd loaded?" needs no state of its own: it is simply whether the
-// child is running, which /status reports as sd_child_up.
-func isGeneration(p string) bool {
-	if strings.HasPrefix(p, "/v1/images/") {
-		return true
-	}
-	switch p {
-	case "/sdapi/v1/txt2img", "/sdapi/v1/img2img":
-		return true
-	}
-	return false
+// routeKind is what a request may do to the estate.
+type routeKind int
+
+const (
+	kindChat        routeKind = iota // the LLM path: wait for a render, evict the card, proxy
+	kindMetadata                     // proxy untouched: the router loads nothing for these
+	kindGeneration                   // may spawn the slot and re-arm its idle clock
+	kindObservation                  // only ever reports on a slot: never spawns
+)
+
+type intent struct {
+	slot string
+	kind routeKind
 }
 
-func isObservation(p string) bool { return strings.HasPrefix(p, "/sdapi/") }
-
-// isMetadata is proxied WITHOUT a transition. The picker polls /v1/models constantly,
-// and the router answers it without loading anything, so it must never evict the
-// child -- otherwise every UI refresh would kill a render.
-func isMetadata(p string) bool {
-	switch p {
-	case "/v1/models", "/props", "/health", "/healthz":
-		return true
+// resolve is the routing table, in one place and as data about paths.
+//
+// The generation/observation split is not cosmetic: a monitoring loop polling
+// /sdapi/v1/progress would otherwise spawn the child and pin the card forever, which
+// is the exact thing the idle timer exists to undo. Metadata is proxied untouched
+// because a picker polls /v1/models constantly and the router answers it without
+// loading anything -- a transition there would kill a render on every UI refresh.
+//
+// Two fixes over stadi, both from the estate's own history:
+//   - whisper is ROUTED now (/inference, /v1/audio/*). It used to match no route and
+//     fall through to the default branch, i.e. to the llama router, which answered
+//     with a 404 from the wrong engine.
+//   - an unconfigured whisper answers 503 here instead of falling through to llama.
+func resolve(p string) intent {
+	switch {
+	case p == "/v1/models", p == "/props", p == "/health", p == "/healthz":
+		return intent{"llama", kindMetadata}
+	case p == "/sdapi/v1/txt2img", p == "/sdapi/v1/img2img", strings.HasPrefix(p, "/v1/images/"):
+		return intent{"sd", kindGeneration}
+	case strings.HasPrefix(p, "/sdapi/"):
+		return intent{"sd", kindObservation}
+	case p == "/inference", strings.HasPrefix(p, "/v1/audio/"):
+		return intent{"whisper", kindGeneration}
 	}
-	return false
+	// Everything else is chat: /v1/chat/completions, /models/load, /models/unload, ...
+	return intent{"llama", kindChat}
 }
 
 // reverseProxy builds the pass-through. isLLM adds the watch: a failed dial or a
-// stream that broke mid-body is the strongest possible evidence about the router, and
-// it arrives before any probe could fire, so the policy hangs off this edge.
-func reverseProxy(b *broker, base string, isLLM bool) *httputil.ReverseProxy {
+// stream that broke mid-body is the strongest evidence about the router, and it
+// arrives before any probe could fire, so the policy hangs off this edge.
+func reverseProxy(d *demesne, base string, isLLM bool) *httputil.ReverseProxy {
 	target, err := url.Parse(base)
 	if err != nil {
 		log.Fatalf("bad target %q: %v", base, err)
@@ -524,18 +564,18 @@ func reverseProxy(b *broker, base string, isLLM bool) *httputil.ReverseProxy {
 	p.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		log.Printf("%s %s -> %s: %v", r.Method, r.URL.Path, base, err)
 		if isLLM {
-			if restart := b.llm.fail(err, b.cfg.failThreshold, b.cfg.breakerFor); restart {
-				b.recoverLLM(err.Error())
+			if restart := d.llm.fail(err, d.cfg.failThreshold, d.cfg.breakerFor); restart {
+				d.recoverLLM(err.Error())
 			}
 		}
-		http.Error(w, "stadi: upstream failed: "+err.Error(), http.StatusBadGateway)
+		http.Error(w, "demesne: upstream failed: "+err.Error(), http.StatusBadGateway)
 	}
 	if isLLM {
 		// Any answer below 500 means the engine really answered -- a streamed 200 is
 		// worth more than a health check, because it proves the model ran.
 		p.ModifyResponse = func(resp *http.Response) error {
 			if resp.StatusCode < 500 {
-				b.llm.ok()
+				d.llm.ok()
 			}
 			return nil
 		}
@@ -543,95 +583,206 @@ func reverseProxy(b *broker, base string, isLLM bool) *httputil.ReverseProxy {
 	return p
 }
 
-func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (d *demesne) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	p := r.URL.Path
 	switch {
-	case r.URL.Path == "/status":
-		b.status(w)
-	case r.URL.Path == "/release":
-		b.mu.Lock()
-		b.stopChild()
-		b.mu.Unlock()
-		fmt.Fprintln(w, "released")
-	case isGeneration(r.URL.Path):
-		b.mu.Lock()
-		err := b.ensureChild()
-		b.mu.Unlock()
-		if err != nil {
-			log.Printf("generation request refused: %v", err)
-			http.Error(w, "stadi: "+err.Error(), http.StatusServiceUnavailable)
-			return
-		}
-		atomic.AddInt64(&b.media, 1)
-		b.sdProxy.ServeHTTP(w, r)
-		atomic.AddInt64(&b.media, -1)
-		// Re-arm from the END of the request. ensureChild() touches BEFORE the render, and a
-		// cold render takes ~8-10 min, so a 5-minute timer armed there would kill the child
-		// mid-load. The count above is what tells the timer a render is still going.
-		b.mu.Lock()
-		b.touch()
-		b.mu.Unlock()
-	case isObservation(r.URL.Path):
-		// Never spawn for a read: answer honestly instead, so a monitor cannot hold the card.
-		b.mu.Lock()
-		up := b.up && portAlive(b.cfg.sd)
-		b.mu.Unlock()
-		if !up {
-			http.Error(w, "stadi: sd is not loaded (no child running; see /status)", http.StatusServiceUnavailable)
-			return
-		}
-		b.sdProxy.ServeHTTP(w, r)
-	case isMetadata(r.URL.Path):
-		b.llmProxy.ServeHTTP(w, r)
+	case p == "/status":
+		d.status(w)
+	case p == "/release":
+		d.handleRelease(w, r)
+	case strings.HasPrefix(p, "/slots/"):
+		d.handleSlotControl(w, r)
 	default:
-		// The breaker: once the router has failed a burst of requests, refuse new ones
-		// quickly instead of dialling a dead port once per client and letting each wait
-		// out its own timeout. A successful request clears it (see reverseProxy).
-		if open, wait := b.llm.failing(); open {
-			w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())))
-			http.Error(w, "stadi: the llama engine is failing; retry shortly (see /status)",
+		d.route(w, r, resolve(p))
+	}
+}
+
+func (d *demesne) route(w http.ResponseWriter, r *http.Request, in intent) {
+	s := d.slotByName(in.slot)
+	if s == nil {
+		http.Error(w, "demesne: no such slot: "+in.slot, http.StatusInternalServerError)
+		return
+	}
+	if !s.spec.own() && !s.spec.fallback {
+		http.Error(w, fmt.Sprintf("demesne: %s is not configured (no command line: set -%s-args)",
+			s.spec.name, s.spec.name), http.StatusServiceUnavailable)
+		return
+	}
+
+	switch in.kind {
+	case kindGeneration:
+		if err := d.ensure(s); err != nil {
+			if !s.spec.own() && !s.spec.fallback {
+				http.Error(w, "demesne: "+err.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			log.Printf("%s request refused: %v", s.spec.name, err)
+			http.Error(w, "demesne: "+err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		atomic.AddInt64(&s.inflight, 1)
+		d.proxies[s.spec.name].ServeHTTP(w, r)
+		atomic.AddInt64(&s.inflight, -1)
+		// Re-arm from the END of the request. ensure() touches BEFORE the render, and a
+		// cold render takes ~8-10 min, so a 5-minute timer armed there would kill the
+		// child mid-load. The count above is what tells the timer a render is running.
+		s.armIdle(d)
+
+	case kindObservation:
+		// Never spawn for a read: answer honestly instead, so a monitor cannot hold the card.
+		if up, _ := s.isUp(); !up || !portAlive(s.spec.url) {
+			http.Error(w, "demesne: "+s.spec.name+" is not loaded (no child running; see /status)",
 				http.StatusServiceUnavailable)
 			return
 		}
-		// A chat request wants the card. If a render is in flight, wait a bounded
-		// while for it to finish -- then say so plainly instead of killing it.
-		if n := atomic.LoadInt64(&b.media); n > 0 {
-			deadline := time.Now().Add(b.cfg.busyWait)
-			for atomic.LoadInt64(&b.media) > 0 && time.Now().Before(deadline) {
+		d.proxies[s.spec.name].ServeHTTP(w, r)
+
+	case kindMetadata:
+		d.proxies[s.spec.name].ServeHTTP(w, r)
+
+	default: // kindChat
+		// The breaker: once the router has failed a burst of requests, refuse new ones
+		// quickly instead of dialling a dead port once per client and letting each wait
+		// out its own timeout. A successful request clears it.
+		if open, wait := d.llm.failing(); open {
+			w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())))
+			http.Error(w, "demesne: the llama engine is failing; retry shortly (see /status)",
+				http.StatusServiceUnavailable)
+			return
+		}
+		// A resident router that is still loading is not broken: wait a bounded while
+		// for its port rather than take a 502 from the proxy. Then say so plainly.
+		if s.booting() {
+			deadline := time.Now().Add(d.cfg.busyWait)
+			for s.booting() && time.Now().Before(deadline) {
 				time.Sleep(500 * time.Millisecond)
 			}
-			if atomic.LoadInt64(&b.media) > 0 {
-				http.Error(w, "stadi: an image generation is in progress on the card; retry shortly",
+			if s.booting() {
+				http.Error(w, "demesne: the llama router is still starting; retry shortly",
 					http.StatusServiceUnavailable)
 				return
 			}
 		}
-		b.mu.Lock()
-		b.stopChild()
-		b.mu.Unlock()
-		b.llmProxy.ServeHTTP(w, r)
+		// A chat request wants the card. If a render is in flight, wait for it to
+		// finish -- then say so plainly instead of killing it.
+		if sd := d.slotByName("sd"); sd != nil {
+			if n := atomic.LoadInt64(&sd.inflight); n > 0 {
+				deadline := time.Now().Add(d.cfg.busyWait)
+				for atomic.LoadInt64(&sd.inflight) > 0 && time.Now().Before(deadline) {
+					time.Sleep(500 * time.Millisecond)
+				}
+				if atomic.LoadInt64(&sd.inflight) > 0 {
+					http.Error(w, "demesne: an image generation is in progress on the card; retry shortly",
+						http.StatusServiceUnavailable)
+					return
+				}
+			}
+			if up, _ := sd.isUp(); up {
+				d.evict(sd, "a chat request wants the card")
+			}
+		}
+		d.proxies[s.spec.name].ServeHTTP(w, r)
 	}
 }
 
-func (b *broker) status(w http.ResponseWriter) {
-	b.mu.Lock()
-	pid := 0
-	if b.child != nil && b.child.Process != nil {
-		pid = b.child.Process.Pid
+// ------------------------------------------------------------------- /status
+
+type slotStatus struct {
+	Name       string  `json:"name"`
+	Listen     string  `json:"listen"`
+	ListenPort int     `json:"port"`
+	Group      string  `json:"group,omitempty"`
+	Policy     string  `json:"policy"`
+	Owned      bool    `json:"owned"`
+	Up         bool    `json:"up"`
+	Booting    bool    `json:"booting"`
+	PID        int     `json:"pid,omitempty"`
+	Foreign    string  `json:"port_held_elsewhere,omitempty"`
+	InFlight   int64   `json:"in_flight"`
+	IdleSecond float64 `json:"idle_timeout_s,omitempty"`
+	UptimeSecs float64 `json:"uptime_s,omitempty"`
+	Restarts   int     `json:"restarts"`
+	LastError  string  `json:"last_error,omitempty"`
+	Cgroup     string  `json:"cgroup,omitempty"`
+}
+
+func (d *demesne) slotStatuses() []slotStatus {
+	out := make([]slotStatus, 0, len(d.slots))
+	for _, s := range d.slots {
+		out = append(out, slotStatusOf(s))
 	}
-	up := b.up
-	b.mu.Unlock()
+	return out
+}
+
+// slotStatusOf reads one slot without the transition lock, so a status poll is never
+// stuck behind an eight-minute cold load.
+func slotStatusOf(s *slot) slotStatus {
+	s.mu.Lock()
+	st := slotStatus{
+		Name: s.spec.name, Listen: s.spec.url, ListenPort: s.port(),
+		Group: s.spec.group, Policy: s.spec.policy.String(), Owned: s.spec.own(),
+		Up: s.up, Booting: s.up && s.readyAt.IsZero(), PID: s.pid,
+		InFlight: atomic.LoadInt64(&s.inflight), Restarts: s.restarts,
+		LastError: s.lastErr,
+	}
+	if s.spec.idle > 0 {
+		st.IdleSecond = s.spec.idle.Seconds()
+	}
+	if s.up && !s.readyAt.IsZero() {
+		st.UptimeSecs = time.Since(s.readyAt).Seconds()
+	}
+	if s.spec.cgroup.set() {
+		st.Cgroup = s.spec.cgroup.leaf
+	}
+	foreign := s.foreign
+	s.mu.Unlock()
+
+	// An external engine is someone else's child, so "up" has to be asked of its port
+	// rather than of our process table -- and it is never a foreign holder, because the
+	// port is its own by contract. This matters during the migration: most engines are
+	// external while demesne takes them over one at a time.
+	if s.spec.policy == policyExternal {
+		st.Up = portAliveWithin(s.spec.url, 150*time.Millisecond)
+		st.Booting = false
+		return st
+	}
+
+	// A port answered while the slot is down means someone else owns it. Bounded
+	// short: /status is polled, and it must never be the slowest thing on the box.
+	if !st.Up && portAliveWithin(s.spec.url, 150*time.Millisecond) {
+		foreign = true
+	}
+	if foreign {
+		st.Foreign = "a process demesne does not own"
+	}
+	return st
+}
+
+func (d *demesne) status(w http.ResponseWriter) {
+	sd := d.slotByName("sd")
+	up, pid := false, 0
+	inflight := int64(0)
+	if sd != nil {
+		up, pid = sd.isUp()
+		inflight = atomic.LoadInt64(&sd.inflight)
+	}
 	used, _ := vramUsed()
 	out := map[string]any{
+		// The estate, as slots.
 		"version":         version,
-		"slot":            slotName(up),
-		"sd_child_up":     up,
-		"sd_child_pid":    pid,
-		"sd_listen":       b.cfg.sd,
-		"llm":             b.cfg.llm,
-		"media_in_flight": atomic.LoadInt64(&b.media),
-		"idle_timeout_s":  b.cfg.idle.Seconds(),
+		"listen":          d.cfg.listen,
 		"vram_used_gib":   float64(used) / (1 << 30),
-		"llm_health":      b.llm.snapshot(),
+		"media_in_flight": inflight,
+		"llm_health":      d.llm.snapshot(),
+		"slots":           d.slotStatuses(),
+
+		// stadi's field names, kept because DSH and the habit of a year read them.
+		"slot":           slotName(up),
+		"sd_child_up":    up,
+		"sd_child_pid":   pid,
+		"sd_listen":      d.cfg.sd.url,
+		"llm":            d.cfg.llama.url,
+		"idle_timeout_s": d.cfg.idle.Seconds(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
@@ -639,6 +790,8 @@ func (b *broker) status(w http.ResponseWriter) {
 	_ = enc.Encode(out)
 }
 
+// slotName is stadi's one-bit answer to "who holds the card", kept as-is: it is what
+// the old /status published and nothing gained by renaming it.
 func slotName(sdUp bool) string {
 	if sdUp {
 		return "sd"
@@ -646,42 +799,162 @@ func slotName(sdUp bool) string {
 	return "llm"
 }
 
-// ---------------------------------------------------------------------------- main
+// ------------------------------------------------------------------ /release
+
+func (d *demesne) handleRelease(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("slot")
+	if name != "" && d.slotByName(name) == nil {
+		http.Error(w, "demesne: no such slot: "+name, http.StatusNotFound)
+		return
+	}
+	released := []string{}
+	for _, s := range d.slots {
+		if name != "" && s.spec.name != name {
+			continue
+		}
+		if s.spec.policy != policyOnDemand {
+			continue
+		}
+		if up, _ := s.isUp(); !up {
+			continue
+		}
+		d.evict(s, "operator release")
+		released = append(released, s.spec.name)
+	}
+	if len(released) == 0 {
+		fmt.Fprintln(w, "released nothing")
+		return
+	}
+	fmt.Fprintf(w, "released %s\n", strings.Join(released, " "))
+}
+
+// handleSlotControl is the per-engine operator interface: /slots/<name>{,/status,
+// /load,/stop}. It replaces "rc-service --user llama restart" as the way to touch one
+// engine, because rc-service can no longer see a child demesne forked.
+func (d *demesne) handleSlotControl(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/slots/")
+	name, action := rest, ""
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		name, action = rest[:i], rest[i+1:]
+	}
+	s := d.slotByName(name)
+	if s == nil {
+		http.Error(w, "demesne: no such slot: "+name, http.StatusNotFound)
+		return
+	}
+	switch action {
+	case "", "status":
+		w.Header().Set("Content-Type", "application/json")
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(slotStatusOf(s))
+	case "load", "start":
+		if r.Method != http.MethodPost {
+			http.Error(w, "demesne: POST required", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := d.ensure(s); err != nil {
+			http.Error(w, "demesne: "+err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		fmt.Fprintf(w, "%s loaded\n", s.spec.name)
+	case "stop", "release":
+		if r.Method != http.MethodPost {
+			http.Error(w, "demesne: POST required", http.StatusMethodNotAllowed)
+			return
+		}
+		d.evict(s, "operator stop")
+		fmt.Fprintf(w, "%s stopped\n", s.spec.name)
+	default:
+		http.Error(w, "demesne: try /slots/<name>, /load or /stop", http.StatusNotFound)
+	}
+}
+
+// --------------------------------------------------------------------- main
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
-	log.SetPrefix("stadi: ")
+	log.SetPrefix("demesne: ")
+
+	// A first non-flag argument is a subcommand: demesne status|release|load|stop.
+	sub := ""
+	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
+		sub = os.Args[1]
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+	}
 	cfg := loadConfig()
+	if sub != "" {
+		runSubcommand(sub, cfg)
+		return
+	}
 
-	b := &broker{cfg: cfg, llm: newLLMWatch()}
-	b.sdProxy = reverseProxy(b, cfg.sd, false)
-	b.llmProxy = reverseProxy(b, cfg.llm, true)
+	d := newDemesne(cfg)
+	if err := cfg.validate(d.slots); err != nil {
+		log.Fatal(err)
+	}
 
-	log.Printf("listening on %s | llm %s | sd %s | idle %s | vram %s",
-		cfg.listen, cfg.llm, cfg.sd, cfg.idle, vramString())
+	log.Printf("listening on %s | llama %s | sd %s | whisper %s | llamb %s | idle %s | vram %s",
+		cfg.listen, cfg.llama.url, cfg.sd.url, cfg.whisper.url, cfg.llamb.url, cfg.idle, vramString())
+	for _, s := range d.slots {
+		note := ""
+		if s.spec.policy == policyExternal {
+			note = " (external: routed, not owned)"
+		}
+		log.Printf("slot %-8s %-24s policy=%-10s group=%-4s%v",
+			s.spec.name, s.spec.url, s.spec.policy, orNone(s.spec.group), note)
+	}
 
-	// supervise-daemon stops us with SIGTERM. Because the child sits in its own process
-	// group (Setpgid) it would NOT die with us, and an orphaned sd-server is exactly the
-	// 12.5 GiB hostage this program exists to prevent -- so take it down on the way out.
+	// A port answering before demesne started the engine is either a leftover or
+	// another supervisor; either way it is the collision this program refuses to race.
+	for _, s := range d.slots {
+		if s.spec.url == "" || s.spec.policy == policyExternal {
+			continue
+		}
+		if portAlive(s.spec.url) {
+			log.Printf("warning: %s is already answering on %s; demesne did not start it",
+				s.spec.name, s.spec.url)
+		}
+	}
+
+	for _, s := range d.slots {
+		d.prepareCgroup(s)
+	}
+
+	// supervise-daemon stops us with SIGTERM. Because every child sits in its own
+	// process group it would NOT die with us, and an orphaned sd-server is exactly the
+	// 12.5 GiB hostage this program exists to prevent -- so take them all down first.
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-stop
-		log.Printf("signal received; stopping the sd child and exiting")
-		b.mu.Lock()
-		b.stopChild()
-		b.mu.Unlock()
+		d.closing.Store(true)
+		close(d.done)
+		log.Printf("signal received; stopping the card's children and exiting")
+		d.stopAll("demesne is going away")
 		os.Exit(0)
 	}()
 
+	for _, s := range d.slots {
+		if s.spec.policy == policyResident {
+			go d.supervise(s)
+		}
+	}
+
 	srv := &http.Server{
 		Addr:              cfg.listen,
-		Handler:           b,
+		Handler:           d,
 		ReadHeaderTimeout: 15 * time.Second,
-		// No WriteTimeout: an image generation can legitimately take ten minutes,
-		// and a default would guillotine it.
+		// No WriteTimeout: an image generation can legitimately take ten minutes, and a
+		// default would guillotine it.
 	}
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
