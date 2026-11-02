@@ -1,4 +1,9 @@
-# stadi
+# demesne
+
+> **Status: fork.** This is a snapshot of [`stadi`](https://github.com/bqv/stadi) at commit
+> `ad49321`, renamed and re-scoped. The code below still describes stadi; the new remit —
+> supervising and routing **llama, llamb, sd and whisper** while keeping stadi's original
+> slot-broker duties — is in [HANDOFF.md](HANDOFF.md). Read that first.
 
 A GPU **slot broker** for a single card shared by two engines that cannot share it.
 
