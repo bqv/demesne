@@ -7,6 +7,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -465,4 +467,75 @@ func newTestDemesne(t *testing.T, cfg config) *demesne {
 		d.stopAll("the test is over")
 	})
 	return d
+}
+
+// The local channel is the same API on a socket: no port to collide with, and the file
+// mode is the access control. This is what a sibling daemon of ours (ward) gets to use
+// instead of dialling loopback TCP.
+func TestUnixSocketServesTheSameAPI(t *testing.T) {
+	cfg := testConfig(t)
+	path := filepath.Join(t.TempDir(), "demesne.sock")
+	cfg.socket = path
+	d := newTestDemesne(t, cfg)
+
+	ln, err := listenUnix(path)
+	if err != nil {
+		t.Fatalf("listenUnix: %v", err)
+	}
+	defer ln.Close()
+	srv := &http.Server{Handler: d}
+	go srv.Serve(ln)
+	defer srv.Close()
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("socket mode = %04o, want 0600 (the filesystem is the access control)", perm)
+	}
+
+	client := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", path)
+		},
+	}}
+	resp, err := client.Get("http://demesne/status")
+	if err != nil {
+		t.Fatalf("GET over the socket: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200 over the socket, got %d", resp.StatusCode)
+	}
+	var got struct {
+		Version string `json:"version"`
+		Socket  string `json:"socket"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Version != version {
+		t.Errorf("version over the socket = %q, want %q", got.Version, version)
+	}
+	if got.Socket != path {
+		t.Errorf("/status socket = %q, want %q", got.Socket, path)
+	}
+
+	// A second listener must not steal the first one's socket, and a plain file in the
+	// way must be reported rather than unlinked: bind(2) refuses a path that exists, and
+	// the temptation is to remove whatever is there.
+	if _, err := listenUnix(path); err == nil {
+		t.Fatal("a live socket must not be taken over")
+	}
+	plain := filepath.Join(t.TempDir(), "not-a-socket")
+	if err := os.WriteFile(plain, []byte("keep me"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := listenUnix(plain); err == nil {
+		t.Fatal("a non-socket path must be refused")
+	}
+	if _, err := os.Stat(plain); err != nil {
+		t.Fatal("the file in the way was deleted")
+	}
 }

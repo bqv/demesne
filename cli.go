@@ -4,12 +4,19 @@
 // Why not `rc-service --user llama status` any more: an engine demesne forked is not in
 // the OpenRC service tree, so rc-service can neither see nor stop it. The old way -- and
 // the new one -- is written down in DESIGN.md.
+//
+// When a unix socket is configured the CLI prefers it and falls back to the port: the
+// socket is the better transport for a caller we own (no port to contend for, mode 0600),
+// but a CLI that refused to work because one of the two ways in was missing would be worse
+// than either.
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -27,12 +34,43 @@ const usage = `demesne -- one owner for the box's local-inference estate
 
 Slots: llama (55555), llamb (55556), sd (55557), whisper (55559).
 Every flag of the server is still accepted before the subcommand, and
-` + "`DEMESNE_*`" + ` environment variables are honoured, so -listen works as usual.
+` + "`DEMESNE_*`" + ` environment variables are honoured, so -listen and -socket work as usual.
 `
 
-func runSubcommand(sub string, cfg config) {
-	base := "http://" + cfg.listen
+// wayIn is one transport the CLI can reach the daemon by.
+type wayIn struct {
+	client *http.Client
+	base   string
+	how    string
+}
 
+// waysIn lists them in preference order: the socket first (when configured), then the
+// port. The port is what DSH uses, so it is always right to fall back to it.
+func waysIn(cfg config) []wayIn {
+	var out []wayIn
+	if cfg.socket != "" {
+		path := cfg.socket
+		out = append(out, wayIn{
+			base: "http://demesne",
+			how:  "unix:" + path,
+			client: &http.Client{Transport: &http.Transport{
+				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					return (&net.Dialer{}).DialContext(ctx, "unix", path)
+				},
+			}},
+		})
+	}
+	if cfg.listen != "" {
+		out = append(out, wayIn{
+			base:   "http://" + cfg.listen,
+			how:    cfg.listen,
+			client: &http.Client{},
+		})
+	}
+	return out
+}
+
+func runSubcommand(sub string, cfg config) {
 	switch sub {
 	case "version":
 		fmt.Println("demesne " + version)
@@ -40,88 +78,76 @@ func runSubcommand(sub string, cfg config) {
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 		return
-	case "status":
-		body, err := call(http.MethodGet, base+"/status", nil)
-		if err != nil {
-			fail("status", err)
-		}
-		fmt.Print(body)
-		return
-	case "release":
-		target := base + "/release"
-		if args := flag.Args(); len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-			target += "?slot=" + args[0]
-		}
-		body, err := call(http.MethodGet, target, nil)
-		if err != nil {
-			fail("release", err)
-		}
-		fmt.Print(body)
-		return
-	case "load", "start":
-		slot, ok := slotArg(sub)
-		if !ok {
-			return
-		}
-		body, err := call(http.MethodPost, base+"/slots/"+slot+"/load", nil)
-		if err != nil {
-			fail("load "+slot, err)
-		}
-		fmt.Print(body)
-		return
-	case "stop":
-		slot, ok := slotArg(sub)
-		if !ok {
-			return
-		}
-		body, err := call(http.MethodPost, base+"/slots/"+slot+"/stop", nil)
-		if err != nil {
-			fail("stop "+slot, err)
-		}
-		fmt.Print(body)
-		return
+	case "status", "release", "load", "start", "stop":
 	default:
 		fmt.Fprintf(os.Stderr, "demesne: unknown subcommand %q\n\n%s", sub, usage)
 		os.Exit(2)
 	}
+
+	method, path := http.MethodGet, "/status"
+	switch sub {
+	case "release":
+		path = "/release"
+		if args := flag.Args(); len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+			path += "?slot=" + args[0]
+		}
+	case "load", "start":
+		method, path = http.MethodPost, "/slots/"+slotArg(sub)+"/load"
+	case "stop":
+		method, path = http.MethodPost, "/slots/"+slotArg(sub)+"/stop"
+	}
+
+	body, errs := call(cfg, method, path)
+	if body == "" {
+		fail(sub, errs)
+	}
+	fmt.Print(body)
 }
 
-func slotArg(sub string) (string, bool) {
+func slotArg(sub string) string {
 	args := flag.Args()
 	if len(args) == 0 {
 		fmt.Fprintf(os.Stderr, "demesne: %s wants a slot name (llama, llamb, sd, whisper)\n", sub)
 		os.Exit(2)
 	}
-	return args[0], true
+	return args[0]
 }
 
-// call talks to the running demesne. `load` can legitimately block for the whole cold
-// load of an engine (~8 minutes for sd), so there is deliberately no client timeout:
+// call tries each way in until one answers. `load` can legitimately block for the whole
+// cold load of an engine (~8 minutes for sd), so there is deliberately no client timeout:
 // the operator can ^C, and a timeout here would lie about what happened.
-func call(method, target string, body io.Reader) (string, error) {
-	req, err := http.NewRequest(method, target, body)
-	if err != nil {
-		return "", err
+func call(cfg config, method, path string) (string, []string) {
+	var errs []string
+	for _, w := range waysIn(cfg) {
+		req, err := http.NewRequest(method, w.base+path, nil)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", w.how, err))
+			continue
+		}
+		started := time.Now()
+		resp, err := w.client.Do(req)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", w.how, err))
+			continue
+		}
+		out, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", w.how, readErr))
+			continue
+		}
+		if resp.StatusCode >= 400 {
+			// The daemon answered; a 4xx/5xx is its verdict, not a transport failure, so
+			// trying the other way in would only repeat it.
+			return "", []string{fmt.Sprintf("%s via %s after %s", resp.Status,
+				w.how, time.Since(started).Round(time.Millisecond))}
+		}
+		return string(out), nil
 	}
-	client := &http.Client{}
-	started := time.Now()
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	out, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	if resp.StatusCode >= 400 {
-		return "", fmt.Errorf("%s: %s after %s", resp.Status,
-			strings.TrimSpace(string(out)), time.Since(started).Round(time.Millisecond))
-	}
-	return string(out), nil
+	return "", errs
 }
 
-func fail(what string, err error) {
-	fmt.Fprintf(os.Stderr, "demesne: %s failed: %v\n", what, err)
+func fail(what string, errs []string) {
+	fmt.Fprintf(os.Stderr, "demesne: %s failed: %s\n", what, strings.Join(errs, "; "))
 	os.Exit(1)
 }

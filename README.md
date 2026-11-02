@@ -94,6 +94,24 @@ is demesne's now, because `rc-service` cannot see a child demesne forked. Anythi
 still asks a port directly — DSH's `dsh-local` provider, for one — keeps talking to
 `:55558` and notices nothing.
 
+## Two ways in
+
+One handler, two transports. The port is for clients configured with a URL (DSH reaches
+`:55558` by name); `-socket` adds the same API on a unix socket, which is for anything
+running as you:
+
+```sh
+curl --unix-socket $XDG_RUNTIME_DIR/demesne.sock http://demesne/status
+demesne status          # or this, which takes the port
+```
+
+There is deliberately **no second protocol**: the socket speaks the same OpenAI dialect and
+the same control endpoints, because a second dialect would mean a second implementation on
+both sides, and none of it would make a five-minute render or a 20 tok/s stream faster. What
+the socket buys is the absence of a port — nothing to collide with, no listener any local
+process can dial, and a file mode that is the access control. See §6a of
+[DESIGN.md](DESIGN.md) for why ward should use it for control and *not* for inference.
+
 ## Configure
 
 **Flags first, environment as the fallback.** Every setting is a command-line argument;
@@ -103,6 +121,7 @@ stderr), then to a portable default. `demesne -h` is the authoritative list.
 | flag | environment | default |
 | :-- | :-- | :-- |
 | `-listen` | `DEMESNE_LISTEN` | `127.0.0.1:55558` |
+| `-socket` | `DEMESNE_SOCKET` | none — same API on a unix socket, mode 0600 |
 | `-llm` | `DEMESNE_LLM` | `http://127.0.0.1:55555` — the router's URL |
 | `-sd` | `DEMESNE_SD` | `http://127.0.0.1:55557` — where the **child** comes up |
 | `-llamb` | `DEMESNE_LLAMB` | `http://127.0.0.1:55556` |

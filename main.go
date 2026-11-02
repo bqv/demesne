@@ -32,6 +32,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -70,7 +71,8 @@ type engineConfig struct {
 }
 
 type config struct {
-	listen                    string // where demesne itself listens
+	listen                    string // where demesne itself listens (the port DSH uses)
+	socket                    string // the same API on a unix socket; empty = no socket
 	sd, llama, llamb, whisper engineConfig
 	idle                      time.Duration // evict an on-demand child after this
 	whisperIdle               time.Duration
@@ -208,6 +210,7 @@ func defaultRCService() string {
 func loadConfig() config {
 	var (
 		fListen  = flag.String("listen", "", "address to listen on (env "+envPrefix+"LISTEN)")
+		fSocket  = flag.String("socket", "", "serve the same API on this unix socket too (env "+envPrefix+"SOCKET)")
 		fLLM     = flag.String("llm", "", "the llama router's base URL (env "+envPrefix+"LLM)")
 		fSD      = flag.String("sd", "", "URL the sd child comes up on (env "+envPrefix+"SD)")
 		fLlamb   = flag.String("llamb", "", "the auxiliary router's base URL (env "+envPrefix+"LLAMB)")
@@ -277,6 +280,7 @@ func loadConfig() config {
 
 	return config{
 		listen: envString(*fListen, "LISTEN", "127.0.0.1:55558"),
+		socket: envString(*fSocket, "SOCKET", ""),
 		sd: engineConfig{
 			url:    envString(*fSD, "SD", "http://127.0.0.1:55557"),
 			bin:    envString(*fSDBin, "SD_BIN", defaultBin("sd-server")),
@@ -771,6 +775,7 @@ func (d *demesne) status(w http.ResponseWriter) {
 		// The estate, as slots.
 		"version":         version,
 		"listen":          d.cfg.listen,
+		"socket":          d.cfg.socket,
 		"vram_used_gib":   float64(used) / (1 << 30),
 		"media_in_flight": inflight,
 		"llm_health":      d.llm.snapshot(),
@@ -895,6 +900,9 @@ func main() {
 
 	log.Printf("listening on %s | llama %s | sd %s | whisper %s | llamb %s | idle %s | vram %s",
 		cfg.listen, cfg.llama.url, cfg.sd.url, cfg.whisper.url, cfg.llamb.url, cfg.idle, vramString())
+	if cfg.socket != "" {
+		log.Printf("the same API is also on unix:%s (mode 0600)", cfg.socket)
+	}
 	for _, s := range d.slots {
 		note := ""
 		if s.spec.policy == policyExternal {
@@ -931,6 +939,9 @@ func main() {
 		close(d.done)
 		log.Printf("signal received; stopping the card's children and exiting")
 		d.stopAll("demesne is going away")
+		if d.cfg.socket != "" {
+			os.Remove(d.cfg.socket)
+		}
 		os.Exit(0)
 	}()
 
@@ -940,16 +951,83 @@ func main() {
 		}
 	}
 
+	// One handler, two transports. The port is for DSH, which we do not control and which
+	// reaches :55558 by name; the socket is for anything running as this user, where a path
+	// and a file mode say who may connect and no port can be contended for.
 	srv := &http.Server{
-		Addr:              cfg.listen,
 		Handler:           d,
 		ReadHeaderTimeout: 15 * time.Second,
 		// No WriteTimeout: an image generation can legitimately take ten minutes, and a
 		// default would guillotine it.
 	}
-	if err := srv.ListenAndServe(); err != nil {
+
+	tcp, err := net.Listen("tcp", cfg.listen)
+	if err != nil {
 		log.Fatal(err)
 	}
+	listeners := []net.Listener{tcp}
+	if cfg.socket != "" {
+		ln, err := listenUnix(cfg.socket)
+		if err != nil {
+			// Never fatal: a box that cannot have a socket still has to serve the card.
+			log.Printf("warning: no unix socket: %v; the port is the only way in", err)
+		} else {
+			log.Printf("also serving on unix:%s (mode 0600)", cfg.socket)
+			listeners = append(listeners, ln)
+		}
+	}
+	for _, ln := range listeners {
+		go func(ln net.Listener) {
+			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("listener %s stopped: %v", ln.Addr(), err)
+			}
+		}(ln)
+	}
+	select {}
+}
+
+// listenUnix prepares the local channel: the same handler demesne serves on its port,
+// on a socket any process running as this user can reach.
+//
+// Why a socket and not a second protocol: everything that would have to change to take
+// HTTP off this path is shared with DSH, which is not ours to change -- the same handler
+// answers both, so the OpenAI dialect, SSE streaming and the slot control endpoints are
+// one implementation either way. What a socket buys that a protocol cannot is the absence
+// of a port (nobody can collide with it, so the 55557 class of bug is gone by
+// construction) and an access control that is the filesystem: mode 0600, no token, no
+// loopback listener that any local user can dial.
+//
+// A stale socket file is removed only when nothing answers on it, because bind(2) refuses
+// a path that exists and unlinking a live daemon's socket is how you get two of them.
+func listenUnix(path string) (net.Listener, error) {
+	if path == "" {
+		return nil, errors.New("no socket path")
+	}
+	if fi, err := os.Stat(path); err == nil {
+		if fi.Mode()&os.ModeSocket == 0 {
+			return nil, fmt.Errorf("%s exists and is not a socket", path)
+		}
+		if c, err := net.DialTimeout("unix", path, 500*time.Millisecond); err == nil {
+			c.Close()
+			return nil, fmt.Errorf("%s is already served by another process", path)
+		}
+		if err := os.Remove(path); err != nil {
+			return nil, fmt.Errorf("remove stale socket: %w", err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		ln.Close()
+		os.Remove(path)
+		return nil, err
+	}
+	return ln, nil
 }
 
 func orNone(s string) string {

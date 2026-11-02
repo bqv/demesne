@@ -157,6 +157,40 @@ The HTTP side: `GET /status`, `GET|POST /release[?slot=]`, `GET /slots/<name>`,
 
 ---
 
+## 6a. The local channel — same API, second transport, no second protocol
+
+**Decided:** demesne can serve the *same* handler on a unix socket as well as on its port
+(`-socket` / `DEMESNE_SOCKET`, off by default, mode 0600). It does not get a second
+protocol, and the estate does not get a private dialect that only its own tools speak.
+
+The temptation is real — we control both ends of a ward↔demesne call, so why pay for HTTP?
+Three reasons not to, and one reason to move the transport at all.
+
+*What HTTP costs here:* nothing measurable. Chat is SSE at ~20 tokens/s and a render takes
+eight minutes; header parsing and loopback TCP are noise against both. What a bespoke
+protocol would cost: a second implementation in demesne, a second in the caller, and the
+loss of the thing both of them already speak — the OpenAI dialect, streaming included,
+which is exactly what `sd` and llama.cpp serve and what DSH consumes.
+
+*Why the transport is still worth changing:* a port is a shared resource with the same
+failure mode as 55557 — somebody else can hold it, and `bind` cannot tell you who. A socket
+in `$XDG_RUNTIME_DIR` cannot be contended for by anyone who is not this user, the file mode
+*is* the access control, and there is no listener on a port that any local process can dial.
+For a caller we own, that is strictly better than `127.0.0.1:55558`; for DSH, which is a
+third party configured with a URL, the port stays exactly where it is.
+
+*The split, then:* port for other people, socket for ourselves. `curl --unix-socket
+/run/user/1000/demesne.sock http://demesne/status` is the whole client.
+
+**What ward should *not* do with it.** Ward's only local model route is
+`http://127.0.0.1:55556` — llamb on the GT 1030, deliberately, so a judgement never
+contends with the 7900 XT. Routing that traffic through demesne would put every ward
+request on the `kindChat` path, which evicts the media child before proxying: a judgement
+would kill a running SD render. The socket is for *control* — "who holds the card", "let it
+go" — not for ward's inference.
+
+---
+
 ## 7. What stays an OpenRC service
 
 Everything that does not hold the card or a contested port: `dsh`, `ward`, `gpg-agent`,
@@ -254,3 +288,15 @@ environment is the natural transport for a list, and a unit file quoting one thr
 - **llamb is supervised but not routed.** Its clients reach 55556 directly. If a route is
   ever wanted, it is a `slotSpec` literal and a path prefix — deliberately not a second
   code path.
+- **ward's side of the local channel is not written.** demesne serves the API on
+  `-socket` today, and `demesne status` already prefers it; ward still speaks only HTTP
+  over TCP. Wiring it is small and lives in ward: one `CURLOPT_UNIX_SOCKET_PATH` in
+  `src/net/http.c` beside the existing `CURLOPT_URL`, and `wd_http_loopback()` taught that
+  a unix path is loopback too (so no bearer header is invented for a socket). The URL stays
+  `http://<anything>/v1/chat/completions` — libcurl sends it to the socket — which is why
+  this is a transport change and not a dialect change.
+- **the control vocabulary is still the operator's.** `/release`, `/slots/<name>/load|stop`
+  and `/status` are what ward would use, and they are shaped for a human reading JSON. If
+  ward grows a policy that reacts to the card (judge throttling, say), the honest next step
+  is a smaller, typed answer — `{"card":"sd","since":…}` — not a faster encoding of the
+  same 4 KiB document.
