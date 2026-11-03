@@ -3,7 +3,7 @@
 //
 // Why not `rc-service --user llama status` any more: an engine demesne forked is not in
 // the OpenRC service tree, so rc-service can neither see nor stop it. The old way -- and
-// the new one -- is written down in DESIGN.md.
+// the new one -- is written down in README.md.
 //
 // When a unix socket is configured the CLI prefers it and falls back to the port: the
 // socket is the better transport for a caller we own (no port to contend for, mode 0600),

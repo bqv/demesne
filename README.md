@@ -2,81 +2,203 @@
 
 > *demesne* — the part of a manor the lord keeps in his own hand. Here: the resident set.
 > Pronounced /dɪˈmeɪn/, like "domain"; the `s` is a 16th-century scribal addition and has
-> never been sounded. (`demense` is the common misspelling.)
+> never been sounded. (`demense` is the common misspelling, and `make install` gives you it
+> as a symlink.)
 
-`demesne` is the single owner of the local-inference estate on this box: it supervises and
-routes the four engines, and it owns the two scarce things they contend for — the 20 GiB
-card and the port numbers.
+`demesne` is the single owner of this box's local-inference estate: four engines, two cards,
+one port. It `fork/exec`s every engine it owns, decides who may hold a card and when, routes
+each request to the engine that actually has the model, and answers for all of it on
+`127.0.0.1:55555`.
 
-It is a fork of [`stadi`](https://github.com/bqv/stadi) at `ad49321`, which was a slot
-broker in front of *two* engines. The slot broker is the hard part and it is unchanged in
-spirit: what grew is that demesne now `fork/exec`s the engines it owns instead of asking
-`rc-service` to do it, so there is one owner and one actor per restart. The decisions
-behind that are in [DESIGN.md](DESIGN.md); this file is how to build, configure and use it.
+It is a fork of [`stadi`](https://github.com/bqv/stadi) at `ad49321`, which was a slot broker
+in front of *two* engines. The slot broker is the hard part and it is unchanged in spirit;
+what grew is ownership — demesne no longer asks `rc-service` to start an engine, so there is
+one owner and one actor per restart.
+
+This file is both the manual and the design record: the decisions are written next to the
+things they decide, because the reasons are only useful where someone is about to change the
+behaviour. The work is in `main.go` (config, routing, HTTP), `slot.go` (the lifecycle, the
+fence), `watch.go` (the router's health policy), `models.go` (which engine has which model),
+`reload.go` (applying a changed conf) and `cli.go`, and `slot_test.go` pins the parts that
+break.
 
 ## The estate
 
-| engine | port | owned by demesne | policy | routed |
+| | port | group | policy | role |
 | :-- | --: | :-- | :-- | :-- |
-| `llama` — llama.cpp router | 55555 | when adopted (else OpenRC) | resident | `/v1/*`, default |
-| `llamb` — aux router, GT 1030 | 55556 | when adopted (else OpenRC) | resident | no (addressed directly) |
-| `sd` — stable-diffusion.cpp | 55557 | always | on demand | `/sdapi/*`, `/v1/images/*` |
-| `whisper` — whisper.cpp | 55559 | when adopted | on demand | `/inference`, `/v1/audio/*` |
-| `demesne` itself | 55558 | — | — | all of the above |
+| **demesne** | 55555 | — | the service | the front door: the number every caller already means |
+| `llama` | 55556 | `gpu` | resident | llama.cpp router — 7–19 GiB rungs on the 20 GiB card |
+| `llamb` | 55557 | `aux` | resident | llama.cpp router — the GT 1030: embedder, reranker, OCR |
+| `sd` | 55558 | `gpu` | on demand | stable-diffusion.cpp; cannot unload, so it must be evicted |
+| `whisper` | 55559 | — | on demand | whisper.cpp, CPU only — contends for neither card nor group |
 
-`whisper` used to claim 55557 as well, as an OpenRC service beside sd, with nothing
-enforcing exclusivity. It is CPU-only, so the two were never exclusive — it was a port
-collision, and the fix is a port of its own (§3 of [DESIGN.md](DESIGN.md)).
+All four are demesne's children. `llama`, `llamb` and `whisper` are out of the OpenRC runlevel
+— two owners of one engine was the 2026-11-02 double restart — and their unit files are kept
+for hand-starting a single engine while debugging, with `conf.d` carrying the new port so a
+hand-start cannot land on the front door.
 
-## The problem
+Two invariants are enforced at startup, not discovered at runtime: **one slot per port**, and
+**one resident holder of a group**.
 
-On a one-tenant card this is not a scheduling nicety, it is a correctness problem:
+### Why a slot table and not "one GPU slot plus one media port"
+
+Because that shape cannot express llamb (a second, smaller card) or whisper (CPU-only), and
+it re-invents itself per engine anyway. One struct with one lifecycle, four rows of data:
+
+```
+name, url            identity and the port the child must bind
+bin, args, env, dir  the child spec: what to run, with what, where, with which environment
+group, vram          the scarce resource: exclusivity group, and whether it is on a card
+policy               external | on-demand | resident
+idle                 evict an on-demand child after this long with no request
+routed, router       may demesne route to it; and does its /v1/models decide routing
+cgroup               memory.high / memory.max / memory.swap.high in a delegated leaf
+```
+
+*Resident* engines are spawned at boot, restarted forever and never evicted. *On demand*
+engines are spawned by a request and evicted when idle or when a group peer wants the card.
+An engine with no command line is *external*: demesne routes to it and never touches it.
+
+## Why an arbitrator at all
+
+On a one-tenant card this is a correctness problem, not a scheduling nicety:
 
 - The llama router keeps a resident model — 17.6–19.7 GiB of a 20 GiB card.
 - A Qwen-Image DiT wants ~13 GiB, plus its VAE and a text encoder.
-- **`sd-server` cannot unload.** There is no flag and no endpoint (grep
-  `examples/server/*.cpp` for `unload`, `evict`, `release` — there is no such route); only
-  the *process exiting* frees the weights. Measured: 12.5 GiB → 0.03 GiB.
+- **`sd-server` cannot unload.** No flag, no endpoint; only the *process exiting* frees the
+  weights (measured: 12.5 GiB → 0.03 GiB).
 - Neither engine knows the other exists, so whichever loads second OOMs mid-load.
 
-So a plain always-on `sd-server` holds ~12.5 GiB until a human stops it, and **a local model
-cannot generate an image by itself**: to call the image model it would have to unload the
-very model making the call.
+So a plain always-on `sd-server` holds ~12.5 GiB until a human stops it, and a local model
+cannot generate an image by itself: to call the image model it would have to unload the very
+model making the call.
 
-## What it does
+And the decisions are not service-lifecycle-shaped. "Unload the router's models, wait for the
+VRAM to return, then spawn the media child" cannot be written as an OpenRC script, and the
+2026-11-02 double restart — `supervise-daemon` respawning llama every 5 s while `recoverLLM()`
+asked `rc-service` for the same restart — was an artefact of two owners, not of a bug.
+
+## What happens to a request
 
 | request | what happens |
 | :-- | :-- |
-| **generation** — `/v1/images/*`, `/sdapi/v1/txt2img`, `/img2img`, `/inference` | make room on the card, spawn the child, proxy to it, re-arm its idle clock |
-| **chat** — everything else, e.g. `/v1/chat/completions`, `/models/load` | evict the media child, **wait for the VRAM to actually return**, proxy to the router |
-| **metadata** — `/v1/models`, `/props`, `/health`, `/healthz` | proxy untouched; the router loads nothing for these, and a picker polls them constantly |
+| **chat** — `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, … | the model name picks the engine; if that engine is on the `gpu` card, the media child is evicted, the VRAM is waited for, then the request is proxied |
+| **generation** — `/sdapi/v1/txt2img`, `/img2img`, `/v1/images/*`, `/inference`, `/v1/audio/*` | make room on the card, spawn the child, proxy to it, re-arm its idle clock |
+| **metadata** — `/props`, `/health`, `/healthz` | proxy untouched; the router loads nothing for these |
 | **observation** — other `/sdapi/*` (`/progress`, `/options`, …) | proxy only if loaded, otherwise `503 sd is not loaded` |
 
 Plus a self-inflicted `keep_alive`: after `DEMESNE_IDLE` with no media request the child is
 stopped and the card frees itself. That is the feature sd.cpp does not have.
 
-The generation/observation split is not cosmetic. Without it a monitoring loop polling
-`/sdapi/v1/progress` would spawn the child and pin the card forever, defeating the idle
-timer entirely.
+The generation/observation split is not cosmetic: without it a monitoring loop polling
+`/sdapi/v1/progress` would spawn the child and pin the card forever, defeating the idle timer.
 
 **State needs no flags: the child's existence *is* the state.** `GET /status` reports
-`sd_child_up`, so "is sd loaded?" is answered by process liveness rather than a boolean
-that can desync. It also reports every slot: policy, pid, uptime, restarts, last error,
-and `port_held_elsewhere` when a port is answered by something demesne does not own.
+`sd_child_up`, so "is sd loaded?" is process liveness rather than a boolean that can desync.
 
-## Build and test
+### One port, four engines — the model name decides
 
-Stdlib only — no dependencies, no module cache, no network:
+The engines keep their own numbers; demesne sits on the one every caller already means, so a
+client does not need to know which engine has its model. The index is the union of both
+routers' `/v1/models`, refreshed on a 30 s ticker and built once before the listener opens:
+
+- a model only one router advertises goes there;
+- an unknown model keeps the path's answer, which is the router;
+- **the arbitration follows the slot the request reaches**, so a model on the small card never
+  evicts a render from the big one — that is what makes an aux-card client safe to route here;
+- **the llama breaker is scoped to llama.** It is built from that engine's failures; applying
+  it to the other card would refuse requests over somebody else's fault. (The first version of
+  `/v1/models` proxied to a *booting* router and shared the breaker's verdict — during a 41 s
+  cold start it fed the watch and asked for a restart of a router that was merely starting. It
+  now answers 503 itself and touches nothing.)
+- `/v1/models` is the estate's list, not one router's: merged, each entry keeping its own
+  fields, and when no router answers the caller gets a named 503 rather than an empty list,
+  because "no models" and "the router is down" are not the same answer.
+
+A path still decides the *kind* of request (`/sdapi/*` is the media child, `/v1/audio/*` is
+whisper); only the engine moves.
+
+## Operator interface — `/status` is the only status surface
+
+`/status` (JSON) is the one place to look, and the CLI is its client. The OpenRC verbs did not
+disappear, they changed subject: `rc-service --user demesne start|stop|restart` is the whole
+estate, and per-engine control is demesne's.
+
+It keeps stadi's field names (`slot`, `sd_child_up`, `sd_child_pid`, `llm_health`,
+`media_in_flight`, `idle_timeout_s`) and adds `slots[]` with, per engine: policy, owned, up,
+booting, pid, uptime, in-flight, restarts, last error, its cgroup, and `port_held_elsewhere`
+when something else owns the port.
+
+A status poll never takes the transition lock, so a cold load cannot wedge the surface that
+explains the cold load. State lives behind per-slot mutexes; the transition lock is only for
+transitions.
+
+The HTTP side: `GET /status`, `GET /estate/card`, `GET|POST /release[?slot=]`,
+`GET /slots/<name>`, `POST /slots/<name>/load|stop`, `POST /reload`, plus the proxied
+`/v1/*`, `/sdapi/*` and `/inference`.
+
+## The card, in one small document
+
+`/status` is the operator's document and it may grow. A *client* that only wants to know
+whether a card is busy gets a separate, deliberately tiny one:
 
 ```sh
-make            # build ./demesne, then vet and test
-make build      # just the binary
-make test       # go test -race ./...
-make install    # ~/bin/demesne, and the ~/bin/demense spelling as a symlink
+curl --unix-socket /run/user/1000/demesne.sock 'http://demesne/estate/card?group=gpu'
+{"group":"gpu","holders":[],"since_ms":0,
+ "slots":[{"name":"llama","state":"running"},{"name":"sd","state":"stopped"}]}
 ```
 
-`make install` also creates `demense`, because that is how everyone spells it on the first
-try. It is a symlink to the same binary, not a second name for anything else.
+A client that reacts to the card needs two booleans and a timestamp, and every field it parses
+becomes a field it depends on. `/status` stays the operator's and is free to grow; this one is
+not, and `TestEstateCardIsTheSmallTypedAnswer` fails when it does.
+
+- **`holders` is an array**, because the invariant is "at most one holder *at rest*": during
+  the handover from a render to a chat request both engines are up for the length of an
+  eviction, and a single-valued field would have to pick one and misreport the other.
+- **`holders` means the card, not the process.** For the media child those are the same thing;
+  idle, a router holds a port and about 28 MiB, so it counts only when a request is in flight
+  or when it reports a model `loaded`. A build that publishes no per-model status is treated
+  as *unknown*, not empty, and falls back to the process — the coarse answer, but never the
+  wrong way round.
+- **`since_ms`** is the earliest readiness among the holders — when the card became busy, not
+  when the request was made — and `0` when it is not known, which is the honest answer for an
+  engine demesne did not start. The field is always present, so a client never has to test for
+  its existence, and 0 is the one sentinel it has to understand.
+- **the group is the unit, not the device.** demesne never parses a driver's device name —
+  `ROCm0` for llama, `vulkan0` for sd, `CUDA0` for the GT 1030 that llamb lives on. Naming one
+  here would be a string from nowhere, and naming the wrong one is worse than naming none. A
+  caller that wants a label maps `gpu`/`aux` itself, where it knows which card it means.
+
+A slot appears with one of three states: `running`, `loading` (started, not yet answering — a
+cold sd load spends eight minutes there) or `stopped`. `loading` is in the vocabulary because
+it is the only state in which the card is about to be taken but is not yet, and a client that
+treats it as `stopped` will be evicted a minute later.
+
+## Two ways in
+
+One handler, two transports:
+
+```sh
+curl http://127.0.0.1:55555/status
+curl --unix-socket /run/user/1000/demesne.sock http://demesne/status
+```
+
+There is deliberately **no second protocol**. We control both ends of a ward↔demesne call, so
+the temptation is real — but HTTP costs nothing measurable here (chat is SSE at ~20 tok/s and
+a render takes eight minutes), while a bespoke dialect would mean a second implementation on
+both sides and the loss of the OpenAI contract that llama.cpp, sd, whisper and DSH already
+speak, streaming included.
+
+What the socket buys is the absence of a port: nothing to collide with, no listener any local
+process can dial, and a file mode that *is* the access control. So: **port for other people,
+socket for ourselves.**
+
+It is for **control**, not for inference. Ward's judge dials `llamb` directly (55557), because
+the aux card needs no arbitration and a judgement must never be the request that evicts a
+render. Ward declined to overload its `wd_http_loopback()` with a socket case, correctly: that
+predicate decides whether a bearer is invented and is also the check that stops `net.request`
+reaching a non-loopback endpoint. If a unix request ever needs the same exemption, it gets its
+own flag rather than a lie in the loopback test.
 
 ## Use
 
@@ -90,153 +212,289 @@ demesne reload                  # re-read conf.d; only what changed is touched
 demesne version
 ```
 
-The estate, as a block of ports — the engines keep their own numbers and demesne sits on the
-one every caller already means:
-
-| | llama | llamb | sd | whisper | demesne |
-| :-- | --: | --: | --: | --: | --: |
-| port | 55556 | 55557 | 55558 | 55559 | 55555 |
-
-Because one port answers for four engines, **the model name decides the engine**: demesne
-reads `model` from the request body, and both routers' `/v1/models` are merged into the answer
-the front door gives. A path still decides the *kind* of request (`/sdapi/*` is the media
-child, `/v1/audio/*` is whisper), and a model on the small card never evicts a render from the
-big one.
-
-The cgroup tree is `/sys/fs/cgroup/estate`, with `ctl` for demesne itself,
-`llama/{llm,aux}` for the two routers and `sd`/`whisper` beside them; the limits are re-written
-and the children re-joined on a timer, not only at startup.
-
-`demesne` with no subcommand runs the estate; OpenRC starts that. Per-engine `start|stop`
-is demesne's now, because `rc-service` cannot see a child demesne forked. Anything that
-still asks a port directly — DSH's `dsh-local` provider, for one — keeps talking to
-`:55558` and notices nothing.
-
-## Two ways in
-
-One handler, two transports. The port is for clients configured with a URL (DSH reaches
-`:55558` by name); `-socket` adds the same API on a unix socket, which is for anything
-running as you:
+`demesne` with no subcommand runs the estate, and OpenRC starts that:
 
 ```sh
-curl --unix-socket $XDG_RUNTIME_DIR/demesne.sock http://demesne/status
-demesne status          # or this, which takes the port
+rc-service --user demesne start|stop|restart|status
+rc-service --user demesne reload     # the same as `demesne reload`, via the socket
 ```
 
-There is deliberately **no second protocol**: the socket speaks the same OpenAI dialect and
-the same control endpoints, because a second dialect would mean a second implementation on
-both sides, and none of it would make a five-minute render or a 20 tok/s stream faster. What
-the socket buys is the absence of a port — nothing to collide with, no listener any local
-process can dial, and a file mode that is the access control. See §6a of
-[DESIGN.md](DESIGN.md) for why ward should use it for control and *not* for inference.
+Per-engine `start|stop` is demesne's now, because `rc-service` cannot see a child demesne
+forked. Clients configured with a URL (DSH's local providers, for one) talk to `:55555` and
+notice nothing.
 
-## The card, in one small document
+### What that cost
 
-`/status` is the operator's document and it may grow. A *client* that only wants to know
-whether the card is busy gets a separate, deliberately tiny one:
+| giving up | how it is covered |
+| :-- | :-- |
+| `supervise-daemon`'s respawn policy | `supervise()`: restart on exit, 5 s doubling to a 60 s cap, reset after a minute of health |
+| cgroup pinning in `init.d/*` (`start_post`) | per-slot `memLimit`: build the leaf, write the limits, join each child (`slot.go`) |
+| `rc-service --user llama restart` | `POST /slots/llama/load` / `stop`, or `demesne load llama` |
+| pidfiles, `rc-status` | `/status` (`demesne status`) |
+
+Per-engine shutdown is still by SIGTERM, and demesne takes every child down with it — the
+children are in their own process groups (`Setpgid`), so without that handler a service
+restart orphans ~12.5 GiB that nothing owns.
+
+### Restart policy — resident is eager, media is lazy, both bounded
+
+The policy is a property of the slot, and the two answers differ because the costs differ.
+
+- **resident** (llama, llamb): eager. Spawn at boot, restart on exit, 5 s doubling to a 60 s
+  cap, forever, reset after a minute of health. Never evicted. The watch no longer restarts
+  them — it *kills* a wedged child and lets the supervisor start it, so there is one actor.
+- **on demand** (sd, whisper): lazy, with the crash backoff the sd child never had. It used to
+  be logged, marked down, and retried immediately by the next request — each attempt able to
+  pay a 15-minute cold load. Now a slot that keeps dying is spaced out and the request is
+  refused with the reason and the wait.
+- `waitReady()` watches the child while it waits for the port, so a child that dies during
+  startup is reported in 500 ms rather than after the full 15-minute load bound.
+
+## Reload, without restarting
+
+The process environment is fixed at exec — OpenRC sourced `conf.d/demesne` into a shell that
+then exec'd the daemon — so a running demesne cannot see an edited file through `os.Getenv`.
+It reads the file instead: with a shell, under a minimal environment, so a variable *deleted*
+from the file cannot survive in the daemon's own. Without that, "reload" would quietly mean
+"reload what was already true".
 
 ```sh
-curl --unix-socket $XDG_RUNTIME_DIR/demesne.sock 'http://demesne/estate/card?group=gpu'
-{"group":"gpu","holders":["sd"],"since_ms":1793711314557,
- "slots":[{"name":"llama","state":"stopped"},{"name":"sd","state":"running"}]}
+rc-service --user demesne reload    # or: demesne reload, or POST /reload, or SIGHUP
+{"restarted":["sd"],"refused":null,"updated_in_place":null,"unchanged":["llama","llamb","whisper"]}
 ```
 
-`holders` is an array because the invariant is *at most one holder at rest*: during a
-handover both engines are up for the length of an eviction. `since_ms` is when the card
-became busy, and `0` when that is not known (an external engine's readiness is not an
-event demesne observed). `group` is the unit, not a driver's device name — see §6b.
+- **Applies**: a child's binary, command line, environment, working directory, URL, idle
+  clock, memory fence, and whether demesne supervises it at all.
+- **Refuses, by name**: `listen` and `socket` — they are the way in, and moving them under a
+  live instance would drop every client mid-stream. The rest of the file still applies.
+- **Only what changed is touched.** A child whose own fields moved is replaced (an engine
+  keeps the argv it was started with): a resident one by its supervisor, an on-demand one on
+  the next request. Everything unchanged keeps running.
 
-## Configure
+`specOf()` makes the spec a single consistent value a request can read while a reload swaps it,
+so a reload cannot tear a lookup.
 
-**Flags first, environment as the fallback.** Every setting is a command-line argument;
-each falls back to `DEMESNE_<NAME>`, then to `STADI_<NAME>` (still read, with a note on
-stderr), then to a portable default. `demesne -h` is the authoritative list.
+## The fence
+
+Every slot has a memory fence under `/sys/fs/cgroup/estate`, and the child is joined to it
+after **every** spawn — including respawns, because a supervisor that restarts an engine must
+not quietly restart it outside its limit. A one-minute timer re-asserts both the limits and the
+membership, so "bounded" is a running claim and not a startup one. `/status` publishes the
+fence as a fact: the leaf, the values, whether the current child is inside it, when that was
+last true, and the error when it is not.
+
+```
+/sys/fs/cgroup/estate        controllers, no processes
+  ctl                        demesne's supervisor
+  llama/                     controllers, no processes
+    llm                      the router      5G high / 6G max / 1G swap
+    aux                      the aux router  3G / 4G
+  sd                         the media child 6G / 8G (its text encoder is on the CPU)
+  whisper                    whisper         1G / 2G
+```
+
+The two routers share a parent because they are the two halves of one job, and a parent that
+holds no processes is the natural place for a limit that would one day cover both. demesne
+itself sits in `ctl` — a cgroup with controllers enabled for children cannot hold processes, so
+"demesne in the estate" means "demesne in a leaf of it".
+
+**Only one act needs privilege: the unit putting the supervisor into `estate/ctl`.** After that
+demesne owns the subtree and does everything else itself. Measured 2026-11-03 as `stem`, no
+sudo: `mkdir` inside `/estate` works, the files cgroupfs creates are owned by `stem`,
+`cgroup.subtree_control` can be written, and `memory.high` can be set in the grandchild — but
+moving a process in from a root-owned ancestor is `EPERM`, which is exactly the one thing the
+unit does. `cgroup-prepare`/`cgroup-join` remain as the fallback for a subtree owned by root (a
+first start, a rebuilt `/sys/fs/cgroup`).
+
+Warn-only, exactly as the init scripts were: a failure must never stop the service, or the box
+loses an engine to a permissions problem.
+
+Why not libcgroup: every operation it offers is a write to a file under `/sys/fs/cgroup`, which
+is what demesne already does in Go. A C library would mean cgo or a dependency for
+`os.WriteFile`, and it cannot make an unprivileged process privileged — the boundary was never
+the interface, it was the ownership.
+
+## Configuration
+
+One file: `~/.config/rc/conf.d/demesne` (which is `~/etc/conf.d/demesne` here).
+
+```sh
+export DEMESNE_LISTEN="127.0.0.1:55555"
+export DEMESNE_SOCKET="/run/user/1000/demesne.sock"
+export DEMESNE_CONF="/home/user/etc/conf.d/demesne"     # what a reload re-reads
+export DEMESNE_CGROUP_ROOT="/sys/fs/cgroup/estate"
+
+export DEMESNE_LLAMA="http://127.0.0.1:55556"
+export DEMESNE_LLAMA_BIN="/usr/bin/llama-server"
+export DEMESNE_LLAMA_DIR="/home/user/var/model/llm"     # models.ini is relative to it
+export DEMESNE_LLAMA_ARGS="--models-dir … --models-preset … --port 55556"
+export DEMESNE_LLAMA_ENV="HIP_VISIBLE_DEVICES=0 VK_DRIVER_FILES=…"
+export DEMESNE_LLAMA_MEMORY_HIGH="5G"
+export DEMESNE_LLAMA_MEMORY_MAX="6G"
+export DEMESNE_LLAMA_SWAP_HIGH="1G"
+```
+
+One file because the per-engine `conf.d/*` were only ever a transport for `rc-service`'s
+environment; the environment each *child* needs is a slot property (`-<slot>-env`), which is
+also the only way to give the two routers different Vulkan pins from one parent process.
+
+**Flags first, environment as the fallback.** Every setting is a command-line argument; each
+falls back to `DEMESNE_<NAME>`, then to `STADI_<NAME>` (still read, with a note on stderr),
+then to a portable default. `demesne -h` is the authoritative list. One engine's keys, all of
+them: `DEMESNE_<SLOT>` is the URL, then `_BIN`, `_DIR`, `_ARGS`, `_ENV`, `_MEMORY_HIGH`,
+`_MEMORY_MAX`, plus `_SWAP_HIGH` (llama) and `_IDLE` (the on-demand two).
 
 | flag | environment | default |
 | :-- | :-- | :-- |
 | `-listen` | `DEMESNE_LISTEN` | `127.0.0.1:55555` |
-| `-socket` | `DEMESNE_SOCKET` | none — same API on a unix socket, mode 0600 |
+| `-socket` | `DEMESNE_SOCKET` | none — the same API on a unix socket, mode 0600 |
 | `-llm` | `DEMESNE_LLAMA` (was `DEMESNE_LLM`) | `http://127.0.0.1:55556` — the router's URL |
-| `-sd` | `DEMESNE_SD` | `http://127.0.0.1:55558` — where the **child** comes up |
 | `-llamb` | `DEMESNE_LLAMB` | `http://127.0.0.1:55557` |
+| `-sd` | `DEMESNE_SD` | `http://127.0.0.1:55558` — where the **child** comes up |
 | `-whisper` | `DEMESNE_WHISPER` | `http://127.0.0.1:55559` |
 | `-idle` | `DEMESNE_IDLE` | `5m` — evict an on-demand child after this long with no request |
 | `-whisper-idle` | `DEMESNE_WHISPER_IDLE` | `10m` |
 | `-busy-wait` | `DEMESNE_BUSY_WAIT` | `2m` — how long a chat request waits for a render, then 503 |
 | `-vram-wait` | `DEMESNE_VRAM_WAIT` | `45s` — bound on waiting for the card to come back |
 | `-load-wait` | `DEMESNE_LOAD_WAIT` | `15m` — bound on a child's port appearing |
-| `-free-gib` | — | `2` — treat the card as free below this many GiB used |
-| `-restart-delay` | `DEMESNE_RESTART_DELAY` | `5s` — first delay between resident restarts |
+| `-conf` | `DEMESNE_CONF` | none — the file `SIGHUP` / `POST /reload` re-reads |
 | `-log-dir` | `DEMESNE_LOG_DIR` | `$XDG_CACHE_HOME/demesne` — one `<slot>.{log,err}` pair per engine |
-| `-sd-bin` | `DEMESNE_SD_BIN` | the `sd-server` found on `PATH` |
-| `-sd-args` | `DEMESNE_SD_ARGS` | **required** — the child's whole command line |
-| `-llama-bin` / `-llamb-bin` / `-whisper-bin` | `DEMESNE_<SLOT>_BIN` | **empty: leave that engine to OpenRC** |
-| `-<slot>-args` | `DEMESNE_<SLOT>_ARGS` | the child's command line |
-| `-<slot>-env` | `DEMESNE_<SLOT>_ENV` | extra `KEY=VALUE` for that child, e.g. its Vulkan pin |
-| `-<slot>-dir` | `DEMESNE_<SLOT>_DIR` | the child's working directory — a router's `models.ini` names weights relative to it |
-| `-conf` | `DEMESNE_CONF` | the file `SIGHUP`/`POST /reload` re-reads; unset = nothing to reload from |
-| `-llm-service` | `DEMESNE_LLM_SERVICE` | `llama` — legacy: the OpenRC service to restart |
-| `-llm-restart-wait` | `DEMESNE_LLM_RESTART_WAIT` | `3m` — legacy |
+| `-restart-delay` | `DEMESNE_RESTART_DELAY` | `5s` — doubling to a `60s` cap, reset after a minute of health |
 | `-restart-window` / `-restart-max` | `DEMESNE_RESTART_*` | `30m` / `2` |
-| `-breaker` / `-fail-threshold` | `DEMESNE_BREAKER` / `DEMESNE_FAIL_THRESHOLD` | `20s` / `2` |
+| `-breaker` / `-fail-threshold` | `DEMESNE_BREAKER` / `DEMESNE_FAIL_THRESHOLD` | `20s` / `2` — the router's breaker |
+| `-<slot>-bin` | `DEMESNE_<SLOT>_BIN` | found on `PATH`; **empty leaves that engine to OpenRC** |
+| `-<slot>-args` | `DEMESNE_<SLOT>_ARGS` | **required when adopting** — the child's whole command line |
+| `-<slot>-env` | `DEMESNE_<SLOT>_ENV` | extra `KEY=VALUE` for that child, e.g. its Vulkan pin |
+| `-<slot>-dir` | `DEMESNE_<SLOT>_DIR` | the child's working directory — a router's `models.ini` is relative to it |
 | `-cgroup-root` | `DEMESNE_CGROUP_ROOT` | `/sys/fs/cgroup/estate` |
-| `-cgroup-prepare` / `-cgroup-join` | `DEMESNE_CGROUP_*` | `cgroup-prepare`/`cgroup-join` on `PATH`, then `~/bin`; only the privileged fallback |
+| `-cgroup-prepare` / `-cgroup-join` | `DEMESNE_CGROUP_*` | on `PATH`, then `~/bin` — the *privileged fallback* only |
+| `-free-gib` | — | `2` — treat the card as free below this many GiB used |
+| `-llm-service` / `-llm-restart-wait` | `DEMESNE_LLM_*` | `llama` / `3m` — legacy: the restarter for an external router |
 | `-version` | — | print the version and exit |
 
-Memory fences are environment-only, three per slot, because they are set once and there
-are twelve of them: `DEMESNE_{SD,LLAMA,LLAMB,WHISPER}_{MEMORY_HIGH,MEMORY_MAX,SWAP_HIGH}`.
+Memory fences are environment-only, three per slot, because they are set once and there would
+be twelve flags: `DEMESNE_{LLAMA,LLAMB,SD,WHISPER}_{MEMORY_HIGH,MEMORY_MAX,SWAP_HIGH}`.
 
-There is deliberately **no hardcoded home path** anywhere: binaries are looked up on
-`PATH` and the log directory follows XDG, so the tool does not assume whose machine it is
-on.
+Two notes on the list-valued settings. They are space-separated — the environment is the
+natural transport for a list, and a unit file quoting one through `command_args` would need
+nested quotes OpenRC does not interpret. And `-sd-args` must **not** include
+`--params-backend`: that flag *disables* `--auto-fit`, which performs the graph segmentation
+that tiles a VAE decode too large for the card. Pinning `--backend` is safe; pinning the
+*params* split throws the fallback away.
 
-Two notes on the list-valued settings. They are space-separated strings — a list, so the
-environment is the natural transport for it, and a unit file quoting one through
-`command_args` would need nested quotes OpenRC does not interpret. And for
-stable-diffusion.cpp `-sd-args` must **not** include `--params-backend`: that flag's own
-`--help` says an explicit `--params-backend` **disables `--auto-fit`**, which is what
-performs the graph segmentation tiling a VAE decode too large for the card. Pinning the
-*params* split throws the fallback away; pinning `--backend` is safe.
+## What stays an OpenRC service
+
+Everything that does not hold a card or a contested port: `dsh`, `ward`, `gpg-agent`,
+`openmessage`, `rcsagent`, `adb` — and `demesne` itself, which is how it starts. `init.d/stadi`
+stays installed but out of the runlevel, as the rollback.
+
+## How it got here
+
+The migration went whisper first, then sd, then the two routers. The instinct was "sd first,
+because the demesne path is stadi's unchanged"; that is right about *risk* and wrong about
+*sequence* — the port collision could be dissolved without migrating anything, and the cheapest
+change should not wait behind the expensive one.
+
+| step | change | risk | rollback |
+| :-- | :-- | :-- | :-- |
+| 0 | `conf.d/whisper` onto its own port, no runlevel | none — already stopped | put the number back |
+| 1 | deploy demesne with the same `sd` settings (`STADI_*` still read) | low: the sd path is stadi's, unchanged in shape | stop demesne, start stadi |
+| 2 | `DEMESNE_WHISPER_*`; whisper leaves the OpenRC tree | low: CPU-only, lazy, no card | unset, `whisper start` |
+| 3 | `DEMESNE_LLAMA_*`; `rc-update del llama` | medium: the router is the busy engine | unset (it becomes external, still routed) |
+| 4 | `DEMESNE_LLAMB_*`; `rc-update del llamb` | low: the aux card, small models | as above |
+
+Step 1 was the only atomic one, because `stadi` and `demesne` both wanted the front port. The
+final layout goes one step further than the plan: demesne took **55555** — the number every
+caller already meant — and the engines moved up behind it, which is what turned "the port picks
+the engine" into "the model name picks the engine".
+
+**Version line:** `0.3.0`. `0.2.0` is stadi's; the fork line starts here so a log line names
+the right program.
+
+## The six problems in the fork snapshot
+
+| # | problem | disposition |
+| --: | :-- | :-- |
+| 1 | the 55557 collision, nothing enforcing exclusivity | whisper moved; duplicate ports are a startup error; a foreign holder is refused and named |
+| 2 | whisper unroutable: `/inference` fell through to llama | whisper is a routed slot; unconfigured it answers 503 naming itself |
+| 3 | double restart: the watch and `supervise-daemon` on one event | one actor — the supervisor restarts, the watch only kills a wedged child |
+| 4 | the sd child had no backoff | crash backoff on every on-demand slot, and `waitReady` notices a startup death in 500 ms |
+| 5 | no syslog; unrotated logs | not solved, only narrowed: one `<slot>.{log,err}` pair per engine, still unrotated |
+| 6 | orphaned VRAM freezes the LLM side for 24 h | unchanged on purpose: a restart cannot free an orphaned context, and a loop would only hide the fault. `/status` shows the three reasons separately (`orphaned`, `degraded`, `last_error`) |
+
+## What is still open
+
+- **log rotation** is real and unaddressed; the answer is probably a `logrotate` config outside
+  this repo, not code.
+- **sd's `--auto-fit` + VRAM wait** interact in a way that is only understood empirically: the
+  code warns and continues when the card is not free in time, which is right for sd and would
+  be wrong for an engine that OOMs cleanly.
+- **nothing yet notices a dead engine on its own.** The measured case: llama was down from
+  2026-11-02 17:34 until the next afternoon and nothing said so, because liveness was only ever
+  asked at request time. `/estate/card` reports it, but the operator's `/status` still reports
+  the *watch's* opinion of the router rather than the router's existence. A ticker with
+  `up/down/booting` per slot is the fix, and it is the difference between `/status` being a
+  fact and being a memory.
+- **the control vocabulary is the operator's, and one typed answer exists.** `/estate/card` is
+  the document a client reacts to; `/status`, `/release` and `/slots/<name>/load|stop` remain
+  shaped for a human. Anything further should be asked for by a client that needs it.
+
+## Build and test
+
+Stdlib only — no dependencies, no module cache, no network:
+
+```sh
+make            # build ./demesne, then vet and test
+make build      # just the binary
+make test       # go test -race ./...
+make install    # ~/bin/demesne, and the ~/bin/demense spelling as a symlink
+```
+
+The tests spawn the test binary as a stand-in engine, so the parts that actually break — spawn,
+readiness, idle eviction, supervisor restart, foreign-port refusal, model routing, reload, the
+card document — are exercised with no GPU, no models and no network.
 
 ## Measured
 
-Numbers from the machine it was written for — a 20 GiB RX 7900 XT, 4-thread Haswell, Vulkan:
+Numbers from this machine — a 20 GiB RX 7900 XT, a 2 GiB GT 1030, a 4-thread Haswell:
 
 | | |
 | :-- | :-- |
+| llama router, cold start to `listening` | **41 s** (it loads no model until asked) |
 | cold render, 20 steps | **508.6 s** (weights still page-cached) |
 | cold render, **1** step | **706.6 s** |
 | warm render | ~148.6 s ≈ 20 steps × 7 s — **pure sampling** |
-| idle release | fired **exactly** 5 min after the render ended; **12.136 → 0.026 GiB in 1 s** |
-| eviction on a chat request | child stopped and card released **before** the router was asked; the chat then answered in 51 s |
+| eviction on a chat request | child stopped, card released **before** the router was asked: **12.136 → 0.026 GiB in 1 s** |
+| idle release | fired **exactly** on the clock, then 12.136 → 0.026 GiB |
 
 The 1-step run being *slower* than the 20-step run is the interesting one: **the cost is the
-load, not the sampling.** ~700 s is weights and init whatever the step count, which is why
-the idle timeout is the lever that matters rather than the step count.
+load, not the sampling.** ~700 s is weights and init whatever the step count, which is why the
+idle timeout is the lever that matters.
 
 ## Design notes worth keeping
 
-Bugs found while building stadi, and kept here because the next reader will otherwise find
-them again:
+Bugs found while building this, kept because the next reader will otherwise find them again:
 
-1. **The idle timer must be armed from the *end* of a request, not the start.** It is first
-   armed when the child is ensured — before the render — and a cold render can take ten
-   minutes. A five-minute timer armed there kills the child mid-load. It re-arms when the
-   request completes, and refuses to fire while a generation is in flight.
-2. **The child must be killed on SIGTERM.** It is started in its own process group
-   (`Setpgid`) so that stopping it takes any children with it — which also means it does
-   *not* die when demesne does. Without a signal handler, a service restart orphans ~12.5
-   GiB that nothing owns any more.
-3. **A status surface must not take the transition lock.** The old broker held one mutex
-   across a cold load, so `/status` blocked for the whole eight minutes it took to describe.
-   State lives behind per-slot mutexes now; the transition lock is only for transitions.
-4. **A child that dies during startup is not a child that is still loading.** Waiting for a
-   port alone cannot tell the two apart, and the difference is fifteen minutes of someone's
+1. **The idle timer must be armed from the *end* of a request, not the start.** A cold render
+   can take ten minutes; a five-minute timer armed when the child is ensured kills it mid-load.
+2. **The child must be killed on SIGTERM.** It is in its own process group (`Setpgid`), which
+   means it does *not* die when demesne does. Without a handler, a service restart orphans
+   ~12.5 GiB that nothing owns.
+3. **A status surface must not take the transition lock**, or `/status` blocks for the whole
+   eight minutes it takes to describe.
+4. **A child that dies during startup is not a child that is still loading.** Waiting for a port
+   alone cannot tell the two apart, and the difference is fifteen minutes of someone's
    afternoon.
-
-And one operational trap: a `supervise-daemon` user service is stopped with SIGTERM, so a
-broker that spawns long-lived children **must** handle that signal. Cheap to do, expensive
-to skip.
+5. **An env key built from a name must uppercase it.** The fence asked for
+   `DEMESNE_sd_MEMORY_HIGH`, which nobody sets, so every limit in the estate was silently
+   unlimited for as long as the slot model existed. `/status` now publishes the fence it
+   actually applied, which is the only reason this class of bug stays fixed.
+6. **A helper looked up on `PATH` is a fence that may not exist.** A `supervise-daemon` service
+   has a `PATH` without `~/bin`; the first real start ran the whole estate unlimited, with one
+   log line per slot that nobody reads.
+7. **"Up" is not "holding the card".** A router with nothing loaded holds a port and about
+   28 MiB. The first card document said `holders:["llama"]` for exactly that, and a client
+   trusting it would refuse to render on a free card.
 
 ## Licence
 
