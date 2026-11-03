@@ -86,8 +86,26 @@ demesne release                 # evict every on-demand engine that is up
 demesne release sd              # ... or just one
 demesne load sd                 # start it and wait for the port (cold ≈ 8 min)
 demesne stop sd
+demesne reload                  # re-read conf.d; only what changed is touched
 demesne version
 ```
+
+The estate, as a block of ports — the engines keep their own numbers and demesne sits on the
+one every caller already means:
+
+| | llama | llamb | sd | whisper | demesne |
+| :-- | --: | --: | --: | --: | --: |
+| port | 55556 | 55557 | 55558 | 55559 | 55555 |
+
+Because one port answers for four engines, **the model name decides the engine**: demesne
+reads `model` from the request body, and both routers' `/v1/models` are merged into the answer
+the front door gives. A path still decides the *kind* of request (`/sdapi/*` is the media
+child, `/v1/audio/*` is whisper), and a model on the small card never evicts a render from the
+big one.
+
+The cgroup tree is `/sys/fs/cgroup/estate`, with `ctl` for demesne itself,
+`llama/{llm,aux}` for the two routers and `sd`/`whisper` beside them; the limits are re-written
+and the children re-joined on a timer, not only at startup.
 
 `demesne` with no subcommand runs the estate; OpenRC starts that. Per-engine `start|stop`
 is demesne's now, because `rc-service` cannot see a child demesne forked. Anything that

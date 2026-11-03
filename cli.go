@@ -30,9 +30,12 @@ const usage = `demesne -- one owner for the box's local-inference estate
   demesne release [slot]        evict one on-demand engine, or all that are up
   demesne load <slot>           start an engine and wait for its port
   demesne stop <slot>           stop an engine
+  demesne reload                re-read the config file; only what changed is touched
   demesne version               print the version
 
-Slots: llama (55555), llamb (55556), sd (55557), whisper (55559).
+The estate (SIGHUP re-reads the same file, POST /reload does it from the socket):
+
+  demesne 55555   llama 55556   llamb 55557   sd 55558   whisper 55559
 Every flag of the server is still accepted before the subcommand, and
 ` + "`DEMESNE_*`" + ` environment variables are honoured, so -listen and -socket work as usual.
 `
@@ -78,7 +81,7 @@ func runSubcommand(sub string, cfg config) {
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 		return
-	case "status", "release", "load", "start", "stop":
+	case "status", "release", "load", "start", "stop", "reload":
 	default:
 		fmt.Fprintf(os.Stderr, "demesne: unknown subcommand %q\n\n%s", sub, usage)
 		os.Exit(2)
@@ -95,6 +98,8 @@ func runSubcommand(sub string, cfg config) {
 		method, path = http.MethodPost, "/slots/"+slotArg(sub)+"/load"
 	case "stop":
 		method, path = http.MethodPost, "/slots/"+slotArg(sub)+"/stop"
+	case "reload":
+		method, path = http.MethodPost, "/reload"
 	}
 
 	body, errs := call(cfg, method, path)

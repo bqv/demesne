@@ -80,6 +80,33 @@ func (p policy) String() string {
 // demesne's children now: `rc_cgroup_settings` never worked for a --user service
 // anyway (openrc-run.sh:60 does not source rc-cgroup.sh under RC_USER_SERVICES), which
 // is why every init script carried forty lines of start_post() to do it by hand.
+// cgroupLeaf is where a slot's fence sits under the estate's cgroup root. The two routers
+// share a parent -- they are the two halves of one job -- and a parent that holds no
+// processes is also the obvious place for a limit that would cover both. Everything else
+// is flat.
+func cgroupLeaf(slot string) string {
+	switch slot {
+	case "llama":
+		return "llama/llm"
+	case "llamb":
+		return "llama/aux"
+	}
+	return slot
+}
+
+// cgroupStatus is the fence as /status reports it: what is set, whether the child is inside
+// it, and why not when it is not. "Maintained" is a claim, so it is published with a
+// timestamp rather than assumed.
+type cgroupStatus struct {
+	Leaf   string    `json:"leaf"`
+	High   string    `json:"high,omitempty"`
+	Max    string    `json:"max,omitempty"`
+	Swap   string    `json:"swap_high,omitempty"`
+	Joined bool      `json:"joined"`
+	At     time.Time `json:"applied_at,omitempty"`
+	Err    string    `json:"error,omitempty"`
+}
+
 type memLimit struct {
 	leaf     string // /sys/fs/cgroup/demesne/<slot>
 	high     string
@@ -127,7 +154,12 @@ type slotSpec struct {
 // short reads and writes; a transition (which may take minutes: a cold sd load is
 // ~8 min) holds demesne.transition instead, so /status is never blocked by a load.
 type slot struct {
-	spec slotSpec
+	// spec is written once at construction and by a reload, and read through specOf().
+	// The lock is separate from mu on purpose: specOf() is called from inside mu-held
+	// regions, and one lock for both would either deadlock or force every reader to
+	// know which region it is in.
+	spec   slotSpec
+	specMu sync.RWMutex
 
 	mu       sync.Mutex
 	child    *exec.Cmd
@@ -145,6 +177,11 @@ type slot struct {
 
 	inflight int64 // requests in flight (atomic): keeps the idle timer off
 
+	supervised bool      // a supervisor goroutine is responsible for this slot
+	cgJoined   bool      // the current child was moved into its leaf
+	cgAt       time.Time // when the fence (or the join) last succeeded
+	cgErr      string
+
 	// gone is closed when the child this slot last started has exited. One channel per
 	// child, not one per slot: with a single slot-wide channel a token left behind by a
 	// failed spawn would make the supervisor believe the NEXT child had died, and it
@@ -154,10 +191,10 @@ type slot struct {
 
 // ----------------------------------------------------------------- lifecycle
 
-func (s *slot) hostPort() string { return uriHostPort(s.spec.url) }
+func (s *slot) hostPort() string { return uriHostPort(s.specOf().url) }
 
 // port is the numeric port, for messages and duplicate-port checks.
-func (s *slot) port() int { return uriPort(s.spec.url) }
+func (s *slot) port() int { return uriPort(s.specOf().url) }
 
 func (s *slot) isUp() (bool, int) {
 	s.mu.Lock()
@@ -172,6 +209,32 @@ func (s *slot) booting() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.up && s.readyAt.IsZero()
+}
+
+func (s *slot) isSupervised() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.supervised
+}
+
+func (s *slot) setSupervised(v bool) {
+	s.mu.Lock()
+	s.supervised = v
+	s.mu.Unlock()
+}
+
+// specOf is the slot's configuration as one consistent value. A reload replaces the whole
+// struct, so a copy is a snapshot and a reader never sees half an apply.
+func (s *slot) specOf() slotSpec {
+	s.specMu.RLock()
+	defer s.specMu.RUnlock()
+	return s.spec
+}
+
+func (s *slot) setSpec(spec slotSpec) {
+	s.specMu.Lock()
+	s.spec = spec
+	s.specMu.Unlock()
 }
 
 // readySince is when this slot last became ready, or the zero time for an engine we
@@ -229,16 +292,16 @@ func (s *slot) armIdleLocked(d *demesne) {
 		s.timer.Stop()
 		s.timer = nil
 	}
-	if s.spec.idle <= 0 {
+	if s.specOf().idle <= 0 {
 		return
 	}
-	s.timer = time.AfterFunc(s.spec.idle, func() {
+	s.timer = time.AfterFunc(s.specOf().idle, func() {
 		if atomic.LoadInt64(&s.inflight) > 0 {
 			// Still rendering: start the clock again rather than killing it.
 			s.armIdle(d)
 			return
 		}
-		d.evict(s, fmt.Sprintf("no request for %s", s.spec.idle))
+		d.evict(s, fmt.Sprintf("no request for %s", s.specOf().idle))
 	})
 }
 
@@ -262,23 +325,23 @@ func (d *demesne) evict(s *slot, why string) {
 }
 
 func (d *demesne) ensureLocked(s *slot) error {
-	if up, _ := s.isUp(); up && portAlive(s.spec.url) {
+	if up, _ := s.isUp(); up && portAlive(s.specOf().url) {
 		s.armIdle(d)
 		return nil
 	}
-	if portAlive(s.spec.url) {
+	if portAlive(s.specOf().url) {
 		s.mu.Lock()
 		s.foreign = true
 		s.mu.Unlock()
 		return fmt.Errorf("%s is already served by a process demesne does not own "+
-			"(find it with: fuser -n tcp %d; stop it, then retry)", s.spec.url, s.port())
+			"(find it with: fuser -n tcp %d; stop it, then retry)", s.specOf().url, s.port())
 	}
-	if !s.spec.own() {
-		return fmt.Errorf("%s is not configured: give it a command line", s.spec.name)
+	if !s.specOf().own() {
+		return fmt.Errorf("%s is not configured: give it a command line", s.specOf().name)
 	}
 	if wait, n := s.backoffLeft(); wait > 0 {
 		return fmt.Errorf("%s has failed %d time(s) in a row; retrying in %s",
-			s.spec.name, n, wait.Round(time.Second))
+			s.specOf().name, n, wait.Round(time.Second))
 	}
 	if err := d.clearGroupLocked(s); err != nil {
 		return err
@@ -294,21 +357,21 @@ func (s slotSpec) own() bool { return s.bin != "" && s.policy != policyExternal 
 // because "the process exited" and "the driver freed the memory" are different
 // moments and only the second one makes a load succeed.
 func (d *demesne) clearGroupLocked(s *slot) error {
-	if s.spec.group == "" {
+	if s.specOf().group == "" {
 		return nil
 	}
 	for _, other := range d.slots {
-		if other == s || other.spec.group != s.spec.group {
+		if other == s || other.specOf().group != s.specOf().group {
 			continue
 		}
-		if other.spec.policy != policyOnDemand {
+		if other.specOf().policy != policyOnDemand {
 			continue
 		}
 		if up, _ := other.isUp(); up {
-			d.evictLocked(other, s.spec.name+" wants the "+s.spec.group)
+			d.evictLocked(other, s.specOf().name+" wants the "+s.specOf().group)
 		}
 	}
-	if !s.spec.vram {
+	if !s.specOf().vram {
 		return nil
 	}
 	d.unloadLLM()
@@ -326,32 +389,32 @@ func (d *demesne) spawnLocked(s *slot) error {
 	if err := os.MkdirAll(d.cfg.logDir, 0o755); err != nil {
 		return fmt.Errorf("log dir: %w", err)
 	}
-	out, err := openLog(d.cfg.logDir, s.spec.name+".log")
+	out, err := openLog(d.cfg.logDir, s.specOf().name+".log")
 	if err != nil {
-		return fmt.Errorf("open %s stdout: %w", s.spec.name, err)
+		return fmt.Errorf("open %s stdout: %w", s.specOf().name, err)
 	}
-	errf, err := openLog(d.cfg.logDir, s.spec.name+".err")
+	errf, err := openLog(d.cfg.logDir, s.specOf().name+".err")
 	if err != nil {
 		out.Close()
-		return fmt.Errorf("open %s stderr: %w", s.spec.name, err)
+		return fmt.Errorf("open %s stderr: %w", s.specOf().name, err)
 	}
 
-	cmd := exec.Command(s.spec.bin, s.spec.args...)
-	cmd.Dir = s.spec.dir
+	cmd := exec.Command(s.specOf().bin, s.specOf().args...)
+	cmd.Dir = s.specOf().dir
 	cmd.Stdout, cmd.Stderr = out, errf
-	cmd.Env = append(os.Environ(), s.spec.env...)
+	cmd.Env = append(os.Environ(), s.specOf().env...)
 	// One process group, so stopping the child also stops anything it forked. The
 	// cost is that it does NOT die with demesne: an orphaned sd-server is ~12.5 GiB
 	// nothing owns any more, so demesne takes every child down on the way out.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if s.spec.own() {
-		log.Printf("starting %s: %s %s", s.spec.name, s.spec.bin, strings.Join(s.spec.args, " "))
+	if s.specOf().own() {
+		log.Printf("starting %s: %s %s", s.specOf().name, s.specOf().bin, strings.Join(s.specOf().args, " "))
 	}
 	if err := cmd.Start(); err != nil {
 		out.Close()
 		errf.Close()
 		s.noteFailure(err)
-		return fmt.Errorf("start %s: %w", s.spec.name, err)
+		return fmt.Errorf("start %s: %w", s.specOf().name, err)
 	}
 
 	s.mu.Lock()
@@ -366,15 +429,15 @@ func (d *demesne) spawnLocked(s *slot) error {
 	d.joinCgroup(s, cmd.Process.Pid)
 
 	if err := d.waitReady(s, d.cfg.loadWait); err != nil {
-		d.evictLocked(s, fmt.Sprintf("%s never answered on %s", s.spec.name, s.spec.url))
+		d.evictLocked(s, fmt.Sprintf("%s never answered on %s", s.specOf().name, s.specOf().url))
 		s.noteFailure(err)
-		return fmt.Errorf("%s never came up on %s: %w", s.spec.name, s.spec.url, err)
+		return fmt.Errorf("%s never came up on %s: %w", s.specOf().name, s.specOf().url, err)
 	}
 	s.mu.Lock()
 	s.readyAt = time.Now()
 	s.mu.Unlock()
 	s.noteReady()
-	log.Printf("%s ready on %s (pid %d), vram %s", s.spec.name, s.spec.url, cmd.Process.Pid, vramString())
+	log.Printf("%s ready on %s (pid %d), vram %s", s.specOf().name, s.specOf().url, cmd.Process.Pid, vramString())
 	s.armIdle(d)
 	return nil
 }
@@ -387,7 +450,7 @@ func (d *demesne) spawnLocked(s *slot) error {
 func (d *demesne) waitReady(s *slot, limit time.Duration) error {
 	deadline := time.Now().Add(limit)
 	for time.Now().Before(deadline) {
-		if portAlive(s.spec.url) {
+		if portAlive(s.specOf().url) {
 			return nil
 		}
 		if up, _ := s.isUp(); !up {
@@ -425,7 +488,7 @@ func (d *demesne) reap(s *slot, cmd *exec.Cmd, out, errf io.Closer, gone chan st
 	// Always this child's own channel, whether or not the slot has moved on: the
 	// waiter for this process is the only thing on the other end.
 	close(gone)
-	log.Printf("%s (pid %d) exited: %v", s.spec.name, cmd.Process.Pid, err)
+	log.Printf("%s (pid %d) exited: %v", s.specOf().name, cmd.Process.Pid, err)
 }
 
 // evictLocked stops the child and waits for the card to come back. SIGTERM the whole
@@ -447,18 +510,18 @@ func (d *demesne) evictLocked(s *slot, why string) {
 	s.mu.Unlock()
 
 	if why != "" {
-		log.Printf("stopping %s (pid %d): %s, vram %s", s.spec.name, pid, why, vramString())
+		log.Printf("stopping %s (pid %d): %s, vram %s", s.specOf().name, pid, why, vramString())
 	}
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		if !portAlive(s.spec.url) {
+		if !portAlive(s.specOf().url) {
 			break
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	if portAlive(s.spec.url) {
-		log.Printf("%s (pid %d) ignored SIGTERM; killing", s.spec.name, pid)
+	if portAlive(s.specOf().url) {
+		log.Printf("%s (pid %d) ignored SIGTERM; killing", s.specOf().name, pid)
 		_ = syscall.Kill(-pid, syscall.SIGKILL)
 	}
 
@@ -466,11 +529,11 @@ func (d *demesne) evictLocked(s *slot, why string) {
 	s.child, s.pid, s.up, s.readyAt, s.stopping = nil, 0, false, time.Time{}, false
 	s.mu.Unlock()
 
-	if !s.spec.vram {
+	if !s.specOf().vram {
 		return
 	}
 	if err := waitVRAMBelow(d.cfg.freeBelow, d.cfg.vramWait); err != nil {
-		log.Printf("warning after stopping %s: %v", s.spec.name, err)
+		log.Printf("warning after stopping %s: %v", s.specOf().name, err)
 	} else {
 		log.Printf("card released, vram %s", vramString())
 	}
@@ -491,6 +554,9 @@ func (d *demesne) supervise(s *slot) {
 			return
 		default:
 		}
+		if !s.isSupervised() {
+			return
+		}
 
 		if attempt > 0 {
 			// One number for "how many times has this engine been restarted": every
@@ -510,7 +576,7 @@ func (d *demesne) supervise(s *slot) {
 			if d.closing.Load() {
 				return
 			}
-			log.Printf("supervise: %s did not start: %v (retrying in %s)", s.spec.name, err, delay)
+			log.Printf("supervise: %s did not start: %v (retrying in %s)", s.specOf().name, err, delay)
 			if !d.pause(s, delay) {
 				return
 			}
@@ -531,7 +597,7 @@ func (d *demesne) supervise(s *slot) {
 		if time.Since(started) > 60*time.Second {
 			delay = d.cfg.restartDelay
 		}
-		log.Printf("supervise: %s is gone; restarting in %s", s.spec.name, delay)
+		log.Printf("supervise: %s is gone; restarting in %s", s.specOf().name, delay)
 		if !d.pause(s, delay) {
 			return
 		}
@@ -592,22 +658,26 @@ func (d *demesne) stopAll(why string) {
 // failure must never abort: warn and carry on unlimited, exactly as the init scripts
 // did.
 func (d *demesne) prepareCgroup(s *slot) {
-	m := s.spec.cgroup
+	m := s.specOf().cgroup
 	if !m.set() {
 		return
 	}
 	if d.cfg.cgroupPrepare == "" {
 		log.Printf("warning: %s has a memory limit but no cgroup-prepare helper was found; "+
-			"running unlimited", s.spec.name)
+			"running unlimited", s.specOf().name)
 		return
 	}
 	out, err := exec.Command("sudo", "-n", d.cfg.cgroupPrepare,
 		filepath.Dir(m.leaf), filepath.Base(m.leaf)).CombinedOutput()
 	if err != nil {
+		s.mu.Lock()
+		s.cgErr = "prepare: " + trim(string(out), 200)
+		s.mu.Unlock()
 		log.Printf("warning: could not prepare %s for %s: %v %s (running unlimited)",
-			m.leaf, s.spec.name, err, trim(string(out), 200))
+			m.leaf, s.specOf().name, err, trim(string(out), 200))
 		return
 	}
+	var failed string
 	for _, kv := range [][2]string{
 		{"memory.high", m.high},
 		{"memory.max", m.max},
@@ -617,26 +687,107 @@ func (d *demesne) prepareCgroup(s *slot) {
 			continue
 		}
 		if err := os.WriteFile(filepath.Join(m.leaf, kv[0]), []byte(kv[1]), 0o644); err != nil {
-			log.Printf("warning: could not set %s=%s for %s: %v", kv[0], kv[1], s.spec.name, err)
+			failed = kv[0] + ": " + err.Error()
+			log.Printf("warning: could not set %s=%s for %s: %v", kv[0], kv[1], s.specOf().name, err)
 		}
 	}
+	s.mu.Lock()
+	s.cgAt, s.cgErr = time.Now(), failed
+	s.mu.Unlock()
 	log.Printf("%s: memory.high=%s memory.max=%s memory.swap.high=%s in %s",
-		s.spec.name, orUnchanged(m.high), orUnchanged(m.max), orUnchanged(m.swapHigh), m.leaf)
+		s.specOf().name, orUnchanged(m.high), orUnchanged(m.max), orUnchanged(m.swapHigh), m.leaf)
 }
 
 // joinCgroup moves a freshly forked child into its leaf. Root is needed because a
 // process cannot move itself without write access to the common ancestor's
 // cgroup.procs. Called per child now (there is no supervisor daemon to inherit from).
 func (d *demesne) joinCgroup(s *slot, pid int) {
-	m := s.spec.cgroup
+	m := s.specOf().cgroup
 	if !m.set() || d.cfg.cgroupJoin == "" {
 		return
 	}
 	if out, err := exec.Command("sudo", "-n", d.cfg.cgroupJoin,
 		strconv.Itoa(pid), m.leaf).CombinedOutput(); err != nil {
+		s.mu.Lock()
+		s.cgJoined, s.cgErr = false, "join: "+trim(string(out), 200)
+		s.mu.Unlock()
 		log.Printf("warning: could not move %s (pid %d) into %s: %v %s",
-			s.spec.name, pid, m.leaf, err, trim(string(out), 200))
+			s.specOf().name, pid, m.leaf, err, trim(string(out), 200))
+		return
 	}
+	s.mu.Lock()
+	s.cgJoined, s.cgAt, s.cgErr = true, time.Now(), ""
+	s.mu.Unlock()
+}
+
+// maintainCgroup re-asserts a fence that drifted: a child that was respawned outside its
+// leaf (a supervisor restart bypasses nothing, but a person running the engine by hand
+// does), or limits that something else rewrote. Cheap and idempotent -- the steady state
+// writes nothing.
+//
+// Why it exists at all: a fence that is applied once at startup and never checked is a
+// fence you believe in for exactly one boot. The estate's whole point is that the card and
+// the host RAM are bounded, so "bounded" has to be a running claim.
+func (d *demesne) maintainCgroup(s *slot) {
+	m := s.specOf().cgroup
+	if !m.set() {
+		return
+	}
+	if _, pid := s.isUp(); pid > 0 {
+		if joined, err := inCgroup(pid, m.leaf); err == nil && !joined {
+			log.Printf("%s: pid %d is not in %s; moving it back", s.specOf().name, pid, m.leaf)
+			d.joinCgroup(s, pid)
+		}
+	}
+	for _, kv := range [][2]string{
+		{"memory.high", m.high},
+		{"memory.max", m.max},
+		{"memory.swap.high", m.swapHigh},
+	} {
+		if kv[1] == "" {
+			continue
+		}
+		path := filepath.Join(m.leaf, kv[0])
+		got, err := os.ReadFile(path)
+		if err != nil || strings.TrimSpace(string(got)) != kv[1] {
+			if err := os.WriteFile(path, []byte(kv[1]), 0o644); err != nil {
+				log.Printf("warning: could not restore %s=%s for %s: %v", kv[0], kv[1], s.specOf().name, err)
+			}
+		}
+	}
+}
+
+// maintainCgroups is the timer behind maintainCgroup: a fence that is written once at
+// startup and never checked is a fence you believe in for exactly one boot.
+func (d *demesne) maintainCgroups() {
+	t := time.NewTicker(60 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-d.done:
+			return
+		case <-t.C:
+			for _, s := range d.slots {
+				d.maintainCgroup(s)
+			}
+		}
+	}
+}
+
+// inCgroup reports whether a pid's own membership names this leaf. It reads /proc rather
+// than asking systemd or the kernel through a helper, because this must be cheap enough to
+// run on a timer.
+func inCgroup(pid int, leaf string) (bool, error) {
+	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cgroup")
+	if err != nil {
+		return false, err
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if i := strings.LastIndex(line, ":"); i >= 0 && strings.TrimSpace(line[i+1:]) == leaf {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func orUnchanged(s string) string {

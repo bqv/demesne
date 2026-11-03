@@ -60,10 +60,11 @@ The estate, as configured:
 
 | slot | port | group | vram | policy | routed | why |
 | :-- | --: | :-- | :-- | :-- | :-- | :-- |
-| `llama` | 55555 | `gpu` | yes | resident (or external) | yes | the router; keeps a resident rung |
-| `sd` | 55557 | `gpu` | yes | on demand | yes | cannot unload; must be evicted |
+| `demesne` | 55555 | — | no | the service itself | — | the front door: the number every caller already means |
+| `llama` | 55556 | `gpu` | yes | resident (or external) | yes | the router; keeps a resident rung |
+| `llamb` | 55557 | `aux` | yes | resident (or external) | yes | second card; its models are routed by name too |
+| `sd` | 55558 | `gpu` | yes | on demand | yes | cannot unload; must be evicted |
 | `whisper` | 55559 | — | no | on demand | yes | CPU-only: contends for neither card nor group |
-| `llamb` | 55556 | `aux` | yes | resident (or external) | no | second card; its clients address it directly |
 
 Two invariants are enforced at startup, not discovered at runtime: **one slot per port**,
 and **one resident holder of a card per group**.
@@ -153,7 +154,7 @@ up, booting, pid, uptime, in-flight, restarts, last error, cgroup, and
 transition lock, so a cold load cannot wedge the surface that explains the cold load.
 
 The HTTP side: `GET /status`, `GET /estate/card` (the small typed one, §6b), `GET|POST
-/release[?slot=]`, `GET /slots/<name>`, `POST /slots/<name>/load|stop`.
+/release[?slot=]`, `GET /slots/<name>`, `POST /slots/<name>/load|stop`, `POST /reload` (§12).
 
 ---
 
@@ -230,6 +231,37 @@ A slot appears with one of three states: `running`, `loading` (started, not yet 
 a cold sd load spends eight minutes there) or `stopped`. `loading` is in the vocabulary
 because it is the only state in which the card is about to be taken but is not yet, and a
 client that treats it as `stopped` will be evicted a minute later.
+
+---
+
+## 6c. One port, four engines — the model name decides
+
+**Decided:** demesne answers on `55555`, the number every caller already means, and the
+engines move up behind it (`llama` 55556, `llamb` 55557, `sd` 55558, `whisper` 55559). A
+request names a model, and the name picks the engine; the path only says what kind of
+request it is.
+
+The old layout had it the other way round — the port picked the engine — which is why the
+numbers could not be reorganised without breaking every caller, and why a model on the small
+card was reachable only by knowing a different port. Both routers answer `/v1/models`; the
+index is the union of those answers, refreshed on a 30 s ticker and built once before the
+listener opens. An unknown model keeps the path's answer (the router), which is where such a
+request went before any of this existed.
+
+Two consequences worth stating, because both were mistakes waiting to happen:
+
+- **the arbitration follows the slot the request reaches, not the path.** An aux-card model
+  is in group `aux`, so asking for it never evicts a render from the `gpu` group. That is
+  what makes ward's judge safe to route here at all.
+- **the llama breaker is scoped to llama.** It is built from that engine's failures; applying
+  it to the other card would refuse requests over somebody else's fault. (The first version
+  of `/v1/models` proxied to a *booting* router and had to share the breaker's verdict —
+  during a 41 s cold start it fed the watch and asked for a restart of a router that was
+  simply starting. It now answers 503 itself and touches nothing.)
+
+`/v1/models` is the estate's list, not one router's: merged, each entry keeping its own
+fields, and when no router answers the caller gets a named 503 rather than an empty list,
+because "no models" and "the router is down" are not the same answer.
 
 ---
 
@@ -348,3 +380,55 @@ environment is the natural transport for a list, and a unit file quoting one thr
   `/slots/<name>/load|stop` remain shaped for a human. Anything further should be asked for
   by a client that needs it, not guessed at.
 
+---
+
+## 12. Live reload, and the fence that stays on
+
+Two promises a running estate has to keep without a restart.
+
+**Reload (`SIGHUP`, `POST /reload`, `demesne reload`, `rc-service --user demesne reload`).**
+The process environment is fixed at exec — OpenRC sourced `conf.d/demesne` into a shell that
+then exec'd the daemon, so a running demesne cannot see an edit through `os.Getenv`. It
+therefore reads the file the way OpenRC did, with a shell, under a minimal environment so a
+variable *deleted* from the file cannot survive in the daemon's own environment. (Without
+that, "reload" would quietly mean "reload what was already true".)
+
+What it applies: a child's binary, command line, environment, working directory, URL, idle
+clock, memory fence, and whether demesne supervises it at all. What it refuses: `listen` and
+`socket`, because those are the way in — a reload that moved them would drop every client
+mid-stream. It refuses them *by name* and still applies the rest.
+
+Only what changed is touched. A child whose own fields moved is replaced (an engine keeps the
+argv it was started with, so a new argv is a new process): a resident one is stopped and its
+supervisor starts it again from the new spec, an on-demand one stays down until the next
+request, and every unchanged child keeps running. `specOf()` makes the spec a single value a
+request can read while a reload swaps it, so a reload cannot tear a lookup.
+
+**The fence.** Every slot's `memory.high`/`memory.max`/`memory.swap.high` is written by
+demesne into a leaf, and the child is joined to it after **every** spawn — including respawns
+— because a supervisor that restarts an engine must not quietly restart it outside its limit.
+A timer re-asserts both the limits and the membership every minute, so "bounded" is a running
+claim and not a startup one. `/status` publishes the fence as a fact: the leaf, the values,
+whether the current child is inside it, when that was last true, and the error when it is not.
+
+The tree, and the reason for its shape:
+
+```
+/sys/fs/cgroup/estate        controllers, no processes
+  ctl                        demesne's supervisor
+  llama/                     controllers, no processes
+    llm                      the router's fence (5G high / 6G max, 1G swap)
+    aux                      the aux router's fence (3G / 4G)
+  sd                         the media child (6G / 8G: its text encoder is on the CPU)
+  whisper
+```
+
+The two routers share a parent because they are the two halves of one job, and a parent that
+holds no processes is the natural place for a limit that would one day cover both. demesne
+itself sits in `ctl` — a cgroup with controllers enabled for children cannot hold processes,
+so "demesne in the estate" means "demesne in a leaf of it".
+
+This was **broken in a way nothing could see** until 2026-11-03: the fence key was built from
+the slot name as written, so the code asked for `DEMESNE_sd_MEMORY_HIGH` and every limit in the
+estate was silently unlimited from the day the slot model landed. `/status` now reports the
+fence it actually applied, which is the only reason that class of bug stays fixed.

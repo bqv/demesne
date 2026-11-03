@@ -702,3 +702,136 @@ func TestModelsListIsTheWholeEstate(t *testing.T) {
 		}
 	}
 }
+
+// writeConf writes a conf.d in the shape OpenRC reads: plain shell assignments.
+func writeConf(t *testing.T, path string, kv map[string]string) {
+	t.Helper()
+	var b strings.Builder
+	for k, v := range kv {
+		fmt.Fprintf(&b, "export %s=%q\n", k, v)
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		t.Fatalf("write conf: %v", err)
+	}
+}
+
+// sdConf is the running test estate's own sd slot, expressed as a conf file: the reload
+// should find nothing to do with it.
+func sdConf(cfg config) map[string]string {
+	return map[string]string{
+		"DEMESNE_SD":     cfg.sd.url,
+		"DEMESNE_SD_BIN": cfg.sd.bin,
+		"DEMESNE_SD_ENV": strings.Join(cfg.sd.env, " "),
+		"DEMESNE_IDLE":   cfg.idle.String(),
+	}
+}
+
+func TestReloadLeavesAMatchingChildAlone(t *testing.T) {
+	cfg := testConfig(t)
+	path := filepath.Join(t.TempDir(), "demesne.conf")
+	cfg.confFile = path
+	d := newTestDemesne(t, cfg)
+	if err := d.ensure(d.slotByName("sd")); err != nil {
+		t.Fatalf("ensure(sd): %v", err)
+	}
+
+	kv := sdConf(cfg)
+	kv["DEMESNE_IDLE"] = "7s" // a clock, not a command line: applies without a restart
+	writeConf(t, path, kv)
+
+	rep, err := d.reload()
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if contains(rep.Restarted, "sd") {
+		t.Fatalf("reload restarted sd for a clock change: %+v", rep)
+	}
+	if up, _ := d.slotByName("sd").isUp(); !up {
+		t.Fatal("reload stopped a child it had no reason to touch")
+	}
+	if got := d.slotByName("sd").specOf().idle; got != 7*time.Second {
+		t.Fatalf("sd idle = %v, want 7s", got)
+	}
+}
+
+func TestReloadRestartsAChildWhoseArgsMoved(t *testing.T) {
+	cfg := testConfig(t)
+	path := filepath.Join(t.TempDir(), "demesne.conf")
+	cfg.confFile = path
+	d := newTestDemesne(t, cfg)
+	if err := d.ensure(d.slotByName("sd")); err != nil {
+		t.Fatalf("ensure(sd): %v", err)
+	}
+
+	kv := sdConf(cfg)
+	kv["DEMESNE_SD_ARGS"] = "--a-different-command-line"
+	writeConf(t, path, kv)
+
+	rep, err := d.reload()
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if !contains(rep.Restarted, "sd") {
+		t.Fatalf("a new command line did not restart sd: %+v", rep)
+	}
+	if up, _ := d.slotByName("sd").isUp(); up {
+		t.Fatal("the old child is still running with the old argv")
+	}
+	if got := d.slotByName("sd").specOf().args; len(got) != 1 || got[0] != "--a-different-command-line" {
+		t.Fatalf("sd args = %v", got)
+	}
+}
+
+// The way in cannot move under a running instance: every client would lose its connection
+// mid-stream. It is refused, and the rest of the file still applies.
+func TestReloadRefusesTheWayIn(t *testing.T) {
+	cfg := testConfig(t)
+	path := filepath.Join(t.TempDir(), "demesne.conf")
+	cfg.confFile = path
+	d := newTestDemesne(t, cfg)
+	before := d.cfg.listen
+
+	kv := sdConf(cfg)
+	kv["DEMESNE_LISTEN"] = "127.0.0.1:1"
+	writeConf(t, path, kv)
+
+	rep, err := d.reload()
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if !contains(rep.Refused, "listen") && !strings.HasPrefix(strings.Join(rep.Refused, " "), "listen") {
+		t.Fatalf("a moved listen address was not refused: %+v", rep)
+	}
+	if d.cfg.listen != before {
+		t.Fatalf("listen moved from %s to %s", before, d.cfg.listen)
+	}
+}
+
+// A running daemon cannot see an edited conf.d through os.Getenv, so it reads the file with
+// a shell -- and the file is the whole truth: a variable it drops must not survive from the
+// environment the daemon was started with.
+func TestReadConfFileIsTheWholeTruth(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "demesne.conf")
+	if err := os.WriteFile(path, []byte("export DEMESNE_SD_BIN=\"/bin/true\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	values, err := readConfFile(path)
+	if err != nil {
+		t.Fatalf("readConfFile: %v", err)
+	}
+	if values["DEMESNE_SD_BIN"] != "/bin/true" {
+		t.Fatalf("values = %v", values)
+	}
+	if _, ok := values["DEMESNE_SD_ARGS"]; ok {
+		t.Fatal("a variable the file does not set appeared in the values")
+	}
+}
+
+func contains(hay []string, needle string) bool {
+	for _, s := range hay {
+		if s == needle {
+			return true
+		}
+	}
+	return false
+}

@@ -250,7 +250,7 @@ func (d *demesne) recoverLLM(reason string) {
 			}
 		}
 
-		if s := d.slotByName("llama"); s != nil && s.spec.own() {
+		if s := d.slotByName("llama"); s != nil && s.specOf().own() {
 			// demesne owns the router: the supervisor is the only actor that starts it,
 			// so the useful thing here is to take down a child that is not answering.
 			// If it is already gone, this is a no-op and the supervisor is already
