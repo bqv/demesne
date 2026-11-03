@@ -499,6 +499,10 @@ func (d *demesne) reap(s *slot, cmd *exec.Cmd, out, errf io.Closer, gone chan st
 	if mine {
 		s.child, s.pid, s.up = nil, 0, false
 		s.readyAt = time.Time{}
+		// The fence described a child that no longer exists. /status said "joined" for a
+		// slot with nothing running, which is the same class of lie as a fence that was
+		// never applied.
+		s.cgJoined = false
 		if !ordered {
 			s.crash++
 			s.diedAt = time.Now()
