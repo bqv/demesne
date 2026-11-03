@@ -34,9 +34,9 @@ break.
 | `whisper` | 55559 | — | on demand | whisper.cpp, CPU only — contends for neither card nor group |
 
 All four are demesne's children. `llama`, `llamb` and `whisper` are out of the OpenRC runlevel
-— two owners of one engine was the 2026-11-02 double restart — and their unit files are kept
-for hand-starting a single engine while debugging, with `conf.d` carrying the new port so a
-hand-start cannot land on the front door.
+— two owners of one engine was the 2026-11-02 double restart — and their units and confs are
+gone too, archived with their last config in `~/var/archive/old-engine-services-*.tar.gz`.
+Nothing but demesne can claim an engine's port now, and nothing starts one but demesne.
 
 Two invariants are enforced at startup, not discovered at runtime: **one slot per port**, and
 **one resident holder of a group**.
