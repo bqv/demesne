@@ -138,6 +138,13 @@ The HTTP side: `GET /status`, `GET /estate/card`, `GET|POST /release[?slot=]`,
 `GET /slots/<name>`, `POST /slots/<name>/load|stop`, `POST /reload`, plus the proxied
 `/v1/*`, `/sdapi/*` and `/inference`.
 
+There is no `restart` verb, and for a resident engine it is not needed: `stop` **is** a
+restart, because the supervisor owns the bringing-back. Measured on llamb: stop at 17:40:43,
+"is gone; restarting in 5s" at 17:40:52, started 17:40:57, ready 17:41:13. On an on-demand
+engine `stop` is simply stop, and the next request starts it. demesne does not restart itself
+over RPC on purpose — the call would lose its own response, and a wedged release must have an
+actor outside the process; that is `rc-service --user demesne restart`.
+
 ## The card, in one small document
 
 `/status` is the operator's document and it may grow. A *client* that only wants to know
@@ -444,6 +451,14 @@ the right program.
 - **the control vocabulary is the operator's, and one typed answer exists.** `/estate/card` is
   the document a client reacts to; `/status`, `/release` and `/slots/<name>/load|stop` remain
   shaped for a human. Anything further should be asked for by a client that needs it.
+- **no `restart` verb, only a restart by consequence.** `POST /slots/<name>/stop` on a resident
+  engine restarts it after `restartDelay`, which is right for an operator and wrong for a
+  caller that wants it *now* (after dropping a new GGUF in the scan dir, say). The shape it
+  would take: `POST /slots/<name>/restart`, on-demand = stop then start, resident = stop and
+  nudge the supervisor past its delay. The nudge is a buffered channel per slot that
+  `supervise()` selects on beside its pause — without it the caller and the supervisor race,
+  and two engines fight for one port. Not built because it needs a demesne restart to exist,
+  and nobody has needed "now" yet.
 
 ## Build and test
 
