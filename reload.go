@@ -91,8 +91,8 @@ func readConfFile(path string) (map[string]string, error) {
 // command-line flags: a flag was set once, at boot, and a file that does not mention it
 // must not silently erase it. In practice the service passes no flags at all.
 func enginesFrom(get func(string) string) (map[string]engineConfig, time.Duration, time.Duration, string) {
-	// The URL key is not the slot name: llama's is DEMESNE_LLM. Everything else is the
-	// slot uppercased.
+	// One shape per engine: the bare name is the URL, then _BIN, _DIR, _ARGS, _ENV,
+	// _MEMORY_HIGH/_MEMORY_MAX. llama's URL also answers to DEMESNE_LLM, stadi's spelling.
 	engine := func(urlKey, slot, defaultURL string) engineConfig {
 		key := strings.ToUpper(slot)
 		return engineConfig{

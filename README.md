@@ -154,11 +154,11 @@ stderr), then to a portable default. `demesne -h` is the authoritative list.
 
 | flag | environment | default |
 | :-- | :-- | :-- |
-| `-listen` | `DEMESNE_LISTEN` | `127.0.0.1:55558` |
+| `-listen` | `DEMESNE_LISTEN` | `127.0.0.1:55555` |
 | `-socket` | `DEMESNE_SOCKET` | none — same API on a unix socket, mode 0600 |
-| `-llm` | `DEMESNE_LLM` | `http://127.0.0.1:55555` — the router's URL |
-| `-sd` | `DEMESNE_SD` | `http://127.0.0.1:55557` — where the **child** comes up |
-| `-llamb` | `DEMESNE_LLAMB` | `http://127.0.0.1:55556` |
+| `-llm` | `DEMESNE_LLAMA` (was `DEMESNE_LLM`) | `http://127.0.0.1:55556` — the router's URL |
+| `-sd` | `DEMESNE_SD` | `http://127.0.0.1:55558` — where the **child** comes up |
+| `-llamb` | `DEMESNE_LLAMB` | `http://127.0.0.1:55557` |
 | `-whisper` | `DEMESNE_WHISPER` | `http://127.0.0.1:55559` |
 | `-idle` | `DEMESNE_IDLE` | `5m` — evict an on-demand child after this long with no request |
 | `-whisper-idle` | `DEMESNE_WHISPER_IDLE` | `10m` |
@@ -173,12 +173,14 @@ stderr), then to a portable default. `demesne -h` is the authoritative list.
 | `-llama-bin` / `-llamb-bin` / `-whisper-bin` | `DEMESNE_<SLOT>_BIN` | **empty: leave that engine to OpenRC** |
 | `-<slot>-args` | `DEMESNE_<SLOT>_ARGS` | the child's command line |
 | `-<slot>-env` | `DEMESNE_<SLOT>_ENV` | extra `KEY=VALUE` for that child, e.g. its Vulkan pin |
+| `-<slot>-dir` | `DEMESNE_<SLOT>_DIR` | the child's working directory — a router's `models.ini` names weights relative to it |
+| `-conf` | `DEMESNE_CONF` | the file `SIGHUP`/`POST /reload` re-reads; unset = nothing to reload from |
 | `-llm-service` | `DEMESNE_LLM_SERVICE` | `llama` — legacy: the OpenRC service to restart |
 | `-llm-restart-wait` | `DEMESNE_LLM_RESTART_WAIT` | `3m` — legacy |
 | `-restart-window` / `-restart-max` | `DEMESNE_RESTART_*` | `30m` / `2` |
 | `-breaker` / `-fail-threshold` | `DEMESNE_BREAKER` / `DEMESNE_FAIL_THRESHOLD` | `20s` / `2` |
-| `-cgroup-root` | `DEMESNE_CGROUP_ROOT` | `/sys/fs/cgroup/demesne` |
-| `-cgroup-prepare` / `-cgroup-join` | `DEMESNE_CGROUP_*` | `PATH` |
+| `-cgroup-root` | `DEMESNE_CGROUP_ROOT` | `/sys/fs/cgroup/estate` |
+| `-cgroup-prepare` / `-cgroup-join` | `DEMESNE_CGROUP_*` | `cgroup-prepare`/`cgroup-join` on `PATH`, then `~/bin`; only the privileged fallback |
 | `-version` | — | print the version and exit |
 
 Memory fences are environment-only, three per slot, because they are set once and there
