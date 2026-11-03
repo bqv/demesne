@@ -782,12 +782,31 @@ func inCgroup(pid int, leaf string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	// /proc/<pid>/cgroup names the path RELATIVE to the cgroup root ("/estate/llama/llm"),
+	// while the spec carries the absolute one. Comparing them raw never matches, which
+	// would have had the maintainer re-join every child on every tick for ever.
+	want := strings.TrimPrefix(leaf, cgroupMount)
 	for _, line := range strings.Split(string(b), "\n") {
-		if i := strings.LastIndex(line, ":"); i >= 0 && strings.TrimSpace(line[i+1:]) == leaf {
+		if i := strings.LastIndex(line, ":"); i >= 0 && strings.TrimSpace(line[i+1:]) == want {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+// prepareCgroupRoot makes the estate's own subtree before any leaf is set up. cgroup-prepare
+// wants a leaf, so the supervisor's own leaf is the one it creates: the side effect -- and
+// the point -- is that controllers are enabled on /estate, without which no child leaf can
+// have memory.* files at all.
+func (d *demesne) prepareCgroupRoot() {
+	if d.cfg.cgroupPrepare == "" {
+		return
+	}
+	if out, err := exec.Command("sudo", "-n", d.cfg.cgroupPrepare,
+		d.cfg.cgroupRoot, "ctl").CombinedOutput(); err != nil {
+		log.Printf("warning: could not prepare %s: %v %s (the estate will run unlimited)",
+			d.cfg.cgroupRoot, err, trim(string(out), 200))
+	}
 }
 
 func orUnchanged(s string) string {

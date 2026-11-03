@@ -108,6 +108,7 @@ type config struct {
 // The estate's ports, in one place. demesne sits on the number every caller already means
 // and the engines keep their own; a reload and a boot read these same defaults.
 const (
+	cgroupMount       = "/sys/fs/cgroup"
 	cgroupRootDefault = "/sys/fs/cgroup/estate"
 	defaultLlamaURL   = "http://127.0.0.1:55556"
 	defaultLlambURL   = "http://127.0.0.1:55557"
@@ -1061,6 +1062,7 @@ func main() {
 		}
 	}
 
+	d.prepareCgroupRoot()
 	for _, s := range d.slots {
 		d.prepareCgroup(s)
 	}
