@@ -105,7 +105,13 @@ func enginesFrom(get func(string) string) (map[string]engineConfig, time.Duratio
 	}
 	cgroupRoot := firstNonEmpty(get("CGROUP_ROOT"), cgroupRootDefault)
 	return map[string]engineConfig{
-		"llama":   engine("LLM", "llama", defaultLlamaURL),
+		// llama's URL has an old spelling as well as a new one; every other engine's URL key
+		// is its slot name and nothing else.
+		"llama": func() engineConfig {
+			e := engine("LLAMA", "llama", defaultLlamaURL)
+			e.url = firstNonEmpty(get("LLAMA"), firstNonEmpty(get("LLM"), defaultLlamaURL))
+			return e
+		}(),
 		"llamb":   engine("LLAMB", "llamb", defaultLlambURL),
 		"sd":      engine("SD", "sd", defaultSDURL),
 		"whisper": engine("WHISPER", "whisper", defaultWhisperURL),

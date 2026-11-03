@@ -185,6 +185,21 @@ func memLimitFor(root, slot string, get func(string) string) memLimit {
 	return m
 }
 
+// llamaURL keeps the slot's name on the slot's URL. Every other knob of that engine is
+// DEMESNE_LLAMA_*, so DEMESNE_LLM was the one name that did not match the thing it named --
+// and a value silently accepted under an old spelling is how an afternoon gets spent
+// wondering why the documented one did nothing.
+func llamaURL(flagVal string) string {
+	if v := envString(flagVal, "LLAMA", ""); v != "" {
+		return v
+	}
+	if v := envRaw("LLM"); v != "" {
+		log.Printf("note: DEMESNE_LLM is the old spelling of DEMESNE_LLAMA; using it, but the slot's name is the one to set")
+		return v
+	}
+	return defaultLlamaURL
+}
+
 func envRaw(key string) string {
 	if v := os.Getenv(envPrefix + key); v != "" {
 		return v
@@ -341,7 +356,7 @@ func loadConfig() config {
 			cgroup: memLimitFor(cgroupRoot, "sd", envRaw),
 		},
 		llama: engineConfig{
-			url:    envString(*fLLM, "LLM", defaultLlamaURL),
+			url:    llamaURL(*fLLM),
 			bin:    envString(*fLlamaBin, "LLAMA_BIN", ""),
 			args:   fields(envString(*fLlamaArgs, "LLAMA_ARGS", "")),
 			env:    fields(envString(*fLlamaEnv, "LLAMA_ENV", "")),
