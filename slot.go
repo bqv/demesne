@@ -94,6 +94,28 @@ func cgroupLeaf(slot string) string {
 	return slot
 }
 
+// makeLeaf builds one slot's leaf inside the estate's subtree, without privilege.
+//
+// This works because the subtree is delegated to this user: cgroup-prepare chowns the
+// directories it makes, and files cgroupfs creates for a cgroup we make are owned by us, so
+// a leaf we create here is a leaf we can write limits into. It fails on a subtree owned by
+// root -- a first start, or a box whose /sys/fs/cgroup was rebuilt -- and the caller falls
+// back to the helper for exactly that case.
+func makeLeaf(m memLimit) error {
+	if err := os.MkdirAll(m.leaf, 0o755); err != nil {
+		return err
+	}
+	// A controller only appears in a child once it is enabled in the parent, and the
+	// parent's subtree_control is idempotent to write.
+	parent := filepath.Join(filepath.Dir(m.leaf), "cgroup.subtree_control")
+	if _, err := os.Stat(filepath.Join(m.leaf, "memory.high")); err != nil {
+		if err := os.WriteFile(parent, []byte("+memory +pids"), 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // cgroupStatus is the fence as /status reports it: what is set, whether the child is inside
 // it, and why not when it is not. "Maintained" is a claim, so it is published with a
 // timestamp rather than assumed.
@@ -667,15 +689,20 @@ func (d *demesne) prepareCgroup(s *slot) {
 			"running unlimited", s.specOf().name)
 		return
 	}
-	out, err := exec.Command("sudo", "-n", d.cfg.cgroupPrepare,
-		filepath.Dir(m.leaf), filepath.Base(m.leaf)).CombinedOutput()
-	if err != nil {
-		s.mu.Lock()
-		s.cgErr = "prepare: " + trim(string(out), 200)
-		s.mu.Unlock()
-		log.Printf("warning: could not prepare %s for %s: %v %s (running unlimited)",
-			m.leaf, s.specOf().name, err, trim(string(out), 200))
-		return
+	if err := makeLeaf(m); err != nil {
+		// The subtree is ours, so this normally succeeds without privilege; the helper is
+		// the answer when it does not (a subtree owned by root, a first start before the
+		// unit has delegated anything).
+		out, herr := exec.Command("sudo", "-n", d.cfg.cgroupPrepare,
+			filepath.Dir(m.leaf), filepath.Base(m.leaf)).CombinedOutput()
+		if herr != nil {
+			s.mu.Lock()
+			s.cgErr = "prepare: " + trim(string(out), 200)
+			s.mu.Unlock()
+			log.Printf("warning: could not prepare %s for %s: %v (direct: %v) %s (running unlimited)",
+				m.leaf, s.specOf().name, herr, err, trim(string(out), 200))
+			return
+		}
 	}
 	var failed string
 	for _, kv := range [][2]string{
@@ -706,14 +733,20 @@ func (d *demesne) joinCgroup(s *slot, pid int) {
 	if !m.set() || d.cfg.cgroupJoin == "" {
 		return
 	}
-	if out, err := exec.Command("sudo", "-n", d.cfg.cgroupJoin,
-		strconv.Itoa(pid), m.leaf).CombinedOutput(); err != nil {
-		s.mu.Lock()
-		s.cgJoined, s.cgErr = false, "join: "+trim(string(out), 200)
-		s.mu.Unlock()
-		log.Printf("warning: could not move %s (pid %d) into %s: %v %s",
-			s.specOf().name, pid, m.leaf, err, trim(string(out), 200))
-		return
+	// Direct first: a child of demesne is forked inside /estate/ctl, and the common
+	// ancestor of that and its leaf is /estate, which this user owns. The helper (which
+	// walks the tree, and needs root) is the answer for a process that came from outside.
+	if err := os.WriteFile(filepath.Join(m.leaf, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0o644); err != nil {
+		out, herr := exec.Command("sudo", "-n", d.cfg.cgroupJoin,
+			strconv.Itoa(pid), m.leaf).CombinedOutput()
+		if herr != nil {
+			s.mu.Lock()
+			s.cgJoined, s.cgErr = false, "join: "+trim(string(out), 200)
+			s.mu.Unlock()
+			log.Printf("warning: could not move %s (pid %d) into %s: %v (direct: %v) %s",
+				s.specOf().name, pid, m.leaf, herr, err, trim(string(out), 200))
+			return
+		}
 	}
 	s.mu.Lock()
 	s.cgJoined, s.cgAt, s.cgErr = true, time.Now(), ""

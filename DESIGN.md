@@ -104,10 +104,26 @@ Cheapest concrete win, and it needs neither the card nor a cold load: it is one 
 carried forty lines of `start_post()`; those forty lines cannot follow a child into
 demesne. So demesne does the same three steps itself:
 
-1. `sudo -n cgroup-prepare /sys/fs/cgroup/demesne <slot>` — delegate the leaf;
+1. build the leaf inside `/sys/fs/cgroup/estate`, unprivileged — the subtree is delegated
+   to this user, and files cgroupfs creates for a cgroup we make are ours;
 2. write `memory.high`, `memory.max`, `memory.swap.high` from the environment;
-3. `sudo -n cgroup-join <child pid> <leaf>` after every spawn (there is no supervisor
-   daemon to inherit from any more).
+3. move the child into it after every spawn (there is no supervisor daemon to inherit from
+   any more).
+
+**Only one privileged act remains: the unit putting the supervisor into `estate/ctl`.**
+Measured 2026-11-03 as `stem`, no sudo: `mkdir` inside `/estate` works, the files it creates
+are owned by `stem`, `cgroup.subtree_control` can be written, and `memory.high` can be set in
+the grandchild — but moving *this shell* in from a root-owned ancestor is EPERM. Once the
+supervisor is inside the subtree, its children are forked there, so the common ancestor of
+`estate/ctl` and `estate/llama/llm` is `estate`, which the user owns, and the move is
+unprivileged. The `sudo` helpers (`cgroup-prepare`, `cgroup-join`) remain as the fallback for
+a subtree owned by root — a first start, or a rebuilt `/sys/fs/cgroup` — and that is the only
+reason they are still in the tree.
+
+Why not libcgroup: every operation it offers is a write to a file under `/sys/fs/cgroup`, which
+is what demesne already does in Go. A C library would mean cgo or a dependency for
+`os.WriteFile`, and it cannot make an unprivileged process privileged — the boundary was never
+the interface, it was the ownership.
 
 Warn-only, exactly as the init scripts were: a failure must never stop the service, or
 the box loses an engine to a permissions problem. Limits live in `conf.d/demesne` as
