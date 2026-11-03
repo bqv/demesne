@@ -10,8 +10,9 @@ one port. It `fork/exec`s every engine it owns, decides who may hold a card and 
 each request to the engine that actually has the model, and answers for all of it on
 `127.0.0.1:55555`.
 
-It is a fork of [`stadi`](https://github.com/bqv/stadi) at `ad49321`, which was a slot broker
-in front of *two* engines. The slot broker is the hard part and it is unchanged in spirit;
+It is a fork of `stadi` at `ad49321`, which was a slot broker in front of *two* engines.
+That repository was deleted once demesne had taken over; its commits live on in this history,
+and in the local checkout beside this one. The slot broker is the hard part and it is unchanged in spirit;
 what grew is ownership — demesne no longer asks `rc-service` to start an engine, so there is
 one owner and one actor per restart.
 
