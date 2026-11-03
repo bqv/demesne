@@ -11,8 +11,8 @@ each request to the engine that actually has the model, and answers for all of i
 `127.0.0.1:55555`.
 
 It is a fork of `stadi` at `ad49321`, which was a slot broker in front of *two* engines.
-That repository was deleted once demesne had taken over; its commits live on in this history,
-and in the local checkout beside this one. The slot broker is the hard part and it is unchanged in spirit;
+That repository, its checkout, its unit, its conf and its binary were all deleted once demesne
+had taken the estate over; its commits live on in this history, and nowhere else. The slot broker is the hard part and it is unchanged in spirit;
 what grew is ownership — demesne no longer asks `rc-service` to start an engine, so there is
 one owner and one actor per restart.
 
@@ -386,8 +386,12 @@ that tiles a VAE decode too large for the card. Pinning `--backend` is safe; pin
 ## What stays an OpenRC service
 
 Everything that does not hold a card or a contested port: `dsh`, `ward`, `gpg-agent`,
-`openmessage`, `rcsagent`, `adb` — and `demesne` itself, which is how it starts. `init.d/stadi`
-stays installed but out of the runlevel, as the rollback.
+`openmessage`, `rcsagent`, `adb` — and `demesne` itself, which is how it starts.
+
+`stadi` is gone: unit, conf, binary, checkout, repository and cgroup. There is no second
+daemon to fall back to, so the rollback for a bad release is demesne's previous commit rather
+than a parallel owner — which is the point of having one owner, and the reason the migration
+was done one engine at a time while the old one was still installed.
 
 ## How it got here
 
@@ -399,12 +403,13 @@ change should not wait behind the expensive one.
 | step | change | risk | rollback |
 | :-- | :-- | :-- | :-- |
 | 0 | `conf.d/whisper` onto its own port, no runlevel | none — already stopped | put the number back |
-| 1 | deploy demesne with the same `sd` settings (`STADI_*` still read) | low: the sd path is stadi's, unchanged in shape | stop demesne, start stadi |
+| 1 | deploy demesne with the same `sd` settings (`STADI_*` still read) | low: the sd path is stadi's, unchanged in shape | stop demesne, start stadi (until stadi was deleted) |
 | 2 | `DEMESNE_WHISPER_*`; whisper leaves the OpenRC tree | low: CPU-only, lazy, no card | unset, `whisper start` |
 | 3 | `DEMESNE_LLAMA_*`; `rc-update del llama` | medium: the router is the busy engine | unset (it becomes external, still routed) |
 | 4 | `DEMESNE_LLAMB_*`; `rc-update del llamb` | low: the aux card, small models | as above |
 
-Step 1 was the only atomic one, because `stadi` and `demesne` both wanted the front port. The
+Step 1 was the only atomic one, because `stadi` and `demesne` both wanted the front port — and
+that rollback existed only while stadi did. The
 final layout goes one step further than the plan: demesne took **55555** — the number every
 caller already meant — and the engines moved up behind it, which is what turned "the port picks
 the engine" into "the model name picks the engine".
