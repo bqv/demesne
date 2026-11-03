@@ -592,6 +592,8 @@ func (d *demesne) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case p == "/status":
 		d.status(w)
+	case p == "/estate/card":
+		d.card(w, r)
 	case p == "/release":
 		d.handleRelease(w, r)
 	case strings.HasPrefix(p, "/slots/"):
@@ -802,6 +804,65 @@ func slotName(sdUp bool) string {
 		return "sd"
 	}
 	return "llm"
+}
+
+// ----------------------------------------------------------------- /estate/card
+
+// estateCard is the typed answer to "who holds this card, and since when". It exists
+// beside /status rather than inside it: a client that reacts to the card should not have
+// to parse four kilobytes of operator detail to find two booleans, and every field it
+// parses is a field it comes to depend on. The four fields below are the whole contract.
+type estateCard struct {
+	Group   string     `json:"group"`
+	Holders []string   `json:"holders"`
+	SinceMS int64      `json:"since_ms"`
+	Slots   []cardSlot `json:"slots"`
+}
+
+type cardSlot struct {
+	Name  string `json:"name"`
+	State string `json:"state"`
+}
+
+// card answers for one exclusivity group, "gpu" by default.
+//
+// holders is an ARRAY, not one value, because the invariant is "at most one holder at
+// rest": during a handover both engines can be up for the length of an eviction, and a
+// client that cannot express that would have to guess which one is lying.
+//
+// since_ms is the earliest readiness among the current holders -- when the card became
+// busy, not when this request was made -- and 0 when the group is idle or the holder is
+// an engine demesne did not start (an external one has no moment of readiness that we
+// observed, and inventing one would be a guess).
+func (d *demesne) card(w http.ResponseWriter, r *http.Request) {
+	group := r.URL.Query().Get("group")
+	if group == "" {
+		group = "gpu"
+	}
+	out := estateCard{Group: group, Holders: []string{}, Slots: []cardSlot{}}
+	for _, s := range d.slots {
+		if s.spec.group != group {
+			continue
+		}
+		st := slotStatusOf(s)
+		state := "stopped"
+		switch {
+		case st.Up && st.Booting:
+			state = "loading"
+		case st.Up:
+			state = "running"
+		}
+		out.Slots = append(out.Slots, cardSlot{Name: s.spec.name, State: state})
+		if state != "running" {
+			continue
+		}
+		out.Holders = append(out.Holders, s.spec.name)
+		if since := s.readySince().UnixMilli(); since > 0 && (out.SinceMS == 0 || since < out.SinceMS) {
+			out.SinceMS = since
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
 }
 
 // ------------------------------------------------------------------ /release

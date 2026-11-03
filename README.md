@@ -112,6 +112,22 @@ the socket buys is the absence of a port — nothing to collide with, no listene
 process can dial, and a file mode that is the access control. See §6a of
 [DESIGN.md](DESIGN.md) for why ward should use it for control and *not* for inference.
 
+## The card, in one small document
+
+`/status` is the operator's document and it may grow. A *client* that only wants to know
+whether the card is busy gets a separate, deliberately tiny one:
+
+```sh
+curl --unix-socket $XDG_RUNTIME_DIR/demesne.sock 'http://demesne/estate/card?group=gpu'
+{"group":"gpu","holders":["sd"],"since_ms":1793711314557,
+ "slots":[{"name":"llama","state":"stopped"},{"name":"sd","state":"running"}]}
+```
+
+`holders` is an array because the invariant is *at most one holder at rest*: during a
+handover both engines are up for the length of an eviction. `since_ms` is when the card
+became busy, and `0` when that is not known (an external engine's readiness is not an
+event demesne observed). `group` is the unit, not a driver's device name — see §6b.
+
 ## Configure
 
 **Flags first, environment as the fallback.** Every setting is a command-line argument;

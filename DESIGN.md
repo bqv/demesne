@@ -152,8 +152,8 @@ up, booting, pid, uptime, in-flight, restarts, last error, cgroup, and
 `port_held_elsewhere` when something else owns the port. A status poll never takes the
 transition lock, so a cold load cannot wedge the surface that explains the cold load.
 
-The HTTP side: `GET /status`, `GET|POST /release[?slot=]`, `GET /slots/<name>`,
-`POST /slots/<name>/load|stop`.
+The HTTP side: `GET /status`, `GET /estate/card` (the small typed one, §6b), `GET|POST
+/release[?slot=]`, `GET /slots/<name>`, `POST /slots/<name>/load|stop`.
 
 ---
 
@@ -188,6 +188,48 @@ contends with the 7900 XT. Routing that traffic through demesne would put every 
 request on the `kindChat` path, which evicts the media child before proxying: a judgement
 would kill a running SD render. The socket is for *control* — "who holds the card", "let it
 go" — not for ward's inference.
+
+---
+
+## 6b. The card, as a typed answer — `/estate/card`
+
+**Decided:** a second document, smaller than `/status` and not a slice of it, for the one
+question a *client* asks: who holds the card, and since when.
+
+```
+GET /estate/card[?group=gpu]
+{"group":"gpu","holders":["sd"],"since_ms":1793711314557,
+ "slots":[{"name":"llama","state":"stopped"},{"name":"sd","state":"running"}]}
+```
+
+Why not a slice of `/status`: a client that reacts to the card needs two booleans and a
+timestamp, and every field it parses becomes a field it depends on. `/status` stays the
+operator's document and is free to grow; this one is not, and
+`TestEstateCardIsTheSmallTypedAnswer` fails when it does. The request came from ward, which
+had the choice between parsing four kilobytes for two booleans and being told to stop
+asking — the smaller document is the cheaper honest answer, and it is the one that cannot
+rot into a second `/status`.
+
+Three shape decisions worth naming:
+
+- **`holders` is an array**, because the invariant is "at most one holder *at rest*". During
+  the handover from a render to a chat request both engines are up for the length of an
+  eviction, and a single-valued field would have to pick one and misreport the other.
+- **`since_ms` is the earliest readiness among the holders** — when the card became busy,
+  not when the request was made — and **`0` when it is not known**, which is the honest
+  answer for an engine demesne did not start: an external engine's readiness is someone
+  else's event. The field is always present, so a client never has to test for its
+  existence, and 0 is the one sentinel it does have to understand.
+- **the group is the unit, not the device.** demesne never parses a driver's device name —
+  `ROCm0` for llama, `vulkan0` for sd, `CUDA0` for the GT 1030 that llamb lives on. Naming
+  one here would be a string from nowhere, and naming the wrong one would be worse than
+  naming none. A caller that wants a label maps `gpu`/`aux` itself, where it knows which
+  card it means.
+
+A slot appears with one of three states: `running`, `loading` (started, not yet answering —
+a cold sd load spends eight minutes there) or `stopped`. `loading` is in the vocabulary
+because it is the only state in which the card is about to be taken but is not yet, and a
+client that treats it as `stopped` will be evicted a minute later.
 
 ---
 
@@ -288,15 +330,21 @@ environment is the natural transport for a list, and a unit file quoting one thr
 - **llamb is supervised but not routed.** Its clients reach 55556 directly. If a route is
   ever wanted, it is a `slotSpec` literal and a path prefix — deliberately not a second
   code path.
-- **ward's side of the local channel is not written.** demesne serves the API on
-  `-socket` today, and `demesne status` already prefers it; ward still speaks only HTTP
-  over TCP. Wiring it is small and lives in ward: one `CURLOPT_UNIX_SOCKET_PATH` in
-  `src/net/http.c` beside the existing `CURLOPT_URL`, and `wd_http_loopback()` taught that
-  a unix path is loopback too (so no bearer header is invented for a socket). The URL stays
-  `http://<anything>/v1/chat/completions` — libcurl sends it to the socket — which is why
-  this is a transport change and not a dialect change.
-- **the control vocabulary is still the operator's.** `/release`, `/slots/<name>/load|stop`
-  and `/status` are what ward would use, and they are shaped for a human reading JSON. If
-  ward grows a policy that reacts to the card (judge throttling, say), the honest next step
-  is a smaller, typed answer — `{"card":"sd","since":…}` — not a faster encoding of the
-  same 4 KiB document.
+- **ward's side of the local channel: the transport is written, the client is not.** Ward
+  committed `5aa0299`: `wd_http_set_unix_socket(path)` sets `CURLOPT_UNIX_SOCKET_PATH` on
+  the curl child before the fork, and the URL stays `http://<anything>/v1/...`. It declined
+  to overload `wd_http_loopback()` with a socket case, correctly — that predicate is what
+  decides whether a bearer is invented, and it is also the check that stops `net.request`
+  reaching a non-loopback endpoint. If a unix request ever needs the same exemption, it gets
+  its own flag rather than a lie in the loopback test.
+- **nothing yet notices a dead engine on its own.** The measured case: llama was down from
+  2026-11-02 17:34 to the next day's afternoon and nothing said so, because liveness was only
+  ever asked at request time. `/estate/card` reports it (it probes an external engine's port),
+  but the operator's `/status` still reports the *watch's* opinion of the router rather than
+  the router's existence. A ticker with `up/down/booting` per slot is the fix, and it is the
+  difference between `/status` being a fact and being a memory.
+- **the control vocabulary is the operator's, and one typed answer now exists.**
+  `/estate/card` (§6b) is the small document ward reacts to; `/status`, `/release` and
+  `/slots/<name>/load|stop` remain shaped for a human. Anything further should be asked for
+  by a client that needs it, not guessed at.
+

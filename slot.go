@@ -162,6 +162,15 @@ func (s *slot) booting() bool {
 	return s.up && s.readyAt.IsZero()
 }
 
+// readySince is when this slot last became ready, or the zero time for an engine we
+// never started: an external engine's readiness is someone else's event, and the only
+// thing we can honestly report about it is that its port answers now.
+func (s *slot) readySince() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.readyAt
+}
+
 // backoffLeft implements the crash backoff, which the old sd lifecycle did not have:
 // a crash was logged, marked down, and the very next request retried immediately --
 // each attempt able to pay a 15-minute cold load. Now a slot that keeps dying is

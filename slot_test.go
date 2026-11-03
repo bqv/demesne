@@ -539,3 +539,73 @@ func TestUnixSocketServesTheSameAPI(t *testing.T) {
 		t.Fatal("the file in the way was deleted")
 	}
 }
+
+// The card answer is a contract, not a slice of /status: four fields, and per slot one
+// of three states. A field added here is a field a client comes to depend on, so the
+// test pins the key set and fails when it grows -- "small and typed" has to be enforced
+// by something other than good intentions.
+func TestEstateCardIsTheSmallTypedAnswer(t *testing.T) {
+	cfg := testConfig(t)
+	d := newTestDemesne(t, cfg)
+
+	get := func(query string) map[string]json.RawMessage {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		d.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/estate/card"+query, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /estate/card%s = %d: %s", query, rec.Code, rec.Body.String())
+		}
+		var doc map[string]json.RawMessage
+		if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return doc
+	}
+
+	doc := get("")
+	for _, k := range []string{"group", "holders", "since_ms", "slots"} {
+		if _, ok := doc[k]; !ok {
+			t.Fatalf("missing %q in %v", k, doc)
+		}
+	}
+	if len(doc) != 4 {
+		t.Fatalf("the card grew to %d fields: %v", len(doc), doc)
+	}
+	var holders []string
+	if err := json.Unmarshal(doc["holders"], &holders); err != nil {
+		t.Fatalf("holders is not an array: %s", doc["holders"])
+	}
+	if len(holders) != 0 {
+		t.Fatalf("an idle group has holders %v", holders)
+	}
+	var since int64
+	if err := json.Unmarshal(doc["since_ms"], &since); err != nil || since != 0 {
+		t.Fatalf("idle since_ms = %s, want 0", doc["since_ms"])
+	}
+
+	if err := d.ensure(d.slotByName("sd")); err != nil {
+		t.Fatalf("ensure(sd): %v", err)
+	}
+	before := time.Now().Add(-time.Minute).UnixMilli()
+	doc = get("")
+	if err := json.Unmarshal(doc["holders"], &holders); err != nil {
+		t.Fatalf("holders: %v", err)
+	}
+	if len(holders) != 1 || holders[0] != "sd" {
+		t.Fatalf("holders = %v, want [sd]", holders)
+	}
+	if err := json.Unmarshal(doc["since_ms"], &since); err != nil {
+		t.Fatalf("since_ms: %v", err)
+	}
+	if since < before || since > time.Now().UnixMilli() {
+		t.Fatalf("since_ms = %d, want the moment sd became ready", since)
+	}
+	if raw, _ := json.Marshal(doc); strings.Contains(string(raw), "whisper") {
+		t.Fatal("whisper contends for no card, so it must not appear in a card answer")
+	}
+
+	aux := get("?group=aux")
+	if raw, _ := json.Marshal(aux); !strings.Contains(string(raw), `"llamb"`) {
+		t.Fatalf("the aux group should name llamb: %s", raw)
+	}
+}
