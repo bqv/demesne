@@ -609,3 +609,96 @@ func TestEstateCardIsTheSmallTypedAnswer(t *testing.T) {
 		t.Fatalf("the aux group should name llamb: %s", raw)
 	}
 }
+
+// modelRouter is a stand-in engine that advertises one model and names itself when asked
+// to chat, so a test can tell which slot a request actually reached.
+func modelRouter(name, id string) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"object":"list","data":[{"id":"`+id+`","object":"model"}]}`)
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		io.WriteString(w, name+" "+string(body))
+	})
+	return mux
+}
+
+// The number in front is one port now, so the model NAME has to choose the engine -- and a
+// model on the small card must not disturb the big one's card at all.
+func TestTheModelNameDecidesTheEngine(t *testing.T) {
+	big := httptest.NewServer(modelRouter("llama", "big-model"))
+	defer big.Close()
+	small := httptest.NewServer(modelRouter("llamb", "small-model"))
+	defer small.Close()
+
+	cfg := testConfig(t)
+	cfg.llama = engineConfig{url: big.URL}
+	cfg.llamb = engineConfig{url: small.URL}
+	d := newTestDemesne(t, cfg)
+	d.models = newModelIndex()
+	d.refreshModels()
+
+	if got := d.slotForModel("small-model"); got != "llamb" {
+		t.Fatalf("small-model routes to %q, want llamb", got)
+	}
+	if got := d.slotForModel("big-model"); got != "llama" {
+		t.Fatalf("big-model routes to %q, want llama", got)
+	}
+
+	if err := d.ensure(d.slotByName("sd")); err != nil {
+		t.Fatalf("ensure(sd): %v", err)
+	}
+	rec := httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"small-model","messages":[]}`)))
+	body := rec.Body.String()
+	if !strings.HasPrefix(body, "llamb ") {
+		t.Fatalf("the aux model reached %q, want the llamb stub", body)
+	}
+	if !strings.Contains(body, `"model":"small-model"`) {
+		t.Fatalf("the request body did not survive the model peek: %q", body)
+	}
+	if up, _ := d.slotByName("sd").isUp(); !up {
+		t.Fatal("an aux-card request evicted the media child on the other card")
+	}
+
+	rec = httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"big-model"}`)))
+	if up, _ := d.slotByName("sd").isUp(); up {
+		t.Fatal("a big-card request left the media child holding the card")
+	}
+
+	rec = httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"nobody-has-this"}`)))
+	if got := rec.Body.String(); !strings.HasPrefix(got, "llama ") {
+		t.Fatalf("an unknown model went to %q, want the default router", got)
+	}
+}
+
+// One port, one list: /v1/models is the union of the routers' answers, because a client
+// that dials the one number should see every model it can ask for.
+func TestModelsListIsTheWholeEstate(t *testing.T) {
+	big := httptest.NewServer(modelRouter("llama", "big-model"))
+	defer big.Close()
+	small := httptest.NewServer(modelRouter("llamb", "small-model"))
+	defer small.Close()
+
+	cfg := testConfig(t)
+	cfg.llama = engineConfig{url: big.URL}
+	cfg.llamb = engineConfig{url: small.URL}
+	d := newTestDemesne(t, cfg)
+
+	rec := httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /v1/models = %d: %s", rec.Code, rec.Body.String())
+	}
+	for _, want := range []string{"big-model", "small-model"} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("%q missing from %s", want, rec.Body.String())
+		}
+	}
+}

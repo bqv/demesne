@@ -4,11 +4,16 @@
 // A slot is one struct with one lifecycle, because the four engines differ only in
 // data:
 //
-//	slot     port   group  policy     routed  why
-//	llama    55555  gpu    resident   yes     the router; keeps a resident rung
-//	sd       55557  gpu    on demand  yes     cannot unload, so it must be evicted
-//	whisper  55559  --     on demand  yes     CPU-only: never contends for the card
-//	llamb    55556  aux    resident   no      second card; supervised, addressed directly
+//	slot     port   group  policy     routed  router  why
+//	llama    55556  gpu    resident   yes     yes     the router; keeps a resident rung
+//	sd       55558  gpu    on demand  yes     no      cannot unload, so it must be evicted
+//	whisper  55559  --     on demand  yes     no      CPU-only: never contends for the card
+//	llamb    55557  aux    resident   yes     yes     second card; its models are routed too
+//
+// Only the routers answer /v1/models, and that answer is what decides which engine serves
+// a request that names a model -- demesne sits on 55555, the number every caller already
+// means, so the name has to choose. The numbers are the engines' own; the estate's is the
+// one in front.
 //
 // Two scarce resources, therefore two rules:
 //
@@ -16,13 +21,13 @@
 //	           displaced by asking it to unload its models; an on-demand holder (sd)
 //	           is displaced by stopping it, because that is its only way to give the
 //	           weights back. A slot that holds neither (whisper) has no group and is
-//	           never evicted by another slot's request.
+//	           never evicted by another slot's request. The rule is applied to the group
+//	           of the slot the request actually goes to, so a model served by the small
+//	           card does not evict a render from the big one.
 //	a port     a slot may only spawn when its own port is free, and a port already
 //	           answered by a process demesne does not own is a REFUSAL, not a race.
-//	           That is the durable half of the 55557 collision: sd and whisper both
-//	           claimed it, one as a child and one as an OpenRC service, and nothing
-//	           enforced exclusivity -- stadi only refused a foreign holder at the
-//	           moment it happened to try to spawn.
+//	           That is the durable half of the old 55557 collision: sd and whisper both
+//	           claimed it, and nothing enforced exclusivity.
 //
 // Policies: an engine OpenRC still supervises is policyExternal (demesne routes to it
 // and never spawns or kills it); an engine demesne owns is either policyOnDemand
@@ -95,6 +100,9 @@ type slotSpec struct {
 	bin  string   // empty: the slot owns no child (policyExternal)
 	args []string // the child's whole command line
 	env  []string // extra KEY=VALUE for the child, appended to demesne's own
+	// dir is the child's working directory. A router's models.ini names its weights
+	// relative to it, so this is load-bearing, not tidiness.
+	dir string
 
 	group  string // exclusivity group ("" = contends for nothing)
 	vram   bool   // the slot's processes hold part of the card
@@ -102,6 +110,10 @@ type slotSpec struct {
 	idle   time.Duration // evict an on-demand child after this long with no request
 
 	routed bool // demesne may route a request to it
+	// router: an engine that advertises models on /v1/models, and whose answer decides
+	// which slot serves a request that names a model. sd and whisper are routed but are
+	// not routers: what they serve is chosen by the path, not by a model name.
+	router bool
 	// fallback: proxy to it even when demesne does not own it. True for an engine
 	// still supervised by OpenRC (llama), false for one demesne is meant to own and
 	// simply has not been configured yet (whisper) -- which must answer 503 rather
@@ -325,6 +337,7 @@ func (d *demesne) spawnLocked(s *slot) error {
 	}
 
 	cmd := exec.Command(s.spec.bin, s.spec.args...)
+	cmd.Dir = s.spec.dir
 	cmd.Stdout, cmd.Stderr = out, errf
 	cmd.Env = append(os.Environ(), s.spec.env...)
 	// One process group, so stopping the child also stops anything it forked. The

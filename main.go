@@ -63,10 +63,14 @@ const (
 // engineConfig is one engine's static configuration: where it answers, what to run,
 // and the memory fence that used to live in its init script.
 type engineConfig struct {
-	url    string
-	bin    string
-	args   []string
-	env    []string
+	url  string
+	bin  string
+	args []string
+	env  []string
+	// dir is the child's working directory. It is not cosmetic: a router's models.ini
+	// names its weights relative to the models directory (`model = ./d1-2B-Q8_0.gguf`,
+	// `mmproj = ../asset/...`), so a router started anywhere else loads nothing.
+	dir    string
 	cgroup memLimit
 }
 
@@ -233,18 +237,22 @@ func loadConfig() config {
 		fSDBin  = flag.String("sd-bin", "", "sd-server binary (env "+envPrefix+"SD_BIN; default: PATH)")
 		fSDArgs = flag.String("sd-args", "", "the sd child's whole command line (env "+envPrefix+"SD_ARGS)")
 		fSDEnv  = flag.String("sd-env", "", "extra KEY=VALUE for the sd child (env "+envPrefix+"SD_ENV)")
+		fSDDir  = flag.String("sd-dir", "", "the sd child's working directory (env "+envPrefix+"SD_DIR)")
 
 		fLlamaBin  = flag.String("llama-bin", "", "adopt the llama router: its binary (env "+envPrefix+"LLAMA_BIN; empty = leave it to OpenRC)")
 		fLlamaArgs = flag.String("llama-args", "", "the router's whole command line (env "+envPrefix+"LLAMA_ARGS)")
 		fLlamaEnv  = flag.String("llama-env", "", "extra KEY=VALUE for the router (env "+envPrefix+"LLAMA_ENV)")
+		fLlamaDir  = flag.String("llama-dir", "", "the router's working directory: where its models.ini lives (env "+envPrefix+"LLAMA_DIR)")
 
 		fLlambBin  = flag.String("llamb-bin", "", "adopt the aux router: its binary (env "+envPrefix+"LLAMB_BIN; empty = leave it to OpenRC)")
 		fLlambArgs = flag.String("llamb-args", "", "the aux router's whole command line (env "+envPrefix+"LLAMB_ARGS)")
 		fLlambEnv  = flag.String("llamb-env", "", "extra KEY=VALUE for the aux router (env "+envPrefix+"LLAMB_ENV)")
+		fLlambDir  = flag.String("llamb-dir", "", "the aux router's working directory (env "+envPrefix+"LLAMB_DIR)")
 
 		fWhisperBin  = flag.String("whisper-bin", "", "adopt whisper: its binary (env "+envPrefix+"WHISPER_BIN)")
 		fWhisperArgs = flag.String("whisper-args", "", "whisper's whole command line (env "+envPrefix+"WHISPER_ARGS)")
 		fWhisperEnv  = flag.String("whisper-env", "", "extra KEY=VALUE for whisper (env "+envPrefix+"WHISPER_ENV)")
+		fWhisperDir  = flag.String("whisper-dir", "", "whisper's working directory (env "+envPrefix+"WHISPER_DIR)")
 
 		fLLMSvc  = flag.String("llm-service", "", "legacy: the OpenRC service that owns the router (env "+envPrefix+"LLM_SERVICE)")
 		fLLMWait = flag.String("llm-restart-wait", "", "legacy: how long a router restart may take to answer (env "+envPrefix+"LLM_RESTART_WAIT)")
@@ -286,6 +294,7 @@ func loadConfig() config {
 			bin:    envString(*fSDBin, "SD_BIN", defaultBin("sd-server")),
 			args:   fields(envString(*fSDArgs, "SD_ARGS", "")),
 			env:    fields(envString(*fSDEnv, "SD_ENV", "")),
+			dir:    envString(*fSDDir, "SD_DIR", ""),
 			cgroup: memLimitFor(cgroupRoot, "sd"),
 		},
 		llama: engineConfig{
@@ -293,6 +302,7 @@ func loadConfig() config {
 			bin:    envString(*fLlamaBin, "LLAMA_BIN", ""),
 			args:   fields(envString(*fLlamaArgs, "LLAMA_ARGS", "")),
 			env:    fields(envString(*fLlamaEnv, "LLAMA_ENV", "")),
+			dir:    envString(*fLlamaDir, "LLAMA_DIR", ""),
 			cgroup: memLimitFor(cgroupRoot, "llama"),
 		},
 		llamb: engineConfig{
@@ -300,6 +310,7 @@ func loadConfig() config {
 			bin:    envString(*fLlambBin, "LLAMB_BIN", ""),
 			args:   fields(envString(*fLlambArgs, "LLAMB_ARGS", "")),
 			env:    fields(envString(*fLlambEnv, "LLAMB_ENV", "")),
+			dir:    envString(*fLlambDir, "LLAMB_DIR", ""),
 			cgroup: memLimitFor(cgroupRoot, "llamb"),
 		},
 		whisper: engineConfig{
@@ -307,6 +318,7 @@ func loadConfig() config {
 			bin:    envString(*fWhisperBin, "WHISPER_BIN", ""),
 			args:   fields(envString(*fWhisperArgs, "WHISPER_ARGS", "")),
 			env:    fields(envString(*fWhisperEnv, "WHISPER_ENV", "")),
+			dir:    envString(*fWhisperDir, "WHISPER_DIR", ""),
 			cgroup: memLimitFor(cgroupRoot, "whisper"),
 		},
 		idle:          envDur(*fIdle, "IDLE", 5*time.Minute),
@@ -379,9 +391,9 @@ func buildSlots(c config) []slotSpec {
 			pol = policyExternal
 		}
 		return slotSpec{
-			name: name, url: e.url, bin: e.bin, args: e.args, env: e.env,
+			name: name, url: e.url, bin: e.bin, args: e.args, env: e.env, dir: e.dir,
 			group: group, vram: true, policy: pol, idle: idle,
-			routed: routed, fallback: true, cgroup: e.cgroup,
+			routed: routed, router: true, fallback: true, cgroup: e.cgroup,
 		}
 	}
 	whisperPolicy := policyOnDemand
@@ -393,7 +405,7 @@ func buildSlots(c config) []slotSpec {
 		resident("llama", c.llama, "gpu", true, 0),
 		// The media child: on demand, because it has no other way to give the card back.
 		{
-			name: "sd", url: c.sd.url, bin: c.sd.bin, args: c.sd.args, env: c.sd.env,
+			name: "sd", url: c.sd.url, bin: c.sd.bin, args: c.sd.args, env: c.sd.env, dir: c.sd.dir,
 			group: "gpu", vram: true, policy: policyOnDemand, idle: c.idle,
 			routed: true, fallback: false, cgroup: c.sd.cgroup,
 		},
@@ -402,13 +414,14 @@ func buildSlots(c config) []slotSpec {
 		// ends the 55557 collision instead of arbitrating it at runtime.
 		{
 			name: "whisper", url: c.whisper.url, bin: c.whisper.bin,
-			args: c.whisper.args, env: c.whisper.env,
+			args: c.whisper.args, env: c.whisper.env, dir: c.whisper.dir,
 			group: "", vram: false, policy: whisperPolicy, idle: c.whisperIdle,
 			routed: true, fallback: false, cgroup: c.whisper.cgroup,
 		},
-		// The second card's router: supervised, not routed. Its callers address 55556
-		// directly; demesne owns it because something has to own the restart.
-		resident("llamb", c.llamb, "aux", false, 0),
+		// The second card's router: routed, because its models are now reachable by name
+		// through the one port. It is in its own group, so a request that lands here
+		// never evicts a render from the big card.
+		resident("llamb", c.llamb, "aux", true, 0),
 	}
 }
 
@@ -422,6 +435,7 @@ type demesne struct {
 	transition sync.Mutex // one transition at a time; never held across a proxy
 	proxies    map[string]*httputil.ReverseProxy
 	llm        *llmWatch
+	models     modelIndex // which engine advertises which model (models.go)
 
 	done    chan struct{}
 	closing atomic.Bool
@@ -594,6 +608,8 @@ func (d *demesne) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.status(w)
 	case p == "/estate/card":
 		d.card(w, r)
+	case p == "/v1/models":
+		d.modelsHandler(w, r)
 	case p == "/release":
 		d.handleRelease(w, r)
 	case strings.HasPrefix(p, "/slots/"):
@@ -604,6 +620,14 @@ func (d *demesne) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *demesne) route(w http.ResponseWriter, r *http.Request, in intent) {
+	// A chat request names the model it wants, and the model decides the engine: demesne
+	// answers on the number every caller already means, so the name has to choose. The
+	// path still decides the KIND of request; only the slot moves.
+	if in.kind == kindChat {
+		if name := d.slotForModel(peekModel(r)); name != "" {
+			in.slot = name
+		}
+	}
 	s := d.slotByName(in.slot)
 	if s == nil {
 		http.Error(w, "demesne: no such slot: "+in.slot, http.StatusInternalServerError)
@@ -650,11 +674,15 @@ func (d *demesne) route(w http.ResponseWriter, r *http.Request, in intent) {
 		// The breaker: once the router has failed a burst of requests, refuse new ones
 		// quickly instead of dialling a dead port once per client and letting each wait
 		// out its own timeout. A successful request clears it.
-		if open, wait := d.llm.failing(); open {
-			w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())))
-			http.Error(w, "demesne: the llama engine is failing; retry shortly (see /status)",
-				http.StatusServiceUnavailable)
-			return
+		// The breaker is the llama router's: it is built from that engine's failures, and
+		// applying it to the aux card would refuse requests over another engine's fault.
+		if s.spec.name == "llama" {
+			if open, wait := d.llm.failing(); open {
+				w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())))
+				http.Error(w, "demesne: the llama engine is failing; retry shortly (see /status)",
+					http.StatusServiceUnavailable)
+				return
+			}
 		}
 		// A resident router that is still loading is not broken: wait a bounded while
 		// for its port rather than take a 502 from the proxy. Then say so plainly.
@@ -664,14 +692,17 @@ func (d *demesne) route(w http.ResponseWriter, r *http.Request, in intent) {
 				time.Sleep(500 * time.Millisecond)
 			}
 			if s.booting() {
-				http.Error(w, "demesne: the llama router is still starting; retry shortly",
+				http.Error(w, "demesne: the "+s.spec.name+" router is still starting; retry shortly",
 					http.StatusServiceUnavailable)
 				return
 			}
 		}
-		// A chat request wants the card. If a render is in flight, wait for it to
-		// finish -- then say so plainly instead of killing it.
-		if sd := d.slotByName("sd"); sd != nil {
+		// A request for this GROUP's card evicts the other holder. The group is the one
+		// of the slot the request actually goes to, not of the path: a model that lives
+		// on the small card must not kill a render on the big one.
+		if sd := d.slotByName("sd"); sd != nil && sd.spec.group == s.spec.group {
+			// If a render is in flight, wait for it to finish -- then say so plainly
+			// instead of killing it.
 			if n := atomic.LoadInt64(&sd.inflight); n > 0 {
 				deadline := time.Now().Add(d.cfg.busyWait)
 				for atomic.LoadInt64(&sd.inflight) > 0 && time.Now().Before(deadline) {
@@ -1011,6 +1042,12 @@ func main() {
 			go d.supervise(s)
 		}
 	}
+
+	// The index is built before the listener opens, so the very first request routes by
+	// model name; the ticker keeps it honest afterwards.
+	d.models = newModelIndex()
+	d.refreshModels()
+	go d.followModels()
 
 	// One handler, two transports. The port is for DSH, which we do not control and which
 	// reaches :55558 by name; the socket is for anything running as this user, where a path
