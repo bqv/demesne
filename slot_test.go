@@ -835,3 +835,47 @@ func contains(hay []string, needle string) bool {
 	}
 	return false
 }
+
+// A router that is up with nothing loaded holds a port and about 28 MiB, not the card. The
+// distinction is the whole point of the field: a client told "llama holds it" would refuse
+// to render on a free card.
+func TestAnIdleRouterDoesNotHoldTheCard(t *testing.T) {
+	withStatus := func(id, status string) http.Handler {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
+			io.WriteString(w, `{"object":"list","data":[{"id":"`+id+`","status":{"value":"`+status+`"}}]}`)
+		})
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") })
+		return mux
+	}
+
+	idle := httptest.NewServer(withStatus("big-model", "unloaded"))
+	defer idle.Close()
+	busy := httptest.NewServer(withStatus("small-model", "loaded"))
+	defer busy.Close()
+
+	cfg := testConfig(t)
+	cfg.llama = engineConfig{url: idle.URL}
+	cfg.llamb = engineConfig{url: busy.URL}
+	d := newTestDemesne(t, cfg)
+	d.models = newModelIndex()
+	d.refreshModels()
+
+	card := func(group string) estateCard {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		d.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/estate/card?group="+group, nil))
+		var out estateCard
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return out
+	}
+
+	if got := card("gpu"); len(got.Holders) != 0 {
+		t.Fatalf("an idle router holds the card: %v (state is still %q)", got.Holders, got.Slots[0].State)
+	}
+	if got := card("aux"); len(got.Holders) != 1 || got.Holders[0] != "llamb" {
+		t.Fatalf("a router with a resident model does not hold its card: %v", got.Holders)
+	}
+}

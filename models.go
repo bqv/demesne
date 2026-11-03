@@ -45,31 +45,47 @@ const (
 type modelIndex struct {
 	mu      sync.Mutex
 	byModel map[string]string // model id -> slot name
-	seen    time.Time
+	// loaded counts, per router, how many models it says are resident. It is what makes
+	// "who holds the card" an answer about memory rather than about a process: a router
+	// that is up with nothing loaded holds the port and about 28 MiB, not the card.
+	loaded map[string]int
+	// known is the set of routers that actually reported a status per model. A build that
+	// does not would leave `loaded` at zero for an engine that may be holding gigabytes,
+	// so its silence is treated as "cannot tell" rather than "empty".
+	known map[string]bool
+	seen  time.Time
 }
 
 func newModelIndex() modelIndex {
-	return modelIndex{byModel: map[string]string{}}
+	return modelIndex{byModel: map[string]string{}, loaded: map[string]int{}, known: map[string]bool{}}
 }
 
 // refreshModels asks every router what it serves and swaps the map in one step.
 func (d *demesne) refreshModels() {
 	next := make(map[string]string)
+	loaded := make(map[string]int)
+	known := make(map[string]bool)
 	for _, s := range d.slots {
-		if !s.spec.router || !s.spec.routed {
+		if !s.specOf().router || !s.specOf().routed {
 			continue
 		}
-		for _, id := range modelIDs(fetchModels(s.spec.url, modelListTimeout)) {
+		items := fetchModels(s.specOf().url, modelListTimeout)
+		if items != nil {
+			n, saw := countLoaded(items)
+			loaded[s.specOf().name], known[s.specOf().name] = n, saw
+		}
+		for _, id := range modelIDs(items) {
 			// First router wins a clash. Two routers advertising one id is a
 			// configuration mistake, and picking the earlier slot is at least stable.
 			if _, taken := next[id]; !taken {
-				next[id] = s.spec.name
+				next[id] = s.specOf().name
 			}
 		}
 	}
 	d.models.mu.Lock()
 	changed := len(next) != len(d.models.byModel)
-	d.models.byModel, d.models.seen = next, time.Now()
+	d.models.byModel, d.models.loaded, d.models.known = next, loaded, known
+	d.models.seen = time.Now()
 	d.models.mu.Unlock()
 	if changed {
 		d.logModelIndex(next)
@@ -89,8 +105,8 @@ func (d *demesne) logModelIndex(byModel map[string]string) {
 	}
 	parts := make([]string, 0, len(d.slots))
 	for _, s := range d.slots {
-		if ids := per[s.spec.name]; len(ids) > 0 {
-			parts = append(parts, s.spec.name+"("+strings.Join(ids, " ")+")")
+		if ids := per[s.specOf().name]; len(ids) > 0 {
+			parts = append(parts, s.specOf().name+"("+strings.Join(ids, " ")+")")
 		}
 	}
 	log.Printf("routing by model: %s", strings.Join(parts, " "))
@@ -153,6 +169,38 @@ func fetchModels(base string, timeout time.Duration) []json.RawMessage {
 	return doc.Data
 }
 
+// countLoaded answers "how many of this router's models does it say are resident", and
+// whether it said so at all. A router that publishes no status is not assumed empty: it is
+// assumed unknown, and the caller falls back to the coarser process-level answer.
+func countLoaded(items []json.RawMessage) (int, bool) {
+	n, saw := 0, false
+	for _, raw := range items {
+		var one struct {
+			Status struct {
+				Value string `json:"value"`
+			} `json:"status"`
+		}
+		if json.Unmarshal(raw, &one) != nil {
+			continue
+		}
+		switch one.Status.Value {
+		case "loaded", "loading":
+			saw, n = true, n+1
+		case "unloaded":
+			saw = true
+		}
+	}
+	return n, saw
+}
+
+// loadedCount is how many models a router has resident, and whether that is known.
+func (d *demesne) loadedCount(slot string) (int, bool) {
+	d.models.mu.Lock()
+	defer d.models.mu.Unlock()
+	n, known := d.models.loaded[slot], d.models.known[slot]
+	return n, known
+}
+
 func modelIDs(items []json.RawMessage) []string {
 	ids := make([]string, 0, len(items))
 	for _, raw := range items {
@@ -188,10 +236,10 @@ func (d *demesne) modelsHandler(w http.ResponseWriter, r *http.Request) {
 	data := []json.RawMessage{}
 	answered := 0
 	for _, s := range d.slots {
-		if !s.spec.router || !s.spec.routed {
+		if !s.specOf().router || !s.specOf().routed {
 			continue
 		}
-		items := fetchModels(s.spec.url, modelListTimeout)
+		items := fetchModels(s.specOf().url, modelListTimeout)
 		if items == nil {
 			continue
 		}
@@ -203,7 +251,7 @@ func (d *demesne) modelsHandler(w http.ResponseWriter, r *http.Request) {
 		// inventing an empty list: "no models" and "the router is down" are not the same
 		// answer, and the second one is the true one.
 		if s := d.slotByName("llama"); s != nil {
-			d.proxies[s.spec.name].ServeHTTP(w, r)
+			d.proxies[s.specOf().name].ServeHTTP(w, r)
 			return
 		}
 		http.Error(w, "demesne: no router answered /v1/models", http.StatusBadGateway)

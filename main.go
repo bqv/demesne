@@ -930,7 +930,7 @@ func (d *demesne) card(w http.ResponseWriter, r *http.Request) {
 			state = "running"
 		}
 		out.Slots = append(out.Slots, cardSlot{Name: s.specOf().name, State: state})
-		if state != "running" {
+		if state != "running" || !d.holdsTheCard(s) {
 			continue
 		}
 		out.Holders = append(out.Holders, s.specOf().name)
@@ -940,6 +940,27 @@ func (d *demesne) card(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
+}
+
+// holdsTheCard separates "the engine is up" from "the card is busy". They are the same thing
+// for the media child (up means its weights are in memory) and different for a router: idle,
+// it holds a port and about 28 MiB, and a client told otherwise would refuse to render on a
+// card that is free.
+//
+// The evidence, in order: a request in flight (it is loading or answering), then the router's
+// own model status, then -- for a build that publishes none -- the process itself, which is
+// the coarse answer but never the wrong way round.
+func (d *demesne) holdsTheCard(s *slot) bool {
+	if !s.specOf().router {
+		return true
+	}
+	if atomic.LoadInt64(&s.inflight) > 0 {
+		return true
+	}
+	if n, known := d.loadedCount(s.specOf().name); known {
+		return n > 0
+	}
+	return true
 }
 
 // ------------------------------------------------------------------ /release

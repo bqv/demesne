@@ -232,6 +232,15 @@ a cold sd load spends eight minutes there) or `stopped`. `loading` is in the voc
 because it is the only state in which the card is about to be taken but is not yet, and a
 client that treats it as `stopped` will be evicted a minute later.
 
+**`holders` means the card, not the process.** For the media child those are the same thing —
+up means its weights are in memory — and for a router they are not: idle, llama holds a port
+and about 28 MiB, and a client told otherwise would refuse to render on a free card. So a
+router is a holder only when a request is in flight or when it reports a model `loaded` in
+`/v1/models` (our builds publish `status.value` per model). A build that publishes no status
+is treated as *unknown*, not empty, and falls back to the process — the coarse answer, but
+never the wrong way round. The first version reported the process, which is how ward measured
+`holders:["llama"]` for a router with nothing loaded; that was this field's bug, not ward's.
+
 ---
 
 ## 6c. One port, four engines — the model name decides
