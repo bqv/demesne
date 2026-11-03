@@ -733,6 +733,16 @@ func (d *demesne) maintainCgroup(s *slot) {
 	if !m.set() {
 		return
 	}
+	if d.cfg.cgroupPrepare == "" || d.cfg.cgroupJoin == "" {
+		// Nothing can be done about it. prepareCgroup has already said so once, per slot.
+		return
+	}
+	if _, err := os.Stat(m.leaf); err != nil {
+		// The leaf is gone -- a removed subtree, a reboot's leftovers, a first start where
+		// the tree was never made. Build it again rather than warning about it for ever.
+		log.Printf("%s: %s is missing; preparing it again", s.specOf().name, m.leaf)
+		d.prepareCgroup(s)
+	}
 	if _, pid := s.isUp(); pid > 0 {
 		if joined, err := inCgroup(pid, m.leaf); err == nil && !joined {
 			log.Printf("%s: pid %d is not in %s; moving it back", s.specOf().name, pid, m.leaf)

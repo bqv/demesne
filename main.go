@@ -220,6 +220,19 @@ func defaultBin(name string) string {
 	if p, err := exec.LookPath(name); err == nil {
 		return p
 	}
+	// A service started by supervise-daemon has a PATH without the user's own bin
+	// directory, and that is where this box keeps cgroup-prepare and cgroup-join. Looking
+	// there is the difference between a fence and a warning on every boot: the first
+	// version of this only asked PATH, found nothing, and quietly ran the whole estate
+	// unlimited with a log line nobody reads.
+	if home, err := os.UserHomeDir(); err == nil {
+		for _, dir := range []string{filepath.Join(home, "bin"), "/usr/local/bin", "/usr/bin"} {
+			p := filepath.Join(dir, name)
+			if fi, err := os.Stat(p); err == nil && !fi.IsDir() && fi.Mode()&0o111 != 0 {
+				return p
+			}
+		}
+	}
 	return ""
 }
 
