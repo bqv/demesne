@@ -538,7 +538,6 @@ func (d *demesne) reap(s *slot, cmd *exec.Cmd, out, errf io.Closer, gone chan st
 // (measured 12.5 GiB -> 0.03 GiB), which is the entire point of stopping it.
 func (d *demesne) evictLocked(s *slot, reason stopReason, why string) {
 	s.mu.Lock()
-	s.stopped = reason
 	if s.timer != nil {
 		s.timer.Stop()
 		s.timer = nil
@@ -549,6 +548,9 @@ func (d *demesne) evictLocked(s *slot, reason stopReason, why string) {
 		s.mu.Unlock()
 		return
 	}
+	// Recorded only when there was something to stop: an operator calling stop on a slot
+	// that is already down must not erase the failure that put it down.
+	s.stopped = reason
 	s.stopping = true
 	s.mu.Unlock()
 

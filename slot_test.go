@@ -960,3 +960,37 @@ func TestLastTransitionSaysWhyTheChildStopped(t *testing.T) {
 		t.Fatalf("after a chat claimed the card: %q, want %q", got, stopChat)
 	}
 }
+
+// A slot that is down is down for one of four reasons, and "never asked since boot" is the
+// same situation the idle timer produces -- so the field is total for a down slot rather than
+// leaving a client to guess at an absent one.
+func TestADownSlotAlwaysSaysWhy(t *testing.T) {
+	cfg := testConfig(t)
+	d := newTestDemesne(t, cfg)
+
+	transition := func() string {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		d.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/slots/sd", nil))
+		var st slotStatus
+		if err := json.Unmarshal(rec.Body.Bytes(), &st); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return string(st.LastTransition)
+	}
+
+	if got := transition(); got != string(stopIdle) {
+		t.Fatalf("a slot that has never run reports %q, want %q", got, stopIdle)
+	}
+
+	// A failure, then an operator stop of the already-down slot: the failure is the last real
+	// event and must not be papered over.
+	sd := d.slotByName("sd")
+	sd.mu.Lock()
+	sd.stopped, sd.lastErr = stopFailed, "exited unexpectedly: boom"
+	sd.mu.Unlock()
+	d.evict(sd, stopOperator, "operator stop")
+	if got := transition(); got != string(stopFailed) {
+		t.Fatalf("an operator stop masked a failure: %q", got)
+	}
+}

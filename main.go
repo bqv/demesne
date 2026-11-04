@@ -850,7 +850,7 @@ func slotStatusOf(s *slot) slotStatus {
 		Group: s.specOf().group, Policy: s.specOf().policy.String(), Owned: s.specOf().own(),
 		Up: s.up, Booting: s.up && s.readyAt.IsZero(), PID: s.pid,
 		InFlight: atomic.LoadInt64(&s.inflight), Restarts: s.restarts,
-		LastError: s.lastErr, LastTransition: s.stopped,
+		LastError: s.lastErr, LastTransition: downReason(s.stopped, s.up),
 	}
 	if s.specOf().idle > 0 {
 		st.IdleSecond = s.specOf().idle.Seconds()
@@ -992,6 +992,17 @@ func (d *demesne) card(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
+}
+
+// downReason makes last_transition a total function for a slot that is down: a slot that has
+// never run is down for want of a request, which is the same situation the idle timer produces,
+// so it says "idle" rather than leaving a client to interpret an absent field as an unknown
+// state. While the slot is up the field is absent -- there is nothing to explain.
+func downReason(reason stopReason, up bool) stopReason {
+	if up || reason != "" {
+		return reason
+	}
+	return stopIdle
 }
 
 // holdsTheCard separates "the engine is up" from "the card is busy". They are the same thing
