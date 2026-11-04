@@ -139,6 +139,13 @@ It keeps stadi's field names (`slot`, `sd_child_up`, `sd_child_pid`, `llm_health
 booting, pid, uptime, in-flight, restarts, last error, its cgroup, and `port_held_elsewhere`
 when something else owns the port.
 
+Two of those are there because a meter asked: `last_error` says why an engine is not running
+and is **cleared when it becomes ready**, so a value is never a stale success; `last_transition`
+is the same idea as a closed vocabulary — `idle`, `chat-claims-card`, `operator`, `failed` —
+because "stopped" and "stopped because a chat took the card" are different sentences to a
+reader, and only the second one explains a render that vanished. Absent while running, for the
+same reason as the error.
+
 A status poll never takes the transition lock, so a cold load cannot wedge the surface that
 explains the cold load. State lives behind per-slot mutexes; the transition lock is only for
 transitions.

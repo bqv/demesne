@@ -801,7 +801,7 @@ func (d *demesne) route(w http.ResponseWriter, r *http.Request, in intent) {
 				}
 			}
 			if up, _ := sd.isUp(); up {
-				d.evict(sd, "a chat request wants the card")
+				d.evict(sd, stopChat, "a chat request wants the card")
 			}
 		}
 		d.proxies[s.specOf().name].ServeHTTP(w, r)
@@ -811,22 +811,26 @@ func (d *demesne) route(w http.ResponseWriter, r *http.Request, in intent) {
 // ------------------------------------------------------------------- /status
 
 type slotStatus struct {
-	Name       string        `json:"name"`
-	Listen     string        `json:"listen"`
-	ListenPort int           `json:"port"`
-	Group      string        `json:"group,omitempty"`
-	Policy     string        `json:"policy"`
-	Owned      bool          `json:"owned"`
-	Up         bool          `json:"up"`
-	Booting    bool          `json:"booting"`
-	PID        int           `json:"pid,omitempty"`
-	Foreign    string        `json:"port_held_elsewhere,omitempty"`
-	InFlight   int64         `json:"in_flight"`
-	IdleSecond float64       `json:"idle_timeout_s,omitempty"`
-	UptimeSecs float64       `json:"uptime_s,omitempty"`
-	Restarts   int           `json:"restarts"`
-	LastError  string        `json:"last_error,omitempty"`
-	Cgroup     *cgroupStatus `json:"cgroup,omitempty"`
+	Name       string  `json:"name"`
+	Listen     string  `json:"listen"`
+	ListenPort int     `json:"port"`
+	Group      string  `json:"group,omitempty"`
+	Policy     string  `json:"policy"`
+	Owned      bool    `json:"owned"`
+	Up         bool    `json:"up"`
+	Booting    bool    `json:"booting"`
+	PID        int     `json:"pid,omitempty"`
+	Foreign    string  `json:"port_held_elsewhere,omitempty"`
+	InFlight   int64   `json:"in_flight"`
+	IdleSecond float64 `json:"idle_timeout_s,omitempty"`
+	UptimeSecs float64 `json:"uptime_s,omitempty"`
+	Restarts   int     `json:"restarts"`
+	LastError  string  `json:"last_error,omitempty"`
+	// LastTransition is why this slot's child is not running: idle, chat-claims-card,
+	// operator or failed. Absent while it is running, because then there is nothing to
+	// explain -- it is cleared on readiness for the same reason last_error is.
+	LastTransition stopReason    `json:"last_transition,omitempty"`
+	Cgroup         *cgroupStatus `json:"cgroup,omitempty"`
 }
 
 func (d *demesne) slotStatuses() []slotStatus {
@@ -846,7 +850,7 @@ func slotStatusOf(s *slot) slotStatus {
 		Group: s.specOf().group, Policy: s.specOf().policy.String(), Owned: s.specOf().own(),
 		Up: s.up, Booting: s.up && s.readyAt.IsZero(), PID: s.pid,
 		InFlight: atomic.LoadInt64(&s.inflight), Restarts: s.restarts,
-		LastError: s.lastErr,
+		LastError: s.lastErr, LastTransition: s.stopped,
 	}
 	if s.specOf().idle > 0 {
 		st.IdleSecond = s.specOf().idle.Seconds()
@@ -1030,7 +1034,7 @@ func (d *demesne) handleRelease(w http.ResponseWriter, r *http.Request) {
 		if up, _ := s.isUp(); !up {
 			continue
 		}
-		d.evict(s, "operator release")
+		d.evict(s, stopOperator, "operator release")
 		released = append(released, s.specOf().name)
 	}
 	if len(released) == 0 {
@@ -1075,7 +1079,7 @@ func (d *demesne) handleSlotControl(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "demesne: POST required", http.StatusMethodNotAllowed)
 			return
 		}
-		d.evict(s, "operator stop")
+		d.evict(s, stopOperator, "operator stop")
 		fmt.Fprintf(w, "%s stopped\n", s.specOf().name)
 	default:
 		http.Error(w, "demesne: try /slots/<name>, /load or /stop", http.StatusNotFound)

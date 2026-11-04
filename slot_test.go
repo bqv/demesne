@@ -434,7 +434,7 @@ func TestEachSpawnGetsItsOwnGoneChannel(t *testing.T) {
 	first := sd.gone
 	sd.mu.Unlock()
 
-	d.evict(sd, "the test wants a second child")
+	d.evict(sd, stopOperator, "the test wants a second child")
 	if err := d.ensure(sd); err != nil {
 		t.Fatalf("second ensure: %v", err)
 	}
@@ -912,5 +912,51 @@ func TestAProbeDoesNotTakeTheCard(t *testing.T) {
 	d.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`)))
 	if up, _ := sd.isUp(); up {
 		t.Fatal("a chat request left the media child holding the card")
+	}
+}
+
+// last_transition says WHY a slot is not running, in a closed vocabulary, and says nothing
+// while it is running. "chat-claims-card" is the one a reader most wants explained: an idle
+// eviction and a divested render look identical in `last_error`, which is empty for both.
+func TestLastTransitionSaysWhyTheChildStopped(t *testing.T) {
+	cfg := testConfig(t)
+	d := newTestDemesne(t, cfg)
+	sd := d.slotByName("sd")
+
+	transition := func() string {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		d.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/slots/sd", nil))
+		var st slotStatus
+		if err := json.Unmarshal(rec.Body.Bytes(), &st); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return string(st.LastTransition)
+	}
+
+	if err := d.ensure(sd); err != nil {
+		t.Fatalf("ensure(sd): %v", err)
+	}
+	if got := transition(); got != "" {
+		t.Fatalf("a running slot reports last_transition %q, want empty", got)
+	}
+
+	rec := httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/slots/sd/stop", nil))
+	if got := transition(); got != string(stopOperator) {
+		t.Fatalf("after an operator stop: %q, want %q", got, stopOperator)
+	}
+
+	if err := d.ensure(sd); err != nil {
+		t.Fatalf("ensure(sd) again: %v", err)
+	}
+	if got := transition(); got != "" {
+		t.Fatalf("readiness did not clear last_transition: %q", got)
+	}
+
+	// A chat request is the interesting one: it evicts the media child without it failing.
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`)))
+	if got := transition(); got != string(stopChat) {
+		t.Fatalf("after a chat claimed the card: %q, want %q", got, stopChat)
 	}
 }

@@ -256,7 +256,7 @@ func (d *demesne) recoverLLM(reason string) {
 			// If it is already gone, this is a no-op and the supervisor is already
 			// dealing with it -- which is the double restart, removed.
 			log.Printf("watch: restarting the llama child after: %s", reason)
-			d.evict(s, "the watch decided the router is wedged")
+			d.evict(s, stopFailed, "the watch decided the router is wedged")
 			return
 		}
 

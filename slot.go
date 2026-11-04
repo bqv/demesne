@@ -80,6 +80,20 @@ func (p policy) String() string {
 // demesne's children now: `rc_cgroup_settings` never worked for a --user service
 // anyway (openrc-run.sh:60 does not source rc-cgroup.sh under RC_USER_SERVICES), which
 // is why every init script carried forty lines of start_post() to do it by hand.
+// stopReason is why a slot's child is not running. A closed vocabulary because a client
+// renders it: "idle" and "operator" are ordinary, "chat-claims-card" is the one a reader wants
+// explained, and "failed" is the only one that is a fault. Empty means "running", or "never
+// stopped since it last became ready" -- the field is cleared on readiness for the same reason
+// last_error is.
+type stopReason string
+
+const (
+	stopIdle     stopReason = "idle"
+	stopChat     stopReason = "chat-claims-card"
+	stopOperator stopReason = "operator"
+	stopFailed   stopReason = "failed"
+)
+
 // cgroupLeaf is where a slot's fence sits under the estate's cgroup root. The two routers
 // share a parent -- they are the two halves of one job -- and a parent that holds no
 // processes is also the obvious place for a limit that would cover both. Everything else
@@ -192,6 +206,7 @@ type slot struct {
 	stopping bool // the exit was ordered, so do not count it as a crash
 	foreign  bool // the port answers but the process is not ours
 	lastErr  string
+	stopped  stopReason // why the child last stopped; cleared when it is ready again
 	restarts int
 	crash    int // consecutive unexpected failures; drives the backoff
 	diedAt   time.Time
@@ -295,7 +310,7 @@ func (s *slot) noteFailure(err error) {
 
 func (s *slot) noteReady() {
 	s.mu.Lock()
-	s.crash, s.lastErr, s.foreign = 0, "", false
+	s.crash, s.lastErr, s.foreign, s.stopped = 0, "", false, ""
 	s.mu.Unlock()
 }
 
@@ -323,7 +338,7 @@ func (s *slot) armIdleLocked(d *demesne) {
 			s.armIdle(d)
 			return
 		}
-		d.evict(s, fmt.Sprintf("no request for %s", s.specOf().idle))
+		d.evict(s, stopIdle, fmt.Sprintf("no request for %s", s.specOf().idle))
 	})
 }
 
@@ -340,10 +355,10 @@ func (d *demesne) ensure(s *slot) error {
 	return d.ensureLocked(s)
 }
 
-func (d *demesne) evict(s *slot, why string) {
+func (d *demesne) evict(s *slot, reason stopReason, detail string) {
 	d.transition.Lock()
 	defer d.transition.Unlock()
-	d.evictLocked(s, why)
+	d.evictLocked(s, reason, detail)
 }
 
 func (d *demesne) ensureLocked(s *slot) error {
@@ -390,7 +405,7 @@ func (d *demesne) clearGroupLocked(s *slot) error {
 			continue
 		}
 		if up, _ := other.isUp(); up {
-			d.evictLocked(other, s.specOf().name+" wants the "+s.specOf().group)
+			d.evictLocked(other, stopChat, s.specOf().name+" wants the "+s.specOf().group)
 		}
 	}
 	if !s.specOf().vram {
@@ -451,7 +466,7 @@ func (d *demesne) spawnLocked(s *slot) error {
 	d.joinCgroup(s, cmd.Process.Pid)
 
 	if err := d.waitReady(s, d.cfg.loadWait); err != nil {
-		d.evictLocked(s, fmt.Sprintf("%s never answered on %s", s.specOf().name, s.specOf().url))
+		d.evictLocked(s, stopFailed, fmt.Sprintf("%s never answered on %s", s.specOf().name, s.specOf().url))
 		s.noteFailure(err)
 		return fmt.Errorf("%s never came up on %s: %w", s.specOf().name, s.specOf().url, err)
 	}
@@ -507,6 +522,7 @@ func (d *demesne) reap(s *slot, cmd *exec.Cmd, out, errf io.Closer, gone chan st
 			s.crash++
 			s.diedAt = time.Now()
 			s.lastErr = fmt.Sprintf("exited unexpectedly: %v", err)
+			s.stopped = stopFailed
 		}
 		s.stopping = false
 	}
@@ -520,8 +536,9 @@ func (d *demesne) reap(s *slot, cmd *exec.Cmd, out, errf io.Closer, gone chan st
 // evictLocked stops the child and waits for the card to come back. SIGTERM the whole
 // group, then SIGKILL if it will not go: sd-server frees its weights on exit
 // (measured 12.5 GiB -> 0.03 GiB), which is the entire point of stopping it.
-func (d *demesne) evictLocked(s *slot, why string) {
+func (d *demesne) evictLocked(s *slot, reason stopReason, why string) {
 	s.mu.Lock()
+	s.stopped = reason
 	if s.timer != nil {
 		s.timer.Stop()
 		s.timer = nil
@@ -673,7 +690,7 @@ func (d *demesne) stopAll(why string) {
 	defer d.transition.Unlock()
 	for _, s := range d.slots {
 		if up, _ := s.isUp(); up {
-			d.evictLocked(s, why)
+			d.evictLocked(s, stopOperator, why)
 		}
 	}
 }

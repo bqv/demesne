@@ -220,7 +220,7 @@ func (d *demesne) reload() (reloadReport, error) {
 		if want.policy != policyResident && s.isSupervised() {
 			s.setSupervised(false)
 			if up {
-				d.evictLocked(s, "demesne no longer supervises it")
+				d.evictLocked(s, stopOperator, "demesne no longer supervises it")
 			}
 		}
 		if want.policy == policyResident && !s.isSupervised() {
@@ -228,7 +228,7 @@ func (d *demesne) reload() (reloadReport, error) {
 			go d.supervise(s)
 		}
 		if childMoved && up {
-			d.evictLocked(s, "its configuration changed")
+			d.evictLocked(s, stopOperator, "its configuration changed")
 			rep.Restarted = append(rep.Restarted, name)
 			continue
 		}
