@@ -206,6 +206,7 @@ func (d *demesne) reload() (reloadReport, error) {
 
 		if cur.url != want.url {
 			d.proxies[name] = reverseProxy(d, want.url, name == "llama")
+			d.probes[name] = reverseProxy(d, want.url, false)
 		}
 		if cur.cgroup != want.cgroup && want.cgroup.set() {
 			d.prepareCgroup(s)

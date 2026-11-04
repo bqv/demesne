@@ -879,3 +879,38 @@ func TestAnIdleRouterDoesNotHoldTheCard(t *testing.T) {
 		t.Fatalf("a router with a resident model does not hold its card: %v", got.Holders)
 	}
 }
+
+// A probe is not a claimant. The catch-all used to be chat, so GET /slots or /metrics on the
+// front door evicted a running render before answering -- a monitoring loop could kill a
+// render simply by looking at the estate.
+func TestAProbeDoesNotTakeTheCard(t *testing.T) {
+	cfg := testConfig(t)
+	d := newTestDemesne(t, cfg)
+	sd := d.slotByName("sd")
+	if err := d.ensure(sd); err != nil {
+		t.Fatalf("ensure(sd): %v", err)
+	}
+
+	for _, path := range []string{"/slots", "/metrics", "/tokenize", "/detokenize", "/apply-template"} {
+		if got := resolve(path); got.kind != kindProxy {
+			t.Errorf("resolve(%q) = kind %d, want kindProxy", path, got.kind)
+		}
+		// llama is absent in this fixture, so the proxy answers 502 -- what matters is
+		// that the media child is still holding the card afterwards.
+		rec := httptest.NewRecorder()
+		d.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if up, _ := sd.isUp(); !up {
+			t.Fatalf("GET %s evicted the media child", path)
+		}
+	}
+
+	// And the thing that IS a claim still claims.
+	if got := resolve("/v1/chat/completions"); got.kind != kindChat {
+		t.Fatalf("resolve(chat) = %d, want kindChat", got.kind)
+	}
+	rec := httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`)))
+	if up, _ := sd.isUp(); up {
+		t.Fatal("a chat request left the media child holding the card")
+	}
+}

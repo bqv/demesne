@@ -83,7 +83,8 @@ asked `rc-service` for the same restart — was an artefact of two owners, not o
 
 | request | what happens |
 | :-- | :-- |
-| **chat** — `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, … | the model name picks the engine; if that engine is on the `gpu` card, the media child is evicted, the VRAM is waited for, then the request is proxied |
+| **chat** — `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/rerank`, `/completion`, `/infill`, `/models/load|unload` | the model name picks the engine; if that engine is on the `gpu` card, the media child is evicted, the VRAM is waited for, then the request is proxied |
+| **anything else** — `/slots`, `/metrics`, `/tokenize`, `/detokenize`, whatever the next llama.cpp build adds | proxied to the router and **nothing else**: no card claim, no eviction, no breaker. A probe is not a claimant |
 | **generation** — `/sdapi/v1/txt2img`, `/img2img`, `/v1/images/*`, `/inference`, `/v1/audio/*` | make room on the card, spawn the child, proxy to it, re-arm its idle clock |
 | **metadata** — `/props`, `/health`, `/healthz` | proxy untouched; the router loads nothing for these |
 | **observation** — other `/sdapi/*` (`/progress`, `/options`, …) | proxy only if loaded, otherwise `503 sd is not loaded` |
@@ -93,6 +94,14 @@ stopped and the card frees itself. That is the feature sd.cpp does not have.
 
 The generation/observation split is not cosmetic: without it a monitoring loop polling
 `/sdapi/v1/progress` would spawn the child and pin the card forever, defeating the idle timer.
+
+The **chat / everything-else** split is the same lesson one layer out, and it was learned on
+2026-11-04 from a report: the catch-all used to be chat, so `GET /slots` on the front door
+evicted a running render before answering, and a failing probe fed the router's breaker — a
+monitor could kill a render and then ask for a restart simply by looking at the estate. What
+claims the card is now an enumerated list; everything else is proxied by a second, unwatched
+proxy. The asymmetry is deliberate: a request that quietly loses its claim is a slow load, one
+that quietly takes the card is somebody's ruined afternoon.
 
 **State needs no flags: the child's existence *is* the state.** `GET /status` reports
 `sd_child_up`, so "is sd loaded?" is process liveness rather than a boolean that can desync.

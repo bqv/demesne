@@ -492,8 +492,13 @@ type demesne struct {
 
 	transition sync.Mutex // one transition at a time; never held across a proxy
 	proxies    map[string]*httputil.ReverseProxy
-	llm        *llmWatch
-	models     modelIndex // which engine advertises which model (models.go)
+	// probes is the same proxy without the health watch. A request that does not claim the
+	// card must not be able to condemn the engine either: a monitoring loop polling /metrics
+	// during a restart would otherwise trip the breaker and ask for a restart of an engine
+	// that was simply starting -- the same mistake the /v1/models handler made once.
+	probes map[string]*httputil.ReverseProxy
+	llm    *llmWatch
+	models modelIndex // which engine advertises which model (models.go)
 
 	done    chan struct{}
 	closing atomic.Bool
@@ -504,6 +509,7 @@ func newDemesne(cfg config) *demesne {
 		cfg:     cfg,
 		index:   map[string]*slot{},
 		proxies: map[string]*httputil.ReverseProxy{},
+		probes:  map[string]*httputil.ReverseProxy{},
 		llm:     newLLMWatch(),
 		done:    make(chan struct{}),
 	}
@@ -514,6 +520,7 @@ func newDemesne(cfg config) *demesne {
 	}
 	for _, s := range d.slots {
 		d.proxies[s.specOf().name] = reverseProxy(d, s.specOf().url, s.specOf().name == "llama")
+		d.probes[s.specOf().name] = reverseProxy(d, s.specOf().url, false)
 		// A resident slot is somebody's responsibility from the start. A reload can hand
 		// an engine back to OpenRC and take it again, so the flag is a real one and not a
 		// property of the spec.
@@ -592,7 +599,8 @@ func waitVRAMBelow(limit uint64, howLong time.Duration) error {
 type routeKind int
 
 const (
-	kindChat        routeKind = iota // the LLM path: wait for a render, evict the card, proxy
+	kindChat        routeKind = iota // a request that WANTS the card: wait for a render, evict it, proxy
+	kindProxy                        // proxied to an engine that needs nothing: no card, no eviction
 	kindMetadata                     // proxy untouched: the router loads nothing for these
 	kindGeneration                   // may spawn the slot and re-arm its idle clock
 	kindObservation                  // only ever reports on a slot: never spawns
@@ -626,9 +634,20 @@ func resolve(p string) intent {
 		return intent{"sd", kindObservation}
 	case p == "/inference", strings.HasPrefix(p, "/v1/audio/"):
 		return intent{"whisper", kindGeneration}
+	case p == "/v1/chat/completions", p == "/v1/completions", p == "/v1/embeddings",
+		p == "/v1/rerank", p == "/v1/reranking", p == "/v1/systemone",
+		p == "/completion", p == "/infill", p == "/embedding", p == "/reranking",
+		p == "/models/load", p == "/models/unload",
+		strings.HasPrefix(p, "/v1/chat/completions/"):
+		return intent{"llama", kindChat}
 	}
-	// Everything else is chat: /v1/chat/completions, /models/load, /models/unload, ...
-	return intent{"llama", kindChat}
+	// Anything else that reaches llama is proxied WITHOUT claiming the card: /slots, /metrics,
+	// /tokenize, /detokenize, /apply-template and whatever the next llama.cpp build adds. The
+	// catch-all used to be chat, which meant a monitoring probe of /slots on the front door
+	// evicted a running render -- a probe is not a claim. What does claim is enumerated above,
+	// because a path nobody recognised must fail safe: a request that quietly loses its card
+	// claim is a slow load, while a probe that quietly takes the card kills someone's render.
+	return intent{"llama", kindProxy}
 }
 
 // reverseProxy builds the pass-through. isLLM adds the watch: a failed dial or a
@@ -733,8 +752,8 @@ func (d *demesne) route(w http.ResponseWriter, r *http.Request, in intent) {
 		}
 		d.proxies[s.specOf().name].ServeHTTP(w, r)
 
-	case kindMetadata:
-		d.proxies[s.specOf().name].ServeHTTP(w, r)
+	case kindMetadata, kindProxy:
+		d.probes[s.specOf().name].ServeHTTP(w, r)
 
 	default: // kindChat
 		// The breaker: once the router has failed a burst of requests, refuse new ones
@@ -765,7 +784,8 @@ func (d *demesne) route(w http.ResponseWriter, r *http.Request, in intent) {
 		}
 		// A request for this GROUP's card evicts the other holder. The group is the one
 		// of the slot the request actually goes to, not of the path: a model that lives
-		// on the small card must not kill a render on the big one.
+		// on the small card must not kill a render on the big one. kindProxy skips the
+		// whole dance -- it is a request that neither loads nor generates.
 		if sd := d.slotByName("sd"); sd != nil && sd.specOf().group == s.specOf().group {
 			// If a render is in flight, wait for it to finish -- then say so plainly
 			// instead of killing it.
