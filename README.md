@@ -144,7 +144,10 @@ and is **cleared when it becomes ready**, so a value is never a stale success; `
 is the same idea as a closed vocabulary — `idle`, `chat-claims-card`, `operator`, `failed` —
 because "stopped" and "stopped because a chat took the card" are different sentences to a
 reader, and only the second one explains a render that vanished. Absent while running, for the
-same reason as the error.
+same reason as the error; and **total for a slot that is down**, so a slot that has never been
+asked says `idle` rather than leaving the client to interpret an absent field. An operator stop
+of a slot that is already down does not overwrite `failed` — the failure is the last thing that
+actually happened.
 
 A status poll never takes the transition lock, so a cold load cannot wedge the surface that
 explains the cold load. State lives behind per-slot mutexes; the transition lock is only for
