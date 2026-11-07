@@ -1947,3 +1947,22 @@ func TestLoadsPollAnySlotMarkedRouter(t *testing.T) {
 		t.Fatalf("a router with no binary was not polled: %+v", got)
 	}
 }
+
+// The Strata slot is opt-in: 55560 is not reserved on an estate that never configured it, and
+// an external slot's "up" is portAlive rather than ownership, so a default URL would have let
+// anything binding that port be adopted silently.
+func TestTheStrataSlotIsOptIn(t *testing.T) {
+	cfg := testConfig(t)
+	if n := len(buildSlots(cfg)); n != 4 {
+		t.Fatalf("an estate that never configured strata has %d slots, want 4", n)
+	}
+	cfg.strata = engineConfig{url: "http://127.0.0.1:55560"}
+	specs := buildSlots(cfg)
+	if len(specs) != 5 {
+		t.Fatalf("%d slots with strata configured, want 5", len(specs))
+	}
+	last := specs[len(specs)-1]
+	if last.name != "strata" || last.policy != policyExternal || last.group != "gpu" || !last.router {
+		t.Fatalf("the fifth slot is not the external router described: %+v", last)
+	}
+}
