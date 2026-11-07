@@ -558,6 +558,12 @@ Bugs found while building this, kept because the next reader will otherwise find
 7. **"Up" is not "holding the card".** A router with nothing loaded holds a port and about
    28 MiB. The first card document said `holders:["llama"]` for exactly that, and a client
    trusting it would refuse to render on a free card.
+8. **A caller that gives up is not an engine that failed.** The proxy sees a cancelled client
+   and a refused connection as the same returned error, and counting the first as evidence is
+   how a client timeout condemned a healthy router: on 2026-11-07 two of them five minutes
+   apart tripped the breaker, the watch killed a child that was 14.65 GiB into a cold load, and
+   every retry after that had no model and no chance. Cancellations are now logged and dropped;
+   the breaker only hears about the engine.
 
 ## Licence
 

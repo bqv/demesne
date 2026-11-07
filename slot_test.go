@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -1185,5 +1186,37 @@ func TestFIMClaimsTheCard(t *testing.T) {
 		`{"model":"big-model","prompt":"a","suffix":"b"}`)))
 	if up, _ := sd.isUp(); up {
 		t.Fatal("a FIM request left the media child holding the card")
+	}
+}
+
+// A caller that gives up says nothing about the engine. On 2026-11-07 two client timeouts,
+// five minutes apart, tripped the breaker and the watch killed a router 14.65 GiB into a cold
+// load; every retry after that had no model and no chance. The 27B rung was never at fault.
+func TestAClientCancelIsNotAnEngineFailure(t *testing.T) {
+	cfg := testConfig(t)
+	d := newTestDemesne(t, cfg)
+	p := d.proxies["llama"]
+
+	// The client went away: the proxy's error handler must leave the watch alone.
+	for i := 0; i < cfg.failThreshold+3; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		ctx, cancel := context.WithCancel(req.Context())
+		cancel()
+		req = req.WithContext(ctx)
+		rec := httptest.NewRecorder()
+		p.ErrorHandler(rec, req, context.Canceled)
+	}
+	if open, wait := d.llm.failing(); open {
+		t.Fatalf("client cancellations opened the breaker (retry after %v)", wait)
+	}
+
+	// A genuine transport failure still counts, or the breaker would protect nothing.
+	for i := 0; i < cfg.failThreshold; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		rec := httptest.NewRecorder()
+		p.ErrorHandler(rec, req, errors.New("dial tcp 127.0.0.1:55556: connect: connection refused"))
+	}
+	if open, _ := d.llm.failing(); !open {
+		t.Fatal("real transport failures no longer trip the breaker")
 	}
 }

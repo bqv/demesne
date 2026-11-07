@@ -27,6 +27,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -663,6 +664,16 @@ func reverseProxy(d *demesne, base string, isLLM bool) *httputil.ReverseProxy {
 	// image_generation.* events.
 	p.FlushInterval = -1
 	p.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		cancelled := clientWentAway(r, err)
+		if cancelled {
+			// The caller gave up. That says nothing about the engine, and on 2026-11-07
+			// counting it as evidence was enough to condemn a router that was 14.65 GiB
+			// into loading a model: two client timeouts five minutes apart tripped the
+			// breaker, the watch killed the child, and the load died with it.
+			log.Printf("%s %s -> %s: the client went away (%v); not held against the engine",
+				r.Method, r.URL.Path, base, err)
+			return
+		}
 		log.Printf("%s %s -> %s: %v", r.Method, r.URL.Path, base, err)
 		if isLLM {
 			if restart := d.llm.fail(err, d.cfg.failThreshold, d.cfg.breakerFor); restart {
@@ -682,6 +693,20 @@ func reverseProxy(d *demesne, base string, isLLM bool) *httputil.ReverseProxy {
 		}
 	}
 	return p
+}
+
+// clientWentAway separates "the engine failed" from "the caller stopped listening". The
+// proxy sees both as a returned error, and only one of them is evidence about the engine.
+func clientWentAway(r *http.Request, err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	select {
+	case <-r.Context().Done():
+		return true
+	default:
+		return false
+	}
 }
 
 func (d *demesne) ServeHTTP(w http.ResponseWriter, r *http.Request) {
