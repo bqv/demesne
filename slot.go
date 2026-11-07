@@ -350,6 +350,12 @@ func (s *slot) armIdleLocked(d *demesne) {
 // surface that exists to explain the eight-minute cold load.
 
 func (d *demesne) ensure(s *slot) error {
+	// Before taking the transition lock, give a held port one chance to be taken back -- see
+	// reclaim.go. It can wait for a process to die, and no other transition should queue
+	// behind that.
+	if up, _ := s.isUp(); !up && portAlive(s.specOf().url) {
+		_, _ = d.reclaimSlot(s)
+	}
 	d.transition.Lock()
 	defer d.transition.Unlock()
 	return d.ensureLocked(s)
@@ -371,7 +377,8 @@ func (d *demesne) ensureLocked(s *slot) error {
 		s.foreign = true
 		s.mu.Unlock()
 		return fmt.Errorf("%s is already served by a process demesne does not own "+
-			"(find it with: fuser -n tcp %d; stop it, then retry)", s.specOf().url, s.port())
+			"(find it with: fuser -n tcp %d; stop it, then retry; see /status: port_held_elsewhere)",
+			s.specOf().url, s.port())
 	}
 	if !s.specOf().own() {
 		return fmt.Errorf("%s is not configured: give it a command line", s.specOf().name)
@@ -428,12 +435,20 @@ func (d *demesne) spawnLocked(s *slot) error {
 	// takes the supervisor into a crash loop that reads as the engine's fault. The orphan
 	// that did this on 2026-11-07 was 1 day 19 hours old and invisible in every log.
 	if up, _ := s.isUp(); !up && portAliveWithin(s.specOf().url, 250*time.Millisecond) {
-		s.mu.Lock()
-		s.foreign = true
-		s.lastErr = "its port is held by a process demesne does not own"
-		s.mu.Unlock()
-		return fmt.Errorf("%s is already answered by a process demesne does not own; "+
-			"refusing to spawn a second one (see /status: port_held_elsewhere)", s.specOf().url)
+		// One chance to take it back, and only on evidence: see reclaim.go. A holder that
+		// cannot be proven ours is left alone, loudly.
+		killed, rerr := d.reclaimSlot(s)
+		if !killed {
+			reason := "its port is held by a process demesne cannot prove it owns"
+			if rerr != nil {
+				reason = rerr.Error()
+			}
+			s.mu.Lock()
+			s.foreign = true
+			s.lastErr = reason
+			s.mu.Unlock()
+			return fmt.Errorf("%s; refusing to spawn a second one (see /status: port_held_elsewhere)", reason)
+		}
 	}
 	if err := os.MkdirAll(d.cfg.logDir, 0o755); err != nil {
 		return fmt.Errorf("log dir: %w", err)

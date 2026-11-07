@@ -172,6 +172,17 @@ func (d *demesne) rpcCall(method string, raw json.RawMessage) (any, *rpcError) {
 		}
 		return map[string]any{"slot": s.specOf().name, "state": "running"}, nil
 
+	case "slots.reclaim":
+		s := d.slotByName(p.Slot)
+		if s == nil {
+			return nil, d.unknownSlot(p.Slot)
+		}
+		killed, err := d.reclaimSlot(s)
+		if err != nil {
+			return nil, &rpcError{Code: rpcInternal, Message: err.Error()}
+		}
+		return map[string]any{"slot": s.specOf().name, "reclaimed": killed}, nil
+
 	case "slots.stop":
 		s := d.slotByName(p.Slot)
 		if s == nil {

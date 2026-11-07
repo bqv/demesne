@@ -1139,6 +1139,21 @@ func (d *demesne) handleSlotControl(w http.ResponseWriter, r *http.Request) {
 		}
 		d.evict(s, stopOperator, "operator stop")
 		fmt.Fprintf(w, "%s stopped\n", s.specOf().name)
+	case "reclaim":
+		if r.Method != http.MethodPost {
+			http.Error(w, "demesne: POST required", http.StatusMethodNotAllowed)
+			return
+		}
+		killed, err := d.reclaimSlot(s)
+		if err != nil {
+			http.Error(w, "demesne: "+err.Error(), http.StatusConflict)
+			return
+		}
+		if !killed {
+			fmt.Fprintf(w, "%s: nothing was holding its port\n", s.specOf().name)
+			return
+		}
+		fmt.Fprintf(w, "%s: port taken back\n", s.specOf().name)
 	default:
 		http.Error(w, "demesne: try /slots/<name>, /load or /stop", http.StatusNotFound)
 	}

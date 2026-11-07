@@ -1497,3 +1497,72 @@ func TestReadinessNeedsOurOwnChild(t *testing.T) {
 		t.Fatalf("want the child exit as the reason, got %q", err)
 	}
 }
+
+// The port's holder must be findable the way ss finds it, or nothing else in reclaim.go means
+// anything.
+func TestProcPortPIDFindsTheHolder(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	pid, ok := procPortPID(port)
+	if !ok {
+		t.Fatalf("no holder found for port %d", port)
+	}
+	if pid != os.Getpid() {
+		t.Fatalf("holder pid = %d, want this process (%d)", pid, os.Getpid())
+	}
+}
+
+// Killing is allowed only on evidence. A listener that is not in the slot's own cgroup is a
+// stranger, and a refusal is the correct answer -- even though it leaves the slot stuck.
+func TestReclaimRefusesAStranger(t *testing.T) {
+	cfg := testConfig(t)
+	d := newTestDemesne(t, cfg)
+	s := d.slotByName("sd")
+
+	ln, err := net.Listen("tcp", s.hostPort())
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	killed, err := d.reclaimSlot(s)
+	if killed {
+		t.Fatal("reclaim killed a process it could not prove was ours")
+	}
+	if err == nil {
+		t.Fatal("reclaim refused silently")
+	}
+	if !strings.Contains(err.Error(), "refusing") {
+		t.Fatalf("the refusal should say it refused: %q", err)
+	}
+	// The stranger is this test process, so "still alive" is the assertion that matters.
+	if _, ok := procPortPID(s.port()); !ok {
+		t.Fatal("the listener was killed anyway")
+	}
+}
+
+// And the spawn refusal must now carry the reason from the reclaim attempt.
+func TestSpawnRefusalNamesTheReason(t *testing.T) {
+	cfg := testConfig(t)
+	d := newTestDemesne(t, cfg)
+	s := d.slotByName("sd")
+
+	ln, err := net.Listen("tcp", s.hostPort())
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	err = d.ensure(s)
+	if err == nil {
+		t.Fatal("ensure() succeeded over a held port")
+	}
+	if !strings.Contains(err.Error(), "port_held_elsewhere") {
+		t.Fatalf("the refusal should point at /status: %q", err)
+	}
+}
