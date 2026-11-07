@@ -2026,3 +2026,32 @@ func TestAStaticStatusProducesNoLoadRow(t *testing.T) {
 		t.Fatalf("a static status produced history: %+v", got)
 	}
 }
+
+// A load longer than the queue window must not disappear from loads[]: a 27B on the network mount
+// reads for thirteen minutes, and expiring the row mid-load is the one moment it matters.
+func TestALongLoadStaysVisible(t *testing.T) {
+	b := newLoadBoard("")
+	b.observe("llama", map[string]string{"M1": "loading"})
+	b.mu.Lock()
+	b.entries[loadKey("llama", "M1")].StartedMS = time.Now().Add(-30 * time.Minute).UnixMilli()
+	b.mu.Unlock()
+	b.prune()
+	if findLoad(t, b.snapshot(), "llama", "M1") == nil {
+		t.Fatal("a thirty-minute load was pruned away")
+	}
+}
+
+// The same transition seen by two writers is one event, not two.
+func TestHistoryDoesNotDoubleCountATransition(t *testing.T) {
+	h := &history{}
+	now := time.Now().UnixMilli()
+	h.record(transitionRecord{AtMS: now, Slot: "llama", Kind: "load", To: "loading", Reason: "M1"})
+	h.record(transitionRecord{AtMS: now, Slot: "llama", Kind: "load", To: "loading", Reason: "M1"})
+	if got := len(h.snapshot()); got != 1 {
+		t.Fatalf("%d history entries for one transition", got)
+	}
+	h.record(transitionRecord{AtMS: now + 10_000, Slot: "llama", Kind: "load", To: "loading", Reason: "M1"})
+	if got := len(h.snapshot()); got != 2 {
+		t.Fatalf("a later transition was swallowed: %d entries", got)
+	}
+}

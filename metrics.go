@@ -32,6 +32,15 @@ type history struct {
 func (h *history) record(r transitionRecord) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	// Two writers can observe the same transition (the model poll and the child log), and a
+	// consumer counting entries would read that as two events.
+	if n := len(h.ring); n > 0 {
+		last := h.ring[n-1]
+		if last.Slot == r.Slot && last.Kind == r.Kind && last.To == r.To && last.Reason == r.Reason &&
+			r.AtMS-last.AtMS < 2000 && r.AtMS >= last.AtMS {
+			return
+		}
+	}
 	h.ring = append(h.ring, r)
 	if len(h.ring) > historyLen {
 		h.ring = h.ring[len(h.ring)-historyLen:]

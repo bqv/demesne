@@ -292,10 +292,16 @@ func (b *loadBoard) prune() {
 			if e.FinishedMS != nil && now.Sub(time.UnixMilli(*e.FinishedMS)) > loadFailedFor {
 				delete(b.entries, key)
 			}
-		case loadQueued, loadLoading:
+		case loadQueued:
+			// A request that never became a load is stale quickly.
 			if age > loadQueuedFor {
 				delete(b.entries, key)
 			}
+		case loadLoading:
+			// Never by age: a 27B on the network mount reads for thirteen minutes, and
+			// expiring it mid-load would make the row vanish exactly while it matters. It
+			// is cleared when the slot goes down, and a stuck engine is the engine's story
+			// to tell, not something to paper over.
 		}
 	}
 }
