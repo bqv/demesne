@@ -117,9 +117,10 @@ func (b *loadBoard) observe(slot string, models map[string]string) {
 				e = &modelLoad{Slot: slot, Model: model, StartedMS: now}
 				b.entries[loadKey(slot, model)] = e
 			}
-			if e.Phase != loadFailed {
+			if e.Phase != loadLoading {
 				was := e.Phase
 				e.Phase = loadLoading
+				e.Error, e.FinishedMS = nil, nil
 				if was != loadLoading {
 					changed = append(changed, *e)
 					b.fire(*e)
@@ -129,7 +130,7 @@ func (b *loadBoard) observe(slot string, models map[string]string) {
 			if has {
 				delete(b.loaded[slot], model)
 			}
-			if e, ok := b.entries[loadKey(slot, model)]; ok && e.Phase != loadFailed && e.Phase != loadReady {
+			if e, ok := b.entries[loadKey(slot, model)]; ok && e.Phase == loadLoading {
 				e.Phase = loadFailed
 				msg := "the router unloaded the model before it was ready"
 				e.Error, e.FinishedMS = &msg, &now
@@ -222,9 +223,13 @@ func hasLoadMark(line string) bool {
 }
 
 func isLoadFailure(line string) bool {
+	if i := strings.Index(line, "exited with status "); i >= 0 {
+		code := strings.TrimSpace(line[i+len("exited with status "):])
+		return code != "" && code[0] != '0'
+	}
 	for _, mark := range []string{
 		"failed to allocate", "unable to allocate", "error loading model",
-		"exited with status", "out of memory", "OOM",
+		"out of memory", "OOM",
 	} {
 		if strings.Contains(line, mark) {
 			return true
@@ -319,7 +324,7 @@ func (b *loadBoard) forget(slot string) {
 
 func (b *loadBoard) refreshLogs(slots []string) {
 	for _, slot := range slots {
-		lines, progress, failure := b.fromLog(slot)
+		lines, progress, _ := b.fromLog(slot)
 		if len(lines) == 0 {
 			continue
 		}
@@ -335,10 +340,10 @@ func (b *loadBoard) refreshLogs(slots []string) {
 			if progress != nil {
 				e.Progress = progress
 			}
-			if failure != nil && e.Phase == loadLoading && namesModel(*failure, e.Model) {
+			if failure := failureAfterStart(lines, e.Model); failure != "" && e.Phase == loadLoading {
 				e.Phase = loadFailed
-				e.Error = failure
-				e.Line = *failure
+				msg := failure
+				e.Error, e.Line = &msg, msg
 				now := time.Now().UnixMilli()
 				e.FinishedMS = &now
 				changed = append(changed, *e)
@@ -423,6 +428,27 @@ func (b *loadBoard) observeFromLog(slot string) {
 		return
 	}
 	b.mu.Unlock()
+}
+
+// failureAfterStart reports the last line that fails this model's CURRENT load: it must come
+// after the model's most recent load line in the tail. A clean stop from a previous instance sits
+// before it, and 'exited with status 0' is not a failure at all.
+func failureAfterStart(lines []string, model string) string {
+	start := -1
+	for i, l := range lines {
+		if m := modelFromLoadLine(l); m != "" && m == model {
+			start = i
+		}
+	}
+	if start < 0 {
+		return ""
+	}
+	for i := len(lines) - 1; i > start; i-- {
+		if namesModel(lines[i], model) && isLoadFailure(lines[i]) {
+			return lines[i]
+		}
+	}
+	return ""
 }
 
 func modelFromLoadLine(line string) string {

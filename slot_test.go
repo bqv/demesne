@@ -2069,3 +2069,58 @@ func TestResidentModelsAreCached(t *testing.T) {
 		t.Fatalf("another slot inherited the set: %v", other)
 	}
 }
+
+// A clean exit is not a failure: the router logs "exited with status 0" whenever it stops an
+// instance, and matching that as a load failure marks a healthy load failed.
+func TestACleanExitIsNotALoadFailure(t *testing.T) {
+	if isLoadFailure("srv run: instance name=M1 exited with status 0") {
+		t.Fatal("a status-0 exit was treated as a failure")
+	}
+	if !isLoadFailure("srv run: instance name=M1 exited with status 1") {
+		t.Fatal("a status-1 exit was not treated as a failure")
+	}
+}
+
+// And a failure only applies to the load it follows: a status-1 exit from an earlier instance,
+// sitting before the new load line, is stale.
+func TestAStaleFailureDoesNotFailTheNewLoad(t *testing.T) {
+	lines := []string{
+		"srv run: instance name=M1 exited with status 1",
+		"srv load: ./M1.gguf",
+		"load_tensors: loading model tensors",
+	}
+	if got := failureAfterStart(lines, "M1"); got != "" {
+		t.Fatalf("a stale failure was taken as current: %q", got)
+	}
+	lines = append(lines, "srv run: instance name=M1 exited with status 1")
+	if got := failureAfterStart(lines, "M1"); got == "" {
+		t.Fatal("a failure after the load line was ignored")
+	}
+}
+
+// A queued request is not failed by the router reporting the model unloaded: that is the state
+// it is in until the load starts.
+func TestAQueuedLoadIsNotFailedByUnloaded(t *testing.T) {
+	b := newLoadBoard("")
+	b.noteRequest("llama", "M1")
+	b.observe("llama", map[string]string{"M1": "unloaded"})
+	e := findLoad(t, b.snapshot(), "llama", "M1")
+	if e == nil || e.Phase != loadQueued {
+		t.Fatalf("a queued load was marked %v", e)
+	}
+}
+
+// A retry after a failure is a new load, and the row must say so rather than stay failed.
+func TestAFailedLoadReturnsToLoadingOnRetry(t *testing.T) {
+	b := newLoadBoard("")
+	b.observe("llama", map[string]string{"M1": "loading"})
+	b.observe("llama", map[string]string{"M1": "unloaded"})
+	if e := findLoad(t, b.snapshot(), "llama", "M1"); e.Phase != loadFailed {
+		t.Fatalf("setup: phase %v", e.Phase)
+	}
+	b.observe("llama", map[string]string{"M1": "loading"})
+	e := findLoad(t, b.snapshot(), "llama", "M1")
+	if e.Phase != loadLoading || e.Error != nil || e.FinishedMS != nil {
+		t.Fatalf("a retried load stayed %v (error %v)", e.Phase, e.Error)
+	}
+}
