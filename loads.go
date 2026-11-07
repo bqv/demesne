@@ -351,6 +351,21 @@ func (b *loadBoard) refreshLogs(slots []string) {
 	}
 }
 
+// resident reports the models the slot's engine last said were loaded, so a client does not
+// have to cache the model list to know whether an unresponsive router is holding anything.
+func (b *loadBoard) resident(slot string) []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]string, 0, len(b.loaded[slot]))
+	for model, loaded := range b.loaded[slot] {
+		if loaded {
+			out = append(out, model)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func (b *loadBoard) snapshot() []modelLoad {
 	b.mu.Lock()
 	defer b.mu.Unlock()

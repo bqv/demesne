@@ -92,6 +92,7 @@ type slotMetrics struct {
 	LastTransition string      `json:"last_transition,omitempty"`
 	LastError      *string     `json:"last_error"`
 	Load           *modelLoad  `json:"load"`
+	ResidentModels []string    `json:"resident_models"`
 	Runtime        slotRuntime `json:"runtime"`
 	Cgroup         *cgroupStat `json:"cgroup"`
 }
@@ -218,7 +219,8 @@ func (d *demesne) metrics() metricsDoc {
 				Active:        s.active.Load(),
 				ErrorsTotal:   s.errors.Load(),
 			},
-			Cgroup: readCgroup(spec.cgroup.leaf),
+			ResidentModels: d.loads.resident(spec.name),
+			Cgroup:         readCgroup(spec.cgroup.leaf),
 		}
 		if st.PID != 0 {
 			pid := st.PID

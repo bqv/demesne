@@ -2055,3 +2055,17 @@ func TestHistoryDoesNotDoubleCountATransition(t *testing.T) {
 		t.Fatalf("a later transition was swallowed: %d entries", got)
 	}
 }
+
+// An unresponsive router still has to answer "am I holding anything": the resident set is cached
+// from the last model list, so a client does not have to keep one of its own.
+func TestResidentModelsAreCached(t *testing.T) {
+	b := newLoadBoard("")
+	b.observe("llama", map[string]string{"M1": "loaded", "M2": "loading", "M3": "unloaded"})
+	got := b.resident("llama")
+	if len(got) != 1 || got[0] != "M1" {
+		t.Fatalf("resident = %v, want [M1]", got)
+	}
+	if other := b.resident("llamb"); len(other) != 0 {
+		t.Fatalf("another slot inherited the set: %v", other)
+	}
+}
