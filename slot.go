@@ -423,6 +423,18 @@ func (d *demesne) spawnLocked(s *slot) error {
 	if d.closing.Load() {
 		return errors.New("demesne is shutting down")
 	}
+	// A port already answered by a process demesne does not own is a REFUSAL, not a race:
+	// spawning anyway gets a child that cannot bind, dies with a bare "exit status 1", and
+	// takes the supervisor into a crash loop that reads as the engine's fault. The orphan
+	// that did this on 2026-11-07 was 1 day 19 hours old and invisible in every log.
+	if up, _ := s.isUp(); !up && portAliveWithin(s.specOf().url, 250*time.Millisecond) {
+		s.mu.Lock()
+		s.foreign = true
+		s.lastErr = "its port is held by a process demesne does not own"
+		s.mu.Unlock()
+		return fmt.Errorf("%s is already answered by a process demesne does not own; "+
+			"refusing to spawn a second one (see /status: port_held_elsewhere)", s.specOf().url)
+	}
 	if err := os.MkdirAll(d.cfg.logDir, 0o755); err != nil {
 		return fmt.Errorf("log dir: %w", err)
 	}
@@ -443,7 +455,14 @@ func (d *demesne) spawnLocked(s *slot) error {
 	// One process group, so stopping the child also stops anything it forked. The
 	// cost is that it does NOT die with demesne: an orphaned sd-server is ~12.5 GiB
 	// nothing owns any more, so demesne takes every child down on the way out.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Pdeathsig is the half a SIGTERM handler cannot cover: if demesne is SIGKILLed -- by the
+	// sandbox that launched it, by a wedged supervisor, by anything -- the kernel kills the
+	// child too. Without it the child sits in its own process group with nobody left to stop
+	// it, which is exactly how a 1d19h aux router came to hold a port that the next llamb
+	// needed. The cost is that a child also dies if the forking thread dies; Go parks its
+	// threads rather than destroying them, and an engine that dies with its owner is worth
+	// more here than one that outlives it.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
 	if s.specOf().own() {
 		log.Printf("starting %s: %s %s", s.specOf().name, s.specOf().bin, strings.Join(s.specOf().args, " "))
 	}
@@ -487,11 +506,14 @@ func (d *demesne) spawnLocked(s *slot) error {
 func (d *demesne) waitReady(s *slot, limit time.Duration) error {
 	deadline := time.Now().Add(limit)
 	for time.Now().Before(deadline) {
-		if portAlive(s.specOf().url) {
-			return nil
-		}
+		// Our child first: a port that answers while the child is already dead is somebody
+		// else's listener, and taking it as our own readiness is how an orphan is mistaken
+		// for a successful start.
 		if up, _ := s.isUp(); !up {
 			return errors.New("the child exited while starting")
+		}
+		if portAlive(s.specOf().url) {
+			return nil
 		}
 		select {
 		case <-d.done:

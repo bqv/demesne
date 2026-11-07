@@ -335,6 +335,20 @@ Per-engine shutdown is still by SIGTERM, and demesne takes every child down with
 children are in their own process groups (`Setpgid`), so without that handler a service
 restart orphans ~12.5 GiB that nothing owns.
 
+**The handler cannot cover SIGKILL, so every child also carries `Pdeathsig: SIGKILL`.** That
+half is not theory: an aux router started 1 day 19 hours earlier by a demesne that had been
+SIGKILLed was still holding port 55557, and the next llamb could not bind — it reached "ready"
+on the orphan's port, died with a bare `exit status 1`, and crash-looped eleven times with
+nothing in any log to say why. Measured A/B: with the deadline in place the child is gone and
+the port free when the daemon is killed; without it the child sits there, listening.
+
+Two smaller consequences of the same lesson, now enforced in the spawn path:
+
+- **a port answered by a process demesne does not own is a REFUSAL**, not a race — spawning
+  onto it produces a child that cannot bind and a crash loop that reads as the engine's fault;
+- **readiness is our child answering**, not just a port answering: the child is checked alive
+  *before* the port is believed, so an orphan cannot be adopted as a successful start.
+
 ### Restart policy — resident is eager, media is lazy, both bounded
 
 The policy is a property of the slot, and the two answers differ because the costs differ.

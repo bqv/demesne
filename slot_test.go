@@ -1444,3 +1444,56 @@ func TestRPCBatchAndNotification(t *testing.T) {
 		t.Fatalf("a notification was answered: %d %q", rec.Code, rec.Body.String())
 	}
 }
+
+// A port answered by somebody else is a refusal, not a race. Spawning anyway gets a child that
+// cannot bind, dies with a bare "exit status 1", and takes the supervisor into a crash loop
+// that looks like the engine's fault -- which is exactly what a 1d19h orphan caused on
+// 2026-11-07, with nothing in any log to say so.
+func TestAForeignPortRefusesTheSpawn(t *testing.T) {
+	cfg := testConfig(t)
+	d := newTestDemesne(t, cfg)
+	s := d.slotByName("sd")
+
+	holder, err := net.Listen("tcp", s.hostPort())
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer holder.Close()
+
+	err = d.ensure(s)
+	if err == nil {
+		t.Fatal("ensure() spawned a child onto a port somebody else holds")
+	}
+	if !strings.Contains(err.Error(), "demesne does not own") {
+		t.Fatalf("the refusal should say what is wrong, got %q", err)
+	}
+	if up, _ := s.isUp(); up {
+		t.Fatal("a child was started anyway")
+	}
+	if st := slotStatusOf(s); st.Foreign == "" {
+		t.Fatal("/status does not report the foreign holder")
+	}
+}
+
+// Readiness must be OUR child answering. A port that answers while the child is already dead
+// belongs to somebody else, and mistaking it for a successful start is how an orphan gets
+// adopted as an engine.
+func TestReadinessNeedsOurOwnChild(t *testing.T) {
+	cfg := testConfig(t)
+	d := newTestDemesne(t, cfg)
+	s := d.slotByName("sd")
+
+	holder, err := net.Listen("tcp", s.hostPort())
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer holder.Close()
+
+	err = d.waitReady(s, 600*time.Millisecond)
+	if err == nil {
+		t.Fatal("waitReady() accepted a port answered by a stranger")
+	}
+	if !strings.Contains(err.Error(), "child exited") {
+		t.Fatalf("want the child exit as the reason, got %q", err)
+	}
+}
