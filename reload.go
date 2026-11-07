@@ -115,7 +115,7 @@ func enginesFrom(get func(string) string) (map[string]engineConfig, time.Duratio
 		"llamb":   engine("LLAMB", "llamb", defaultLlambURL),
 		"sd":      engine("SD", "sd", defaultSDURL),
 		"whisper": engine("WHISPER", "whisper", defaultWhisperURL),
-		"strata":  engine("STRATA", "strata", defaultStrataURL),
+		"strata":  engine("STRATA", "strata", ""),
 	}, envDurFrom(get, "IDLE", 30*time.Minute), envDurFrom(get, "WHISPER_IDLE", 10*time.Minute), cgroupRoot
 }
 

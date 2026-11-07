@@ -76,22 +76,22 @@ type engineConfig struct {
 }
 
 type config struct {
-	listen                    string // where demesne itself listens (the port DSH uses)
-	socket                    string // the same API on a unix socket; empty = no socket
-	confFile                  string // what SIGHUP re-reads; empty = nothing to reload from
+	listen                            string // where demesne itself listens (the port DSH uses)
+	socket                            string // the same API on a unix socket; empty = no socket
+	confFile                          string // what SIGHUP re-reads; empty = nothing to reload from
 	sd, llama, llamb, whisper, strata engineConfig
-	idle                      time.Duration // evict an on-demand child after this
-	whisperIdle               time.Duration
-	busyWait                  time.Duration // a chat request waits this long for a render
-	vramWait                  time.Duration // bound on waiting for the card to return
-	loadWait                  time.Duration // bound on a child's port appearing
-	freeBelow                 uint64        // bytes: "the card is free" threshold
-	orphanAbove               uint64        // bytes: VRAM still held while the port is dead
-	logDir                    string
-	cgroupRoot                string
-	cgroupPrepare             string // cgroup-prepare helper (root, via sudo -n)
-	cgroupJoin                string
-	restartDelay              time.Duration // first delay between resident restarts
+	idle                              time.Duration // evict an on-demand child after this
+	whisperIdle                       time.Duration
+	busyWait                          time.Duration // a chat request waits this long for a render
+	vramWait                          time.Duration // bound on waiting for the card to return
+	loadWait                          time.Duration // bound on a child's port appearing
+	freeBelow                         uint64        // bytes: "the card is free" threshold
+	orphanAbove                       uint64        // bytes: VRAM still held while the port is dead
+	logDir                            string
+	cgroupRoot                        string
+	cgroupPrepare                     string // cgroup-prepare helper (root, via sudo -n)
+	cgroupJoin                        string
+	restartDelay                      time.Duration // first delay between resident restarts
 
 	// LLM watch (watch.go). Traffic-driven: no timer, no health probe.
 	llmService     string        // legacy: the OpenRC service that owns the router
@@ -115,7 +115,6 @@ const (
 	defaultLlambURL   = "http://127.0.0.1:55557"
 	defaultSDURL      = "http://127.0.0.1:55558"
 	defaultWhisperURL = "http://127.0.0.1:55559"
-	defaultStrataURL  = "http://127.0.0.1:55560"
 )
 
 func envString(flagVal, key, def string) string {
@@ -388,7 +387,7 @@ func loadConfig() config {
 			cgroup: memLimitFor(cgroupRoot, "whisper", envRaw),
 		},
 		strata: engineConfig{
-			url:    envString(*fStrata, "STRATA", defaultStrataURL),
+			url:    envString(*fStrata, "STRATA", ""),
 			bin:    envString(*fStrataBin, "STRATA_BIN", ""),
 			args:   fields(envString(*fStrataArgs, "STRATA_ARGS", "")),
 			env:    fields(envString(*fStrataEnv, "STRATA_ENV", "")),
