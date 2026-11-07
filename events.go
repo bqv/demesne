@@ -100,6 +100,9 @@ func (h *eventHub) since(seq int64) ([]eventFrame, bool) {
 	if len(h.ring) == 0 {
 		return nil, seq == 0
 	}
+	if seq > h.seq {
+		return nil, false
+	}
 	oldest := h.ring[0].Seq
 	if seq+1 < oldest {
 		return nil, false

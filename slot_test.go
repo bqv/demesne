@@ -1825,3 +1825,14 @@ func TestALoadFailureIsAttributedToItsOwnModel(t *testing.T) {
 		t.Fatalf("the failure line was not kept: %q", think.Line)
 	}
 }
+
+// A cursor from a previous process cannot be honoured, and silence is the wrong answer: the
+// stream restarts with a snapshot instead.
+func TestEventsRestartOnACursorFromAPreviousProcess(t *testing.T) {
+	d := newEventHub()
+	d.publish(eventFrame{Type: "load", Load: &modelLoad{Slot: "llama", Model: "M1"}})
+	d.publish(eventFrame{Type: "load", Load: &modelLoad{Slot: "llama", Model: "M2"}})
+	if _, ok := d.since(200); ok {
+		t.Fatal("a cursor from the future was accepted; the stream would go silent")
+	}
+}
