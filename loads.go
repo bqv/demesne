@@ -44,6 +44,7 @@ type modelLoad struct {
 	ioBase      uint64
 	ioBaseSet   bool
 	total       uint64
+	childPID    int
 	Line        string `json:"line"`
 }
 
@@ -127,6 +128,10 @@ func (b *loadBoard) observe(slot string, models map[string]string) {
 				was := e.Phase
 				e.Phase = loadLoading
 				e.Error, e.FinishedMS = nil, nil
+				e.ioBase, e.ioBaseSet, e.total, e.childPID = 0, false, 0, 0
+				if e.ProgressSrc == progressSourceLog {
+					e.Progress = nil
+				}
 				if was != loadLoading {
 					changed = append(changed, *e)
 					b.fire(*e)
@@ -247,6 +252,9 @@ func (d *demesne) attachProgress(s *slot) {
 			continue
 		}
 		b.mu.Lock()
+		if e.childPID != child {
+			e.childPID, e.ioBase, e.ioBaseSet, e.total = child, 0, false, 0
+		}
 		if e.total == 0 {
 			if n, ok := fileSize(modelPath); ok {
 				e.total = n
@@ -420,6 +428,7 @@ func (b *loadBoard) refreshLogs(slots []string) {
 			}
 			if progress != nil {
 				e.Progress = progress
+				e.ProgressSrc = progressSourceLog
 			}
 			if failure := failureAfterStart(lines, e.Model); failure != "" && e.Phase == loadLoading {
 				e.Phase = loadFailed

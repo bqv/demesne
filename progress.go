@@ -20,7 +20,10 @@ import (
 // can begin a little above zero (up to one poll late) and why it is honest about its source:
 // progress_source says which counter produced it.
 
-const progressSourceIO = "io_read_bytes"
+const (
+	progressSourceIO  = "io_read_bytes"
+	progressSourceLog = "log_percent"
+)
 
 // procIO reads one child's read_bytes. read_bytes counts bytes the kernel fetched from the
 // block layer -- with dio that is the gguf, not a page-cache hit.

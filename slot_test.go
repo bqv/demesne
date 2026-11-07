@@ -2212,3 +2212,41 @@ func TestLoadLinesComeFromStdoutNotStderr(t *testing.T) {
 		t.Fatalf("the line is not a load mark: %q", e.Line)
 	}
 }
+
+// Whatever the source, a non-null progress always names it: a client draws a bar only when it
+// knows what the bar measures.
+func TestProgressAlwaysNamesItsSource(t *testing.T) {
+	dir := t.TempDir()
+	log := "load_tensors: loading model tensors (45%)\n"
+	if err := os.WriteFile(filepath.Join(dir, "llama.log"), []byte(log), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b := newLoadBoard(dir)
+	b.observe("llama", map[string]string{"M1": "loading"})
+	b.refreshLogs([]string{"llama"})
+	e := findLoad(t, b.snapshot(), "llama", "M1")
+	if e.Progress == nil {
+		t.Fatal("no progress from a 45% log line")
+	}
+	if e.ProgressSrc != progressSourceLog {
+		t.Fatalf("progress %v with source %q", *e.Progress, e.ProgressSrc)
+	}
+}
+
+// A retry is a new load: the bytes an earlier attempt read must not count toward the new bar.
+func TestAFreshLoadResetsTheBaseline(t *testing.T) {
+	b := newLoadBoard("")
+	b.observe("llama", map[string]string{"M1": "loading"})
+	b.mu.Lock()
+	e := b.entries[loadKey("llama", "M1")]
+	e.ioBase, e.ioBaseSet, e.total, e.childPID = 500, true, 1000, 42
+	b.mu.Unlock()
+	b.observe("llama", map[string]string{"M1": "unloaded"})
+	b.observe("llama", map[string]string{"M1": "loading"})
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if e.ioBaseSet || e.ioBase != 0 || e.total != 0 || e.childPID != 0 {
+		t.Fatalf("baseline survived the retry: base=%d set=%v total=%d child=%d",
+			e.ioBase, e.ioBaseSet, e.total, e.childPID)
+	}
+}
