@@ -79,7 +79,7 @@ type config struct {
 	listen                    string // where demesne itself listens (the port DSH uses)
 	socket                    string // the same API on a unix socket; empty = no socket
 	confFile                  string // what SIGHUP re-reads; empty = nothing to reload from
-	sd, llama, llamb, whisper engineConfig
+	sd, llama, llamb, whisper, strata engineConfig
 	idle                      time.Duration // evict an on-demand child after this
 	whisperIdle               time.Duration
 	busyWait                  time.Duration // a chat request waits this long for a render
@@ -115,6 +115,7 @@ const (
 	defaultLlambURL   = "http://127.0.0.1:55557"
 	defaultSDURL      = "http://127.0.0.1:55558"
 	defaultWhisperURL = "http://127.0.0.1:55559"
+	defaultStrataURL  = "http://127.0.0.1:55560"
 )
 
 func envString(flagVal, key, def string) string {
@@ -277,6 +278,7 @@ func loadConfig() config {
 		fSD      = flag.String("sd", "", "URL the sd child comes up on (env "+envPrefix+"SD)")
 		fLlamb   = flag.String("llamb", "", "the auxiliary router's base URL (env "+envPrefix+"LLAMB)")
 		fWhisper = flag.String("whisper", "", "URL the whisper child comes up on (env "+envPrefix+"WHISPER)")
+		fStrata  = flag.String("strata", "", "the Strata engine's base URL (env "+envPrefix+"STRATA)")
 
 		fIdle        = flag.String("idle", "", "evict an on-demand child after this long with no request (env "+envPrefix+"IDLE)")
 		fWhisperIdle = flag.String("whisper-idle", "", "the same for whisper (env "+envPrefix+"WHISPER_IDLE)")
@@ -311,6 +313,11 @@ func loadConfig() config {
 		fWhisperArgs = flag.String("whisper-args", "", "whisper's whole command line (env "+envPrefix+"WHISPER_ARGS)")
 		fWhisperEnv  = flag.String("whisper-env", "", "extra KEY=VALUE for whisper (env "+envPrefix+"WHISPER_ENV)")
 		fWhisperDir  = flag.String("whisper-dir", "", "whisper's working directory (env "+envPrefix+"WHISPER_DIR)")
+
+		fStrataBin  = flag.String("strata-bin", "", "adopt Strata: its binary (env "+envPrefix+"STRATA_BIN; empty = route only, never spawn)")
+		fStrataArgs = flag.String("strata-args", "", "Strata's whole command line (env "+envPrefix+"STRATA_ARGS)")
+		fStrataEnv  = flag.String("strata-env", "", "extra KEY=VALUE for Strata (env "+envPrefix+"STRATA_ENV)")
+		fStrataDir  = flag.String("strata-dir", "", "Strata's working directory (env "+envPrefix+"STRATA_DIR)")
 
 		fLLMSvc  = flag.String("llm-service", "", "legacy: the OpenRC service that owns the router (env "+envPrefix+"LLM_SERVICE)")
 		fLLMWait = flag.String("llm-restart-wait", "", "legacy: how long a router restart may take to answer (env "+envPrefix+"LLM_RESTART_WAIT)")
@@ -379,6 +386,14 @@ func loadConfig() config {
 			env:    fields(envString(*fWhisperEnv, "WHISPER_ENV", "")),
 			dir:    envString(*fWhisperDir, "WHISPER_DIR", ""),
 			cgroup: memLimitFor(cgroupRoot, "whisper", envRaw),
+		},
+		strata: engineConfig{
+			url:    envString(*fStrata, "STRATA", defaultStrataURL),
+			bin:    envString(*fStrataBin, "STRATA_BIN", ""),
+			args:   fields(envString(*fStrataArgs, "STRATA_ARGS", "")),
+			env:    fields(envString(*fStrataEnv, "STRATA_ENV", "")),
+			dir:    envString(*fStrataDir, "STRATA_DIR", ""),
+			cgroup: memLimitFor(cgroupRoot, "strata", envRaw),
 		},
 		idle:          envDur(*fIdle, "IDLE", 5*time.Minute),
 		whisperIdle:   envDur(*fWhisperIdle, "WHISPER_IDLE", 10*time.Minute),
@@ -459,7 +474,11 @@ func buildSlots(c config) []slotSpec {
 	if c.whisper.bin == "" {
 		whisperPolicy = policyExternal // exists as a route, answers 503, never spawns
 	}
-	return []slotSpec{
+	strataPolicy := policyExternal
+	if c.strata.bin != "" {
+		strataPolicy = policyOnDemand
+	}
+	slots := []slotSpec{
 		// The router: resident, and it keeps the card by keeping models.
 		resident("llama", c.llama, "gpu", true, 0),
 		// The media child: on demand, because it has no other way to give the card back.
@@ -482,6 +501,15 @@ func buildSlots(c config) []slotSpec {
 		// never evicts a render from the big card.
 		resident("llamb", c.llamb, "aux", true, 0),
 	}
+	if c.strata.url != "" {
+		slots = append(slots, slotSpec{
+			name: "strata", url: c.strata.url, bin: c.strata.bin,
+			args: c.strata.args, env: c.strata.env, dir: c.strata.dir,
+			group: "gpu", vram: true, policy: strataPolicy, idle: c.idle,
+			routed: true, router: true, fallback: c.strata.bin == "", cgroup: c.strata.cgroup,
+		})
+	}
+	return slots
 }
 
 // ----------------------------------------------------------------------- estate
