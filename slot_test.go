@@ -1999,3 +1999,30 @@ func TestReloadRefusesToEmptyASlotsURL(t *testing.T) {
 		t.Fatalf("reload did not report the removed engine: %+v", rep)
 	}
 }
+
+// An engine that loads its model before it answers and then reports the same status forever has
+// no load transitions to observe. Polling it must produce no row and no history entry, or the
+// card shows a permanent "ready" for a model nobody watched load.
+func TestAStaticStatusProducesNoLoadRow(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, `{"object":"list","data":[{"id":"M1","object":"model","status":{"value":"loaded"}}]}`)
+	}))
+	defer up.Close()
+	cfg := testConfig(t)
+	cfg.llama = engineConfig{url: up.URL}
+	d := newTestDemesne(t, cfg)
+
+	for i := 0; i < 3; i++ {
+		d.pollLoads()
+	}
+	if got := d.loads.snapshot(); len(got) != 0 {
+		t.Fatalf("a static status produced rows: %+v", got)
+	}
+	if got := d.history.snapshot(); len(got) != 0 {
+		t.Fatalf("a static status produced history: %+v", got)
+	}
+}
