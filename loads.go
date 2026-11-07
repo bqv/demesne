@@ -499,7 +499,7 @@ func (d *demesne) routerModels(s *slot) (map[string]string, error) {
 func (d *demesne) pollLoads() {
 	var active []string
 	for _, s := range d.slots {
-		if !isRouterSlot(s.specOf().bin) {
+		if !s.specOf().router {
 			continue
 		}
 		if !portAlive(s.specOf().url) {

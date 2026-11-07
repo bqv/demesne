@@ -1892,3 +1892,58 @@ func TestLoadsFallBackToTheChildLog(t *testing.T) {
 		t.Fatalf("no load entry from the log alone: %+v", got)
 	}
 }
+
+// A reload cannot adopt a new engine -- the slot set, its proxies and its supervisors are built
+// once -- and on 2026-11-07 a fifth engine was configured and the reload said nothing at all.
+func TestReloadSaysANewEngineNeedsARestart(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.confFile = filepath.Join(t.TempDir(), "conf")
+	if err := os.WriteFile(cfg.confFile, []byte("export DEMESNE_STRATA=\"http://127.0.0.1:55560\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d := newTestDemesne(t, cfg)
+	rep, err := d.reload()
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	said := false
+	for _, r := range rep.Refused {
+		if strings.Contains(r, "strata") {
+			said = true
+		}
+	}
+	if !said {
+		t.Fatalf("reload ignored a configured engine it has no slot for: %+v", rep)
+	}
+}
+
+// The load board follows the slot's own router flag, not the name of its binary: an external
+// engine that answers /v1/models is a router even with no command line (strata is exactly that).
+func TestLoadsPollAnySlotMarkedRouter(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, `{"data":[{"id":"M1","status":{"value":"loading"}}]}`)
+	}))
+	defer up.Close()
+	cfg := testConfig(t)
+	cfg.llama = engineConfig{url: up.URL}
+	d := newTestDemesne(t, cfg)
+	for _, s := range d.slots {
+		if s.specOf().name == "llama" {
+			if !s.specOf().router {
+				t.Fatal("the llama slot is not marked as a router")
+			}
+			if s.specOf().bin != "" {
+				t.Fatal("this test means to have no binary configured")
+			}
+		}
+	}
+	d.pollLoads()
+	got := d.loads.snapshot()
+	if findLoad(t, got, "llama", "M1") == nil {
+		t.Fatalf("a router with no binary was not polled: %+v", got)
+	}
+}

@@ -115,6 +115,7 @@ func enginesFrom(get func(string) string) (map[string]engineConfig, time.Duratio
 		"llamb":   engine("LLAMB", "llamb", defaultLlambURL),
 		"sd":      engine("SD", "sd", defaultSDURL),
 		"whisper": engine("WHISPER", "whisper", defaultWhisperURL),
+		"strata":  engine("STRATA", "strata", defaultStrataURL),
 	}, envDurFrom(get, "IDLE", 30*time.Minute), envDurFrom(get, "WHISPER_IDLE", 10*time.Minute), cgroupRoot
 }
 
@@ -174,6 +175,20 @@ func (d *demesne) reload() (reloadReport, error) {
 		names = append(names, s.specOf().name)
 	}
 	sort.Strings(names)
+
+	// A new engine in the conf cannot be adopted by a reload: the slot set, its proxies and
+	// its supervisors are built once. Saying so beats ignoring it -- on 2026-11-07 a fifth
+	// engine was configured and the reload reported nothing at all.
+	for name := range engines {
+		if d.slotByName(name) != nil {
+			continue
+		}
+		key := envPrefix + strings.ToUpper(name)
+		if values[key] == "" && values[key+"_BIN"] == "" {
+			continue
+		}
+		rep.Refused = append(rep.Refused, name+" (a new engine needs a restart: its slot is built with the estate)")
+	}
 
 	for _, name := range names {
 		s := d.slotByName(name)
