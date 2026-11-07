@@ -206,6 +206,72 @@ engine `stop` is simply stop, and the next request starts it. demesne does not r
 over RPC on purpose — the call would lose its own response, and a wedged release must have an
 actor outside the process; that is `rc-service --user demesne restart`.
 
+## What each engine is loading, and what the estate is doing
+
+Three additive surfaces, none of which touch `/status`'s existing keys or `/estate/card`:
+
+| surface | for | shape |
+| :-- | :-- | :-- |
+| `loads[]` in `/status` | the cold start of a card app | one entry per model load, per slot |
+| `GET /estate/metrics` | a first paint and a fallback poll | a versioned snapshot, `"version": 1` |
+| `GET /estate/events` | the live feed | SSE, a snapshot frame then typed deltas |
+
+### `loads[]`
+
+`slots[].booting` is about a *child process*: a router that is up and loading a model into
+VRAM is not booting, and for two hours on 2026-11-07 nothing in `/status` said so. `loads[]` is
+the model-level answer, and it is an array because llamb can hold four models at once:
+
+```json
+{"slot":"llama","model":"Qwen3.8-27B-abliterated-120k","phase":"loading",
+ "started_ms":1794051974420,"finished_ms":null,"error":null,
+ "progress":null,"line":"llama_model_loader: loaded meta data (45%)"}
+```
+
+- `phase`: `queued` (a request named it and the router has not started), `loading`, `ready`
+  (lingering for 60 s), `failed` (lingering for 10 min, with `error`).
+- `started_ms`/`finished_ms`: epoch ms. `started_ms` for a polled load is when demesne first
+  saw it, which is within one 2 s tick of the truth.
+- `line` and `progress` come from the child's own log (`<logDir>/<slot>.err`) — the last
+  `load_tensors`/`llama_model_loader`/`request cancelled while waiting` line, and a percentage
+  when the engine prints one.
+- The phase comes from the router's own `/v1/models` `status.value`, not from guessing at
+  request counters: the router knows which model is loading, and a probe of `/v1/models` claims
+  no card and evicts nothing.
+
+### `GET /estate/metrics`
+
+One document, `"version": 1`, with `since_ms` naming the moment every counter is counted from
+(the daemon's start). Per slot: `runtime` (`requests_total`, `active`, `errors_total`,
+`last_latency_ms`), `cgroup` (`current_bytes`, `high_bytes`, `max_bytes`, `oom_kills`), `load`,
+`restarts`, `uptime_s`, `foreign`, `last_transition`. Estate-wide: VRAM used/total/free, the
+models each router advertises (`models`), which slot owns each model (`owner`), `history` (the
+last 32 transitions, with the reason a slot stopped), and an `unavailable` list — currently
+`tokens_in`, `tokens_out`, `prefill_tps`, `decode_tps`, `queue_depth`, `wait_ms`, because
+reading those means parsing response bodies, which this daemon deliberately does not do. They
+are named rather than silently zero.
+
+### `GET /estate/events`
+
+Server-sent events on the same listener. The first frame is a **complete snapshot** — the
+`/estate/metrics` document — so a client paints from one frame and needs no second call. After
+that, deltas arrive as `transition` and `load` frames, and a coalesced `snapshot` is published
+every 2 s while anyone is subscribed (the metrics tick; a lagging client is never blocked —
+publishes drop instead, and the next snapshot repairs the client's view).
+
+```
+id: 41
+event: load
+data: {"seq":41,"type":"load","at_ms":1794051980000,"load":{...}}
+```
+
+- every frame carries a monotonic `seq` and its own `id:` line;
+- `Last-Event-ID` resumes: the last 64 frames are kept, and a reconnect replays what it missed;
+  if the cursor is older than the ring, the stream starts again with a snapshot;
+- `: keep-alive` every 15 s;
+- subscribing claims no card, evicts nothing and spawns nothing: it reads state;
+- the stream closes on shutdown, so a reload is a clean end rather than a hang.
+
 ## The typed control plane — JSON-RPC on the door we already have
 
 `POST /rpc` speaks **JSON-RPC 2.0**, on the port and on the socket alike. The methods are the

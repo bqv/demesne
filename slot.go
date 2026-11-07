@@ -214,6 +214,12 @@ type slot struct {
 
 	inflight int64 // requests in flight (atomic): keeps the idle timer off
 
+	owner       *demesne
+	requests    atomic.Int64
+	errors      atomic.Int64
+	active      atomic.Int64
+	lastLatency atomic.Int64
+
 	supervised bool      // a supervisor goroutine is responsible for this slot
 	cgJoined   bool      // the current child was moved into its leaf
 	cgAt       time.Time // when the fence (or the join) last succeeded
@@ -309,6 +315,10 @@ func (s *slot) noteFailure(err error) {
 }
 
 func (s *slot) noteReady() {
+	d := s.owner
+	if d != nil {
+		d.recordTransition(s.specOf().name, "start", "ready", "")
+	}
 	s.mu.Lock()
 	s.crash, s.lastErr, s.foreign, s.stopped = 0, "", false, ""
 	s.mu.Unlock()
@@ -588,6 +598,9 @@ func (d *demesne) evictLocked(s *slot, reason stopReason, why string) {
 	// Recorded only when there was something to stop: an operator calling stop on a slot
 	// that is already down must not erase the failure that put it down.
 	s.stopped = reason
+	if s.owner != nil {
+		s.owner.recordTransition(s.specOf().name, "stop", string(reason), why)
+	}
 	s.stopping = true
 	s.mu.Unlock()
 

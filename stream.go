@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -35,6 +36,8 @@ import (
 // every parser, so this is a heartbeat rather than a message: it exists so that clients and
 // any intermediate proxy can see the connection is alive and no header deadline fires.
 const keepAliveEvery = 10 * time.Second
+
+var errClientGone = errors.New("the client went away")
 
 // sse is a streaming response: one writer, guarded, because the heartbeat and the body copy
 // run concurrently and an http.ResponseWriter is not safe for that on its own.
@@ -201,6 +204,11 @@ func (d *demesne) streamChat(w http.ResponseWriter, r *http.Request, s *slot, bo
 	}
 	defer resp.Body.Close()
 	if err := out.copyFrom(resp.Body); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, errClientGone) {
+			log.Printf("%s %s: the client went away mid-stream; the engine keeps its work",
+				r.Method, r.URL.Path)
+			return
+		}
 		out.comment("demesne: the engine stream ended: " + err.Error())
 	}
 }

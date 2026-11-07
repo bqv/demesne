@@ -7,6 +7,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1564,5 +1565,230 @@ func TestSpawnRefusalNamesTheReason(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "port_held_elsewhere") {
 		t.Fatalf("the refusal should point at /status: %q", err)
+	}
+}
+
+func findLoad(t *testing.T, loads []modelLoad, slot, model string) *modelLoad {
+	t.Helper()
+	for i := range loads {
+		if loads[i].Slot == slot && loads[i].Model == model {
+			return &loads[i]
+		}
+	}
+	return nil
+}
+
+// The Android card needs one entry per model load, not just a slot that happens to be busy.
+func TestLoadsFollowAModelFromLoadingToReady(t *testing.T) {
+	b := newLoadBoard("")
+	b.observe("llama", map[string]string{"M1": "loading"})
+	got := b.snapshot()
+	e := findLoad(t, got, "llama", "M1")
+	if e == nil || e.Phase != loadLoading {
+		t.Fatalf("no loading entry: %+v", got)
+	}
+	if e.StartedMS == 0 || e.FinishedMS != nil {
+		t.Fatalf("started/finished wrong: %+v", e)
+	}
+	b.observe("llama", map[string]string{"M1": "loaded"})
+	e = findLoad(t, b.snapshot(), "llama", "M1")
+	if e.Phase != loadReady || e.FinishedMS == nil {
+		t.Fatalf("not ready after load: %+v", e)
+	}
+}
+
+// A load that dies must say so rather than vanish, or the card freezes on "loading".
+func TestLoadsReportAFailedLoad(t *testing.T) {
+	b := newLoadBoard("")
+	b.observe("llama", map[string]string{"M1": "loading"})
+	b.observe("llama", map[string]string{"M1": "unloaded"})
+	e := findLoad(t, b.snapshot(), "llama", "M1")
+	if e.Phase != loadFailed || e.Error == nil {
+		t.Fatalf("unloaded mid-load is not a failure: %+v", e)
+	}
+}
+
+// A request for a model the router does not hold yet is queued BEFORE any load starts; this is
+// the only phase the router itself cannot report.
+func TestALoadIsQueuedWhenARequestNamesIt(t *testing.T) {
+	b := newLoadBoard("")
+	b.observe("llama", map[string]string{"M1": "loaded"})
+	b.noteRequest("llama", "M1")
+	if findLoad(t, b.snapshot(), "llama", "M1") != nil {
+		t.Fatal("a request for an already-loaded model invented a load")
+	}
+	b.noteRequest("llama", "M2")
+	e := findLoad(t, b.snapshot(), "llama", "M2")
+	if e == nil || e.Phase != loadQueued {
+		t.Fatalf("no queued entry for M2: %+v", b.snapshot())
+	}
+}
+
+// The child log is the only source for the line and the progress, and for why a load failed.
+func TestLoadsCarryTheChildLog(t *testing.T) {
+	dir := t.TempDir()
+	log := "srv  load:   --model\n" +
+		"load_tensors: loading model tensors, this can take a while...\n" +
+		"llama_model_loader: loaded meta data (45%)\n"
+	if err := os.WriteFile(filepath.Join(dir, "llama.err"), []byte(log), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b := newLoadBoard(dir)
+	b.observe("llama", map[string]string{"M1": "loading"})
+	b.refreshLogs([]string{"llama"})
+	e := findLoad(t, b.snapshot(), "llama", "M1")
+	if e.Line == "" || !strings.Contains(e.Line, "45%") {
+		t.Fatalf("no line from the child log: %+v", e)
+	}
+	if e.Progress == nil || *e.Progress < 0.44 || *e.Progress > 0.46 {
+		t.Fatalf("progress = %v", e.Progress)
+	}
+}
+
+// Two routers, two loads, independently: llamb can hold several models at once.
+func TestLoadsArePerSlot(t *testing.T) {
+	b := newLoadBoard("")
+	b.observe("llama", map[string]string{"Big": "loading"})
+	b.observe("llamb", map[string]string{"Small": "loading"})
+	got := b.snapshot()
+	if len(got) != 2 || findLoad(t, got, "llama", "Big") == nil || findLoad(t, got, "llamb", "Small") == nil {
+		t.Fatalf("loads not per slot: %+v", got)
+	}
+}
+
+// And it reaches the document the Android plugin reads.
+func TestStatusCarriesLoads(t *testing.T) {
+	cfg := testConfig(t)
+	d := newTestDemesne(t, cfg)
+	d.loads.observe("llama", map[string]string{"M1": "loading"})
+
+	rec := httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+	var doc struct {
+		Loads []modelLoad `json:"loads"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(doc.Loads) != 1 || doc.Loads[0].Model != "M1" || doc.Loads[0].Phase != loadLoading {
+		t.Fatalf("/status loads = %+v", doc.Loads)
+	}
+}
+
+func TestMetricsAnswersEverySlot(t *testing.T) {
+	cfg := testConfig(t)
+	d := newTestDemesne(t, cfg)
+	rec := httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/estate/metrics", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	var doc metricsDoc
+	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if doc.Version != metricsVersion || doc.SinceMS == 0 {
+		t.Fatalf("version/since wrong: %+v", doc)
+	}
+	if len(doc.Slots) != len(d.slots) {
+		t.Fatalf("%d slots in metrics, %d configured", len(doc.Slots), len(d.slots))
+	}
+	for _, s := range doc.Slots {
+		if s.Runtime.SinceMS == 0 {
+			t.Fatalf("slot %s has no runtime since", s.Name)
+		}
+	}
+	if doc.Loads == nil || doc.History == nil {
+		t.Fatalf("loads/history must be arrays, not null: %+v", doc)
+	}
+}
+
+func TestMetricsCountRequests(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer up.Close()
+	cfg := testConfig(t)
+	cfg.llama = engineConfig{url: up.URL}
+	d := newTestDemesne(t, cfg)
+
+	rec := httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("proxied request failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var doc metricsDoc
+	rec = httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/estate/metrics", nil))
+	_ = json.Unmarshal(rec.Body.Bytes(), &doc)
+	for _, s := range doc.Slots {
+		if s.Name != "llama" {
+			continue
+		}
+		if s.Runtime.RequestsTotal != 1 {
+			t.Fatalf("requests_total = %d", s.Runtime.RequestsTotal)
+		}
+		if s.Runtime.LastLatencyMS == nil {
+			t.Fatal("no latency recorded")
+		}
+	}
+}
+
+func TestEventsStartWithASnapshot(t *testing.T) {
+	cfg := testConfig(t)
+	d := newTestDemesne(t, cfg)
+	srv := httptest.NewServer(d)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/estate/events")
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer resp.Body.Close()
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("content-type %q", ct)
+	}
+	br := bufio.NewReader(resp.Body)
+	head, _ := br.ReadString('\n')
+	kind, _ := br.ReadString('\n')
+	data, _ := br.ReadString('\n')
+	if !strings.HasPrefix(head, "id: ") || !strings.Contains(kind, "event: snapshot") ||
+		!strings.Contains(data, `"type":"snapshot"`) {
+		t.Fatalf("first frame is not a snapshot: %q %q %q", head, kind, data)
+	}
+	if !strings.Contains(data, `"version":1`) {
+		t.Fatalf("snapshot carries no metrics doc: %q", data)
+	}
+}
+
+func TestEventsResumeFromACursor(t *testing.T) {
+	d := newEventHub()
+	d.publish(eventFrame{Type: "transition", Transition: &transitionRecord{Slot: "llama", To: "stop"}})
+	d.publish(eventFrame{Type: "load", Load: &modelLoad{Slot: "llama", Model: "M1", Phase: "loading"}})
+	frames, ok := d.since(1)
+	if !ok || len(frames) != 1 || frames[0].Type != "load" {
+		t.Fatalf("resume after 1 gave %v (%v)", frames, ok)
+	}
+	if _, ok := d.since(0); !ok {
+		t.Fatal("resume from the beginning should be possible while the ring holds it")
+	}
+}
+
+func TestEventsDropRatherThanBlock(t *testing.T) {
+	d := newEventHub()
+	id, _ := d.subscribe()
+	defer d.unsubscribe(id)
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 200; i++ {
+			d.publish(eventFrame{Type: "load", Load: &modelLoad{Slot: "llama"}})
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("publish blocked on a slow subscriber")
 	}
 }

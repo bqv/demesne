@@ -138,8 +138,11 @@ func (d *demesne) rpcCall(method string, raw json.RawMessage) (any, *rpcError) {
 
 	switch method {
 	case "estate.status":
-		slots := d.slotStatuses()
-		return map[string]any{"version": version, "slots": slots}, nil
+		return map[string]any{
+			"version": version,
+			"slots":   d.slotStatuses(),
+			"loads":   d.loads.snapshot(),
+		}, nil
 
 	case "estate.card":
 		group := p.Group

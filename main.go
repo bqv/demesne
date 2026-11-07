@@ -497,9 +497,14 @@ type demesne struct {
 	// card must not be able to condemn the engine either: a monitoring loop polling /metrics
 	// during a restart would otherwise trip the breaker and ask for a restart of an engine
 	// that was simply starting -- the same mistake the /v1/models handler made once.
-	probes map[string]*httputil.ReverseProxy
-	llm    *llmWatch
-	models modelIndex // which engine advertises which model (models.go)
+	probes  map[string]*httputil.ReverseProxy
+	llm     *llmWatch
+	models  modelIndex // which engine advertises which model (models.go)
+	loads   *loadBoard // which model each router is loading, if any (loads.go)
+	hub     *eventHub  // the subscription feed (events.go)
+	history *history   // the last transitions, for the cards
+
+	startedAt time.Time
 
 	done    chan struct{}
 	closing atomic.Bool
@@ -507,15 +512,19 @@ type demesne struct {
 
 func newDemesne(cfg config) *demesne {
 	d := &demesne{
-		cfg:     cfg,
-		index:   map[string]*slot{},
-		proxies: map[string]*httputil.ReverseProxy{},
-		probes:  map[string]*httputil.ReverseProxy{},
-		llm:     newLLMWatch(),
-		done:    make(chan struct{}),
+		cfg:       cfg,
+		index:     map[string]*slot{},
+		proxies:   map[string]*httputil.ReverseProxy{},
+		probes:    map[string]*httputil.ReverseProxy{},
+		llm:       newLLMWatch(),
+		loads:     newLoadBoard(cfg.logDir),
+		hub:       newEventHub(),
+		history:   &history{},
+		startedAt: time.Now(),
+		done:      make(chan struct{}),
 	}
 	for _, spec := range buildSlots(cfg) {
-		s := &slot{spec: spec}
+		s := &slot{spec: spec, owner: d}
 		d.slots = append(d.slots, s)
 		d.index[spec.name] = s
 	}
@@ -724,6 +733,10 @@ func (d *demesne) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.handleFIM(w, r)
 	case p == "/rpc":
 		d.handleRPC(w, r)
+	case p == "/estate/metrics":
+		d.handleMetrics(w, r)
+	case p == "/estate/events":
+		d.handleEvents(w, r)
 	case p == "/release":
 		d.handleRelease(w, r)
 	case strings.HasPrefix(p, "/slots/"):
@@ -743,6 +756,9 @@ func (d *demesne) route(w http.ResponseWriter, r *http.Request, in intent) {
 		if name := d.slotForModel(pk.model); name != "" {
 			in.slot = name
 		}
+		if pk.model != "" && isRouterSlot(d.index[in.slot].specOf().bin) {
+			d.loads.noteRequest(in.slot, pk.model)
+		}
 	}
 	s := d.slotByName(in.slot)
 	if s == nil {
@@ -753,6 +769,15 @@ func (d *demesne) route(w http.ResponseWriter, r *http.Request, in intent) {
 		http.Error(w, fmt.Sprintf("demesne: %s is not configured (no command line: set -%s-args)",
 			s.specOf().name, s.specOf().name), http.StatusServiceUnavailable)
 		return
+	}
+	if in.kind != kindProxy && in.kind != kindMetadata {
+		s.requests.Add(1)
+		s.active.Add(1)
+		t0 := time.Now()
+		defer func() {
+			s.active.Add(-1)
+			s.lastLatency.Store(time.Since(t0).Microseconds())
+		}()
 	}
 
 	switch in.kind {
@@ -952,6 +977,7 @@ func (d *demesne) status(w http.ResponseWriter) {
 		"media_in_flight": inflight,
 		"llm_health":      d.llm.snapshot(),
 		"slots":           d.slotStatuses(),
+		"loads":           d.loads.snapshot(),
 
 		// stadi's field names, kept because DSH and the habit of a year read them.
 		"slot":           slotName(up),
@@ -1255,6 +1281,9 @@ func main() {
 	d.models = newModelIndex()
 	d.refreshModels()
 	go d.followModels()
+	d.loads.onChange = d.loadChanged
+	go d.followLoads()
+	go d.publishSnapshots()
 
 	// One handler, two transports. The port is for DSH, which we do not control and which
 	// reaches :55558 by name; the socket is for anything running as this user, where a path
