@@ -129,6 +129,25 @@ routers' `/v1/models`, refreshed on a 30 s ticker and built once before the list
 A path still decides the *kind* of request (`/sdapi/*` is the media child, `/v1/audio/*` is
 whisper); only the engine moves.
 
+### A cold load is long enough to break a client
+
+A 27B rung on this box takes minutes to load, and llama.cpp's router says nothing until it is
+loaded. Two things follow, and both were measured the hard way on 2026-11-07, when a session
+died of it:
+
+- **demesne answers a streaming chat request itself, before dialling the engine**, and keeps
+  the stream warm with SSE comments (`: demesne: the engine is still loading`) every ten
+  seconds while it waits. Llama's answer is then relayed verbatim, flushed per chunk. The cost
+  is that once `200` has gone out a later failure can no longer be a status code: it becomes
+  an `event: error` in the stream. That price is paid only by requests that ask to stream,
+  which are exactly the requests a cold load used to kill — and the hard refusals (engine
+  booting, breaker open) still happen first, with their proper status.
+- **the load belongs to the estate, not to the caller.** The client's cancellation is not
+  propagated to the engine until the engine has answered; before that the request is kept
+  alive deliberately and the caller is simply forgotten. One impatient client must not destroy
+  a load that every other client is waiting for. After the engine has answered, cancellation is
+  honoured as usual.
+
 ### The one dialect we translate
 
 `POST /v1/fim/completions` is served, and it is the only translation in demesne — everything
@@ -558,7 +577,12 @@ Bugs found while building this, kept because the next reader will otherwise find
 7. **"Up" is not "holding the card".** A router with nothing loaded holds a port and about
    28 MiB. The first card document said `holders:["llama"]` for exactly that, and a client
    trusting it would refuse to render on a free card.
-8. **A caller that gives up is not an engine that failed.** The proxy sees a cancelled client
+8. **A slow answer needs a clock on the right side of the proxy.** The client's header
+   deadline runs from the first byte out, so a proxy that forwards headers only when the
+   upstream sends them hands the client a deadline that the engine can exceed: 300 s against a
+   cold 27B load, in the case that started this. Answer the caller first, and let the engine
+   catch up.
+9. **A caller that gives up is not an engine that failed.** The proxy sees a cancelled client
    and a refused connection as the same returned error, and counting the first as evidence is
    how a client timeout condemned a healthy router: on 2026-11-07 two of them five minutes
    apart tripped the breaker, the watch killed a child that was 14.65 GiB into a cold load, and

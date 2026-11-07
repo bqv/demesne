@@ -735,8 +735,10 @@ func (d *demesne) route(w http.ResponseWriter, r *http.Request, in intent) {
 	// A chat request names the model it wants, and the model decides the engine: demesne
 	// answers on the number every caller already means, so the name has to choose. The
 	// path still decides the KIND of request; only the slot moves.
+	var pk peeked
 	if in.kind == kindChat {
-		if name := d.slotForModel(peekModel(r)); name != "" {
+		pk = peekRequest(r)
+		if name := d.slotForModel(pk.model); name != "" {
 			in.slot = name
 		}
 	}
@@ -784,6 +786,10 @@ func (d *demesne) route(w http.ResponseWriter, r *http.Request, in intent) {
 
 	default: // kindChat
 		if !d.claimCard(w, r, s) {
+			return
+		}
+		if pk.stream {
+			d.streamChat(w, r, s, pk.body)
 			return
 		}
 		d.proxies[s.specOf().name].ServeHTTP(w, r)

@@ -21,7 +21,6 @@ import (
 	"bufio"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -103,6 +102,19 @@ func (d *demesne) handleFIM(w http.ResponseWriter, r *http.Request) {
 		writeMistralError(w, http.StatusInternalServerError, err.Error(), "internal_error")
 		return
 	}
+	id := newCompletionID()
+	model := in.Model
+	if model == "" {
+		model = slot.specOf().name
+	}
+
+	// Streaming goes first: it answers the client before dialling, so a cold load cannot sit
+	// behind a header deadline. The non-streaming path below can afford to wait for a status.
+	if in.Stream {
+		d.streamFIM(w, r, slot, payload, id, model)
+		return
+	}
+
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost,
 		strings.TrimRight(slot.specOf().url, "/")+"/infill", strings.NewReader(string(payload)))
 	if err != nil {
@@ -126,44 +138,32 @@ func (d *demesne) handleFIM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id := newCompletionID()
-	model := in.Model
-	if model == "" {
-		model = slot.specOf().name
-	}
-
-	if in.Stream {
-		d.streamFIM(w, resp.Body, id, model)
-		return
-	}
 	d.collectFIM(w, resp.Body, id, model)
 }
 
 // streamFIM relays upstream deltas as OpenAI-shaped SSE chunks, which is the dialect Mistral
-// documents for a streaming FIM request: data-only events terminated by [DONE].
-func (d *demesne) streamFIM(w http.ResponseWriter, upstream io.Reader, id, model string) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	flusher, _ := w.(http.Flusher)
+// documents for a streaming FIM request: data-only events terminated by [DONE]. It answers the
+// client first, for the same reason chat does: a cold load must not sit behind a header
+// deadline.
+func (d *demesne) streamFIM(w http.ResponseWriter, r *http.Request, s *slot, payload []byte, id, model string) {
+	url := strings.TrimRight(s.specOf().url, "/") + "/infill"
+	out, resp, done, err := d.streamUpstream(w, r, url, payload)
+	defer done()
+	if err != nil || resp == nil {
+		return
+	}
+	defer resp.Body.Close()
 	created := time.Now().Unix()
-
 	emit := func(payload any) bool {
 		b, err := json.Marshal(payload)
 		if err != nil {
 			return false
 		}
-		if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
-			return false
-		}
-		if flusher != nil {
-			flusher.Flush()
-		}
+		out.write("data: " + string(b) + "\n\n")
 		return true
 	}
-
-	err := readInfill(upstream, func(text string, done bool) bool {
-		if done {
+	_ = readInfill(resp.Body, func(text string, finished bool) bool {
+		if finished {
 			return emit(map[string]any{
 				"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
 				"choices": []any{map[string]any{
@@ -178,13 +178,7 @@ func (d *demesne) streamFIM(w http.ResponseWriter, upstream io.Reader, id, model
 			}},
 		})
 	})
-	if err != nil && w.Header().Get("Content-Type") != "" {
-		return
-	}
-	fmt.Fprint(w, "data: [DONE]\n\n")
-	if flusher != nil {
-		flusher.Flush()
-	}
+	out.write("data: [DONE]\n\n")
 }
 
 // collectFIM drains the same stream and answers with the one object a non-streaming FIM
@@ -287,26 +281,9 @@ func writeMistralError(w http.ResponseWriter, status int, msg, kind string) {
 // writeMistralRawError passes an engine's own error through, re-wrapped: the message is the
 // engine's, because it is the only part that says what is actually wrong.
 func writeMistralRawError(w http.ResponseWriter, status int, raw []byte) {
-	var upstream struct {
-		Message string `json:"message"`
-		Error   struct {
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	_ = json.Unmarshal(raw, &upstream)
-	msg := upstream.Message
-	if msg == "" {
-		msg = upstream.Error.Message
-	}
-	if msg == "" {
-		msg = strings.TrimSpace(string(raw))
-		if len(msg) > 400 {
-			msg = msg[:400]
-		}
-	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"object": "error", "message": msg, "type": "server_error", "code": status,
+		"object": "error", "message": engineMessage(raw), "type": "server_error", "code": status,
 	})
 }

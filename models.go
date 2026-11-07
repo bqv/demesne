@@ -124,28 +124,35 @@ func (d *demesne) slotForModel(model string) string {
 	return d.models.byModel[model]
 }
 
-// peekModel reads just enough of a request body to learn the model name, then hands the
-// body back untouched: the proxy streams from the same bytes and the upstream never learns
-// that anything looked.
-func peekModel(r *http.Request) string {
-	if r.Body == nil {
-		return ""
-	}
-	if r.ContentLength > modelBodyCap {
-		return ""
+// peeked is what a chat request says about itself before it is forwarded: which model, and
+// whether it wants a stream. Both decide behaviour, and the body is kept so the peek costs
+// the request nothing.
+type peeked struct {
+	body   []byte
+	model  string
+	stream bool
+}
+
+// peekRequest reads just enough of a request body to learn the model name and whether it
+// streams, then hands the body back untouched: the proxy streams from the same bytes and the
+// upstream never learns that anything looked.
+func peekRequest(r *http.Request) peeked {
+	if r.Body == nil || r.ContentLength > modelBodyCap {
+		return peeked{}
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, modelBodyCap+1))
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	if err != nil || len(body) > modelBodyCap {
-		return ""
+		return peeked{}
 	}
 	var probe struct {
-		Model string `json:"model"`
+		Model  string `json:"model"`
+		Stream bool   `json:"stream"`
 	}
 	if json.Unmarshal(body, &probe) != nil {
-		return ""
+		return peeked{body: body}
 	}
-	return probe.Model
+	return peeked{body: body, model: probe.Model, stream: probe.Stream}
 }
 
 // fetchModels returns a router's raw model list, kept as raw bytes so every entry travels

@@ -1220,3 +1220,120 @@ func TestAClientCancelIsNotAnEngineFailure(t *testing.T) {
 		t.Fatal("real transport failures no longer trip the breaker")
 	}
 }
+
+// slowEngine answers like llama.cpp's router during a cold load: nothing, for a while, and
+// then a stream. It records whether ITS context was cancelled before it answered, which is how
+// the second test proves the load survived the caller.
+type slowEngine struct {
+	*httptest.Server
+	delay                 time.Duration
+	mu                    sync.Mutex
+	cancelledWhenAnswered bool
+	answered              bool
+	path                  string
+}
+
+func newSlowEngine(delay time.Duration, text string) *slowEngine {
+	e := &slowEngine{delay: delay}
+	e.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(e.delay)
+		e.mu.Lock()
+		e.path = r.URL.Path
+		e.cancelledWhenAnswered = r.Context().Err() != nil
+		e.answered = true
+		e.mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%q}}]}\n\n", text)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	return e
+}
+
+func (e *slowEngine) record() (bool, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.answered, e.cancelledWhenAnswered
+}
+
+// The client must be answered BEFORE the engine is. A caller with a 300 s header deadline is
+// the thing that killed session d9ff4d92: llama.cpp says nothing while it loads a 27B rung.
+func TestAStreamingChatAnswersBeforeTheEngineDoes(t *testing.T) {
+	up := newSlowEngine(600*time.Millisecond, "hello")
+	defer up.Close()
+
+	cfg := testConfig(t)
+	cfg.llama = engineConfig{url: up.URL}
+	d := newTestDemesne(t, cfg)
+	srv := httptest.NewServer(d)
+	defer srv.Close()
+
+	started := time.Now()
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("the front door did not answer: %v", err)
+	}
+	defer resp.Body.Close()
+	waited := time.Since(started)
+	if waited > 400*time.Millisecond {
+		t.Fatalf("headers took %v; the engine had not even answered yet (delay 600ms)", waited)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("content-type %q", ct)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "hello") {
+		t.Fatalf("the stream never carried the engine's text: %q", string(body))
+	}
+	if !strings.Contains(string(body), "data: [DONE]") {
+		t.Fatalf("no [DONE] in %q", string(body))
+	}
+}
+
+// And the load is shared work: a caller that gives up must not destroy it. This is the half
+// that would have saved the 14.65 GiB load the watch killed.
+func TestACancelDoesNotAbortTheLoad(t *testing.T) {
+	up := newSlowEngine(500*time.Millisecond, "late")
+	defer up.Close()
+
+	cfg := testConfig(t)
+	cfg.llama = engineConfig{url: up.URL}
+	d := newTestDemesne(t, cfg)
+	srv := httptest.NewServer(d)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"m","stream":true,"messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err == nil {
+		// We asked to give up after 100 ms and the engine answers at 500 ms; the read must
+		// fail, which is the caller giving up.
+		_, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+	}
+
+	// Wait for the engine to have answered, then look at what it saw.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if answered, _ := up.record(); answered {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	answered, cancelled := up.record()
+	if !answered {
+		t.Fatal("the engine never answered at all")
+	}
+	if cancelled {
+		t.Fatal("the engine's request was cancelled when the client gave up: the load died with it")
+	}
+}
