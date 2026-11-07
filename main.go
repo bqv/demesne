@@ -1165,6 +1165,17 @@ func (d *demesne) handleSlotControl(w http.ResponseWriter, r *http.Request) {
 		}
 		d.evict(s, stopOperator, "operator stop")
 		fmt.Fprintf(w, "%s stopped\n", s.specOf().name)
+	case "reload":
+		if r.Method != http.MethodPost {
+			http.Error(w, "demesne: POST required", http.StatusMethodNotAllowed)
+			return
+		}
+		n, err := d.reloadPreset(s)
+		if err != nil {
+			http.Error(w, "demesne: "+err.Error(), http.StatusConflict)
+			return
+		}
+		fmt.Fprintf(w, "%s: preset reloaded, %d models\n", s.specOf().name, n)
 	case "reclaim":
 		if r.Method != http.MethodPost {
 			http.Error(w, "demesne: POST required", http.StatusMethodNotAllowed)

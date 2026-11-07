@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -360,9 +361,97 @@ func (b *loadBoard) snapshot() []modelLoad {
 	return out
 }
 
+// observeFromLog keeps the load state honest while the router cannot be asked: the last
+// `load:   ./model.gguf` line names what is being loaded, and a failure after it is its own.
+func (b *loadBoard) observeFromLog(slot string) {
+	lines, _, _ := b.fromLog(slot)
+	model := ""
+	at := -1
+	for i, l := range lines {
+		if m := modelFromLoadLine(l); m != "" {
+			model, at = m, i
+		}
+	}
+	if model == "" {
+		return
+	}
+	now := time.Now().UnixMilli()
+	var changed *modelLoad
+	b.mu.Lock()
+	e, ok := b.entries[loadKey(slot, model)]
+	if !ok {
+		e = &modelLoad{Slot: slot, Model: model, Phase: loadLoading, StartedMS: now}
+		b.entries[loadKey(slot, model)] = e
+		changed = e
+	}
+	for _, l := range lines[at+1:] {
+		if isLoadFailure(l) && namesModel(l, model) {
+			if e.Phase != loadFailed {
+				e.Phase = loadFailed
+				msg := l
+				e.Error, e.FinishedMS = &msg, &now
+				changed = e
+			}
+			break
+		}
+	}
+	if changed != nil {
+		out := *changed
+		b.mu.Unlock()
+		b.fire(out)
+		return
+	}
+	b.mu.Unlock()
+}
+
+func modelFromLoadLine(line string) string {
+	i := strings.Index(line, "load:")
+	if i < 0 {
+		return ""
+	}
+	rest := line[i+len("load:"):]
+	for _, field := range strings.Fields(rest) {
+		if !strings.HasSuffix(field, ".gguf") {
+			continue
+		}
+		base := filepath.Base(field)
+		return strings.TrimSuffix(base, ".gguf")
+	}
+	return ""
+}
+
 func (d *demesne) loadChanged(l modelLoad) {
 	d.hub.publish(eventFrame{Type: "load", AtMS: time.Now().UnixMilli(), Load: &l})
 	d.history.record(transitionRecord{AtMS: time.Now().UnixMilli(), Slot: l.Slot, Kind: "load", To: l.Phase, Reason: l.Model})
+}
+
+// reloadPreset asks a router to re-read its models.ini. llama.cpp exposes no POST for this: the
+// refresh is a query string on the model list, and it is slow while a model is loading.
+func (d *demesne) reloadPreset(s *slot) (int, error) {
+	if !isRouterSlot(s.specOf().bin) {
+		return 0, errors.New(s.specOf().name + " is not a llama.cpp router, so it has no preset to reload")
+	}
+	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(s.specOf().url, "/")+"/models?reload=1", nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := (&http.Client{Timeout: 90 * time.Second}).Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("the router answered %d: %s", resp.StatusCode, engineMessage(body))
+	}
+	var doc struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	_ = json.Unmarshal(body, &doc)
+	d.refreshModels()
+	return len(doc.Data), nil
 }
 
 func isRouterSlot(bin string) bool {
@@ -419,6 +508,11 @@ func (d *demesne) pollLoads() {
 		}
 		models, err := d.routerModels(s)
 		if err != nil {
+			// /v1/models is blocked for tens of seconds while the router loads a model, so
+			// the engine's own log is the only witness during exactly the window a card
+			// cares about.
+			d.loads.observeFromLog(s.specOf().name)
+			active = append(active, s.specOf().name)
 			continue
 		}
 		d.loads.observe(s.specOf().name, models)

@@ -239,6 +239,23 @@ the model-level answer, and it is an array because llamb can hold four models at
   request counters: the router knows which model is loading, and a probe of `/v1/models` claims
   no card and evicts nothing.
 
+### Two reloads, and they are not the same thing
+
+`estate.reload` re-reads **demesne's** own conf (`~/etc/conf.d/demesne`), which is why a
+restart is not needed for a port change, a fence change or an env change.
+
+`POST /slots/llama/reload` (or `slots.reload` over RPC) asks **the router** to re-read
+`~/var/model/llm/models.ini`, so adding, editing or deleting a rung needs no restart either.
+llama.cpp has no POST for this: the refresh is a query string on the model list,
+`GET <router>/models?reload=1`, and it is slow — ten seconds or more — while a model is loading.
+demesne gives it a 90 s budget and refreshes its own model index as soon as it returns.
+
+Two things follow from the router's shape, both learned on 2026-11-07: the reload is the
+*only* live way to change a preset (the endpoint is not `POST /models/reload`, which is a 404 in
+this build), and `/v1/models` can block for tens of seconds while a model loads — so the load
+board falls back to the child log (the last `load:   ./model.gguf` line) exactly when a card
+needs it most.
+
 ### `GET /estate/metrics`
 
 One document, `"version": 1`, with `since_ms` naming the moment every counter is counted from
@@ -291,6 +308,7 @@ curl --unix-socket /run/user/1000/demesne.sock http://demesne/rpc \
 | `slots.load` | `{slot}` | `{slot, state:"running"}` — may block for a cold load |
 | `slots.stop` | `{slot}` | `{slot, state:"stopped"}` |
 | `slots.reclaim` | `{slot}` | `{slot, reclaimed:bool}` — see the evidence rules below |
+| `slots.reload` | `{slot}` | `{slot, reloaded:true, models:N}` — re-reads a router's `models.ini` |
 
 Errors are JSON-RPC's own: `-32601` no such method, `-32602` bad params (an unknown slot comes
 with the valid names in `data`), `-32603` internal. Batches are answered in order, and a

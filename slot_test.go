@@ -1836,3 +1836,59 @@ func TestEventsRestartOnACursorFromAPreviousProcess(t *testing.T) {
 		t.Fatal("a cursor from the future was accepted; the stream would go silent")
 	}
 }
+
+// The live reload is llama.cpp's own: GET <router>/models?reload=1. There is no POST for it.
+func TestSlotReloadAsksTheRouterToReload(t *testing.T) {
+	seen := make(chan string, 1)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.URL.RequestURI()
+		_, _ = io.WriteString(w, `{"data":[{"id":"A"},{"id":"B"}]}`)
+	}))
+	defer up.Close()
+	cfg := testConfig(t)
+	cfg.llama = engineConfig{url: up.URL, bin: "/usr/bin/llama-server"}
+	d := newTestDemesne(t, cfg)
+
+	n, err := d.reloadPreset(d.slotByName("llama"))
+	if err != nil {
+		t.Fatalf("reloadPreset: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("models = %d", n)
+	}
+	if got := <-seen; got != "/models?reload=1" {
+		t.Fatalf("asked for %q", got)
+	}
+}
+
+// A slot that is not a router has no preset, and saying so beats dialling it.
+func TestSlotReloadRefusesANonRouter(t *testing.T) {
+	cfg := testConfig(t)
+	d := newTestDemesne(t, cfg)
+	if _, err := d.reloadPreset(d.slotByName("sd")); err == nil {
+		t.Fatal("reloadPreset accepted a non-router slot")
+	}
+}
+
+// While the router is loading, /v1/models is blocked for tens of seconds; the child log is the
+// only witness, and it must still produce a load entry.
+func TestLoadsFallBackToTheChildLog(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer up.Close()
+	cfg := testConfig(t)
+	cfg.llama = engineConfig{url: up.URL, bin: "/usr/bin/llama-server"}
+	d := newTestDemesne(t, cfg)
+
+	log := "srv  load:   --model\nsrv  load:   ./M1.gguf\nload_tensors: loading model tensors\n"
+	if err := os.WriteFile(filepath.Join(cfg.logDir, "llama.err"), []byte(log), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d.pollLoads()
+	got := d.loads.snapshot()
+	e := findLoad(t, got, "llama", "M1")
+	if e == nil || e.Phase != loadLoading {
+		t.Fatalf("no load entry from the log alone: %+v", got)
+	}
+}
