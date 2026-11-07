@@ -1966,3 +1966,36 @@ func TestTheStrataSlotIsOptIn(t *testing.T) {
 		t.Fatalf("the fifth slot is not the external router described: %+v", last)
 	}
 }
+
+// Dropping an engine's URL from the conf must not move a live slot to "" -- the reload would
+// leave it proxying into nothing. Removing an engine needs a restart, like adopting one.
+func TestReloadRefusesToEmptyASlotsURL(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.strata = engineConfig{url: "http://127.0.0.1:55560"}
+	cfg.confFile = filepath.Join(t.TempDir(), "conf")
+	if err := os.WriteFile(cfg.confFile, []byte("# strata is not configured\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d := newTestDemesne(t, cfg)
+	before := d.slotByName("strata").specOf().url
+	if before == "" {
+		t.Fatal("the strata slot was not built")
+	}
+	rep, err := d.reload()
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	after := d.slotByName("strata").specOf().url
+	if after != before {
+		t.Fatalf("reload moved the slot's URL from %q to %q", before, after)
+	}
+	said := false
+	for _, r := range rep.Refused {
+		if strings.Contains(r, "strata") {
+			said = true
+		}
+	}
+	if !said {
+		t.Fatalf("reload did not report the removed engine: %+v", rep)
+	}
+}

@@ -195,6 +195,14 @@ func (d *demesne) reload() (reloadReport, error) {
 		e := engines[name]
 		cur := s.specOf()
 
+		// An engine whose URL left the conf has no address to be moved to, and applying an
+		// empty one would leave the slot proxying into nothing. Removing an engine needs a
+		// restart, exactly as adopting one does.
+		if e.url == "" {
+			rep.Refused = append(rep.Refused, name+" (its URL is gone from the conf; removing an engine needs a restart)")
+			continue
+		}
+
 		want := cur
 		want.url, want.bin, want.args, want.env, want.dir = e.url, e.bin, e.args, e.env, e.dir
 		want.policy = policyFor(name, e.bin)
