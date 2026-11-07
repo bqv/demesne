@@ -206,6 +206,36 @@ engine `stop` is simply stop, and the next request starts it. demesne does not r
 over RPC on purpose — the call would lose its own response, and a wedged release must have an
 actor outside the process; that is `rc-service --user demesne restart`.
 
+## The typed control plane — JSON-RPC on the door we already have
+
+`POST /rpc` speaks **JSON-RPC 2.0**, on the port and on the socket alike. The methods are the
+point; the framing is not.
+
+```sh
+curl --unix-socket /run/user/1000/demesne.sock http://demesne/rpc \
+  -d '{"jsonrpc":"2.0","id":1,"method":"estate.card","params":{"group":"gpu"}}'
+```
+
+| method | params | answer |
+| :-- | :-- | :-- |
+| `estate.status` | — | `{version, slots[]}` — the estate's own account of itself |
+| `estate.card` | `{group?}` | the small card document (default `gpu`) |
+| `estate.reload` | — | the reload report |
+| `slots.status` | `{slot}` | one slot |
+| `slots.load` | `{slot}` | `{slot, state:"running"}` — may block for a cold load |
+| `slots.stop` | `{slot}` | `{slot, state:"stopped"}` |
+
+Errors are JSON-RPC's own: `-32601` no such method, `-32602` bad params (an unknown slot comes
+with the valid names in `data`), `-32603` internal. Batches are answered in order, and a
+notification — a request with no `id` — is executed and not answered.
+
+**Why HTTP as the transport.** It is already on the socket, ward's client already speaks it
+(`CURLOPT_UNIX_SOCKET_PATH`), and Go's standard library has no CBOR: a second binary framing
+would mean a dependency in a stdlib-only daemon, or a hand-rolled codec, for a payload of a few
+hundred bytes. What changes here is the vocabulary — a caller says `estate.card` instead of
+knowing a URL, a query string, and which of four documents answers it — and that is the part
+that was worth having.
+
 ## The card, in one small document
 
 `/status` is the operator's document and it may grow. A *client* that only wants to know

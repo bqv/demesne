@@ -722,6 +722,8 @@ func (d *demesne) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.handleReload(w, r)
 	case p == "/v1/fim/completions":
 		d.handleFIM(w, r)
+	case p == "/rpc":
+		d.handleRPC(w, r)
 	case p == "/release":
 		d.handleRelease(w, r)
 	case strings.HasPrefix(p, "/slots/"):
@@ -1007,6 +1009,13 @@ func (d *demesne) card(w http.ResponseWriter, r *http.Request) {
 	if group == "" {
 		group = "gpu"
 	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(d.cardDocument(group))
+}
+
+// cardDocument is the card answer itself, so the HTTP endpoint and the typed control plane
+// cannot drift apart: one builds it, the other wraps it.
+func (d *demesne) cardDocument(group string) estateCard {
 	out := estateCard{Group: group, Holders: []string{}, Slots: []cardSlot{}}
 	for _, s := range d.slots {
 		if s.specOf().group != group {
@@ -1029,8 +1038,7 @@ func (d *demesne) card(w http.ResponseWriter, r *http.Request) {
 			out.SinceMS = since
 		}
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(out)
+	return out
 }
 
 // downReason makes last_transition a total function for a slot that is down: a slot that has

@@ -1337,3 +1337,110 @@ func TestACancelDoesNotAbortTheLoad(t *testing.T) {
 		t.Fatal("the engine's request was cancelled when the client gave up: the load died with it")
 	}
 }
+
+// callRPC posts one JSON-RPC request at the handler and decodes the envelope.
+func callRPC(t *testing.T, d *demesne, body string) (int, map[string]any) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/rpc", strings.NewReader(body)))
+	var out map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	return rec.Code, out
+}
+
+func TestRPCAnswersTheTypedMethods(t *testing.T) {
+	cfg := testConfig(t)
+	d := newTestDemesne(t, cfg)
+
+	code, out := callRPC(t, d, `{"jsonrpc":"2.0","id":1,"method":"estate.card","params":{"group":"gpu"}}`)
+	if code != http.StatusOK || out["error"] != nil {
+		t.Fatalf("estate.card: %d %v", code, out)
+	}
+	card, ok := out["result"].(map[string]any)
+	if !ok || card["group"] != "gpu" {
+		t.Fatalf("estate.card result: %v", out["result"])
+	}
+
+	code, out = callRPC(t, d, `{"jsonrpc":"2.0","id":2,"method":"estate.status"}`)
+	if code != http.StatusOK || out["error"] != nil {
+		t.Fatalf("estate.status: %d %v", code, out)
+	}
+	status := out["result"].(map[string]any)
+	if status["version"] != version {
+		t.Fatalf("estate.status version = %v", status["version"])
+	}
+	if slots, ok := status["slots"].([]any); !ok || len(slots) != 4 {
+		t.Fatalf("estate.status slots = %v", status["slots"])
+	}
+
+	// The method that stops an engine must reach the same code path as the HTTP verb, so the
+	// slot's own account of itself agrees.
+	if err := d.ensure(d.slotByName("sd")); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	code, out = callRPC(t, d, `{"jsonrpc":"2.0","id":3,"method":"slots.stop","params":{"slot":"sd"}}`)
+	if code != http.StatusOK || out["error"] != nil {
+		t.Fatalf("slots.stop: %d %v", code, out)
+	}
+	if up, _ := d.slotByName("sd").isUp(); up {
+		t.Fatal("slots.stop left the child running")
+	}
+	if got := d.slotByName("sd").specOf().name; got != "sd" {
+		t.Fatalf("wrong slot: %s", got)
+	}
+
+	_, out = callRPC(t, d, `{"jsonrpc":"2.0","id":4,"method":"slots.status","params":{"slot":"sd"}}`)
+	st := out["result"].(map[string]any)
+	if st["last_transition"] != string(stopOperator) {
+		t.Fatalf("last_transition after an RPC stop = %v", st["last_transition"])
+	}
+}
+
+func TestRPCErrorsAreJSONRPC(t *testing.T) {
+	cfg := testConfig(t)
+	d := newTestDemesne(t, cfg)
+
+	cases := []struct {
+		name string
+		body string
+		code float64
+	}{
+		{"no method", `{"jsonrpc":"2.0","id":1,"method":"nope"}`, rpcNoMethod},
+		{"unknown slot", `{"jsonrpc":"2.0","id":2,"method":"slots.status","params":{"slot":"zzz"}}`, rpcBadParams},
+		{"missing slot", `{"jsonrpc":"2.0","id":3,"method":"slots.load","params":{}}`, rpcBadParams},
+	}
+	for _, c := range cases {
+		_, out := callRPC(t, d, c.body)
+		e, ok := out["error"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s: no error in %v", c.name, out)
+		}
+		if e["code"] != c.code {
+			t.Fatalf("%s: code %v, want %v", c.name, e["code"], c.code)
+		}
+	}
+}
+
+// A batch is answered in order, and a notification is run but not answered.
+func TestRPCBatchAndNotification(t *testing.T) {
+	cfg := testConfig(t)
+	d := newTestDemesne(t, cfg)
+
+	rec := httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/rpc", strings.NewReader(
+		`[{"jsonrpc":"2.0","id":1,"method":"estate.card"},{"jsonrpc":"2.0","id":2,"method":"estate.status"}]`)))
+	var batch []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &batch); err != nil {
+		t.Fatalf("batch decode: %v (%s)", err, rec.Body.String())
+	}
+	if len(batch) != 2 || batch[0]["id"] != float64(1) || batch[1]["id"] != float64(2) {
+		t.Fatalf("batch out of order: %v", batch)
+	}
+
+	rec = httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/rpc", strings.NewReader(
+		`{"jsonrpc":"2.0","method":"estate.reload"}`)))
+	if rec.Code != http.StatusNoContent || rec.Body.Len() != 0 {
+		t.Fatalf("a notification was answered: %d %q", rec.Code, rec.Body.String())
+	}
+}
