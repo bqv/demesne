@@ -224,6 +224,7 @@ curl --unix-socket /run/user/1000/demesne.sock http://demesne/rpc \
 | `slots.status` | `{slot}` | one slot |
 | `slots.load` | `{slot}` | `{slot, state:"running"}` — may block for a cold load |
 | `slots.stop` | `{slot}` | `{slot, state:"stopped"}` |
+| `slots.reclaim` | `{slot}` | `{slot, reclaimed:bool}` — see the evidence rules below |
 
 Errors are JSON-RPC's own: `-32601` no such method, `-32602` bad params (an unknown slot comes
 with the valid names in `data`), `-32603` internal. Batches are answered in order, and a
@@ -348,6 +349,19 @@ Two smaller consequences of the same lesson, now enforced in the spawn path:
   onto it produces a child that cannot bind and a crash loop that reads as the engine's fault;
 - **readiness is our child answering**, not just a port answering: the child is checked alive
   *before* the port is believed, so an orphan cannot be adopted as a successful start.
+
+**And one chance to take a port back — on evidence, never on a guess.** A slot whose port is
+answered while the slot is down tries `reclaim` (also `POST /slots/<name>/reclaim`, and
+`slots.reclaim` over the RPC). It kills the holder only if both of these hold:
+
+1. the process is in **the slot's own cgroup leaf** — only demesne ever moves a process there;
+2. its **executable is the binary the slot is configured to run**, matched by basename.
+
+Anything else is refused with the pid and the reason, and left alone: a slot stuck behind
+somebody else's listener is a loud, recoverable state, while killing the wrong process is not
+recoverable at all. A slot with no fence configured has no test 1, so it refuses too. The
+holder is found the way `ss` finds it — the socket inode from `/proc/net/tcp{,6}`, then the
+process in `/proc/<pid>/fd` — because a daemon may not shell out to `ss`.
 
 ### Restart policy — resident is eager, media is lazy, both bounded
 
