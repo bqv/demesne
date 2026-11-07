@@ -191,11 +191,20 @@ func lineFor(lines []string, model string) string {
 		return ""
 	}
 	for i := len(lines) - 1; i >= 0; i-- {
+		if isLoadFailure(lines[i]) && namesModel(lines[i], model) {
+			return lines[i]
+		}
+	}
+	for i := len(lines) - 1; i >= 0; i-- {
 		if model != "" && strings.Contains(lines[i], model) {
 			return lines[i]
 		}
 	}
 	return lines[len(lines)-1]
+}
+
+func namesModel(line, model string) bool {
+	return model == "" || strings.Contains(line, model)
 }
 
 func hasLoadMark(line string) bool {
@@ -319,9 +328,10 @@ func (b *loadBoard) refreshLogs(slots []string) {
 			if progress != nil {
 				e.Progress = progress
 			}
-			if failure != nil && e.Phase == loadLoading {
+			if failure != nil && e.Phase == loadLoading && namesModel(*failure, e.Model) {
 				e.Phase = loadFailed
 				e.Error = failure
+				e.Line = *failure
 				now := time.Now().UnixMilli()
 				e.FinishedMS = &now
 				changed = append(changed, *e)

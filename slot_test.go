@@ -1792,3 +1792,36 @@ func TestEventsDropRatherThanBlock(t *testing.T) {
 		t.Fatal("publish blocked on a slow subscriber")
 	}
 }
+
+// A failure line belongs to the model it names. On 2026-11-07 a missing Thinklite gguf made the
+// router exit, and the 27B that was loading on the same slot was marked failed with it.
+func TestALoadFailureIsAttributedToItsOwnModel(t *testing.T) {
+	dir := t.TempDir()
+	log := "srv  load:   ./Qwen3.8-27B-abliterated-120k.gguf\n" +
+		"gguf_init_from_file: failed to open GGUF file './Thinklite-27B-Q4_K_M.gguf' (No such file or directory)\n" +
+		"instance name=Thinklite-27B-Q4_K_M exited with status 1\n"
+	if err := os.WriteFile(filepath.Join(dir, "llama.err"), []byte(log), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b := newLoadBoard(dir)
+	b.observe("llama", map[string]string{
+		"Qwen3.8-27B-abliterated-120k": "loading",
+		"Thinklite-27B-Q4_K_M":         "loading",
+	})
+	b.refreshLogs([]string{"llama"})
+	got := b.snapshot()
+	qwen := findLoad(t, got, "llama", "Qwen3.8-27B-abliterated-120k")
+	think := findLoad(t, got, "llama", "Thinklite-27B-Q4_K_M")
+	if qwen == nil || think == nil {
+		t.Fatalf("entries missing: %+v", got)
+	}
+	if qwen.Phase != loadLoading {
+		t.Fatalf("the 27B was marked %q by another model's failure", qwen.Phase)
+	}
+	if think.Phase != loadFailed || think.Error == nil || !strings.Contains(*think.Error, "Thinklite") {
+		t.Fatalf("Thinklite should carry its own failure: %+v", think)
+	}
+	if !strings.Contains(think.Line, "Thinklite") {
+		t.Fatalf("the failure line was not kept: %q", think.Line)
+	}
+}
