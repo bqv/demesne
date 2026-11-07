@@ -84,6 +84,7 @@ asked `rc-service` for the same restart — was an artefact of two owners, not o
 | request | what happens |
 | :-- | :-- |
 | **chat** — `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/rerank`, `/completion`, `/infill`, `/models/load|unload` | the model name picks the engine; if that engine is on the `gpu` card, the media child is evicted, the VRAM is waited for, then the request is proxied |
+| **translated** — `/v1/fim/completions` | Mistral's fill-in-the-middle dialect: `prompt` + `suffix` become llama.cpp's `input_prefix`/`input_suffix`, and the stream-shaped reply is re-enclosed as a `chat.completion`. It claims the card like chat, because it is generation |
 | **anything else** — `/slots`, `/metrics`, `/tokenize`, `/detokenize`, whatever the next llama.cpp build adds | proxied to the router and **nothing else**: no card claim, no eviction, no breaker. A probe is not a claimant |
 | **generation** — `/sdapi/v1/txt2img`, `/img2img`, `/v1/images/*`, `/inference`, `/v1/audio/*` | make room on the card, spawn the child, proxy to it, re-arm its idle clock |
 | **metadata** — `/props`, `/health`, `/healthz` | proxy untouched; the router loads nothing for these |
@@ -127,6 +128,28 @@ routers' `/v1/models`, refreshed on a 30 s ticker and built once before the list
 
 A path still decides the *kind* of request (`/sdapi/*` is the media child, `/v1/audio/*` is
 whisper); only the engine moves.
+
+### The one dialect we translate
+
+`POST /v1/fim/completions` is served, and it is the only translation in demesne — everything
+else is proxied in the dialect the engine already speaks. The rule that decides it: **a dialect
+is cheap when it renames and expensive when it re-vocabularises.**
+
+Mistral's FIM endpoint is the only widely-implemented *name* for the thing llama.cpp calls
+`/infill` — send a prefix and a suffix, get the text between them — and no OpenAI-shaped client
+can reach `/infill` at all. So it earns three translations and nothing else:
+
+- a field rename: `prompt`/`suffix` → `input_prefix`/`input_suffix`;
+- a `model` field added, because the router picks the rung from it;
+- a response enclosure: `/infill` is stream-shaped and not OAI-compatible, so the reply is
+  re-wrapped into a `chat.completion`, or into OpenAI-shaped SSE chunks terminated by
+  `data: [DONE]` when the caller asks to stream.
+
+Two refusals, both deliberate. It does not invent an answer for a model that cannot infill:
+llama.cpp requires the model to carry `fim_pre`/`fim_suf`/`fim_mid` tokens, and a model without
+them answers `501 Infill is not supported by this model`, which is passed through with its status
+and its reason because that is the true answer. And a FIM field with no upstream meaning is a
+`422`, not a silent drop.
 
 ## Operator interface — `/status` is the only status surface
 

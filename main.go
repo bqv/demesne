@@ -695,6 +695,8 @@ func (d *demesne) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.modelsHandler(w, r)
 	case p == "/reload" && r.Method == http.MethodPost:
 		d.handleReload(w, r)
+	case p == "/v1/fim/completions":
+		d.handleFIM(w, r)
 	case p == "/release":
 		d.handleRelease(w, r)
 	case strings.HasPrefix(p, "/slots/"):
@@ -756,56 +758,62 @@ func (d *demesne) route(w http.ResponseWriter, r *http.Request, in intent) {
 		d.probes[s.specOf().name].ServeHTTP(w, r)
 
 	default: // kindChat
-		// The breaker: once the router has failed a burst of requests, refuse new ones
-		// quickly instead of dialling a dead port once per client and letting each wait
-		// out its own timeout. A successful request clears it.
-		// The breaker is the llama router's: it is built from that engine's failures, and
-		// applying it to the aux card would refuse requests over another engine's fault.
-		if s.specOf().name == "llama" {
-			if open, wait := d.llm.failing(); open {
-				w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())))
-				http.Error(w, "demesne: the llama engine is failing; retry shortly (see /status)",
-					http.StatusServiceUnavailable)
-				return
-			}
-		}
-		// A resident router that is still loading is not broken: wait a bounded while
-		// for its port rather than take a 502 from the proxy. Then say so plainly.
-		if s.booting() {
-			deadline := time.Now().Add(d.cfg.busyWait)
-			for s.booting() && time.Now().Before(deadline) {
-				time.Sleep(500 * time.Millisecond)
-			}
-			if s.booting() {
-				http.Error(w, "demesne: the "+s.specOf().name+" router is still starting; retry shortly",
-					http.StatusServiceUnavailable)
-				return
-			}
-		}
-		// A request for this GROUP's card evicts the other holder. The group is the one
-		// of the slot the request actually goes to, not of the path: a model that lives
-		// on the small card must not kill a render on the big one. kindProxy skips the
-		// whole dance -- it is a request that neither loads nor generates.
-		if sd := d.slotByName("sd"); sd != nil && sd.specOf().group == s.specOf().group {
-			// If a render is in flight, wait for it to finish -- then say so plainly
-			// instead of killing it.
-			if n := atomic.LoadInt64(&sd.inflight); n > 0 {
-				deadline := time.Now().Add(d.cfg.busyWait)
-				for atomic.LoadInt64(&sd.inflight) > 0 && time.Now().Before(deadline) {
-					time.Sleep(500 * time.Millisecond)
-				}
-				if atomic.LoadInt64(&sd.inflight) > 0 {
-					http.Error(w, "demesne: an image generation is in progress on the card; retry shortly",
-						http.StatusServiceUnavailable)
-					return
-				}
-			}
-			if up, _ := sd.isUp(); up {
-				d.evict(sd, stopChat, "a chat request wants the card")
-			}
+		if !d.claimCard(w, r, s) {
+			return
 		}
 		d.proxies[s.specOf().name].ServeHTTP(w, r)
 	}
+}
+
+// claimCard is the preflight every request that WANTS the card needs, whichever dialect it
+// arrived in: the router's breaker, the bounded wait for a booting engine, and the eviction of
+// the media child when it shares the group. It writes its own refusal and reports whether the
+// caller may proceed.
+func (d *demesne) claimCard(w http.ResponseWriter, r *http.Request, s *slot) bool {
+	// The breaker is the llama router's: it is built from that engine's failures, and
+	// applying it to the aux card would refuse requests over another engine's fault.
+	if s.specOf().name == "llama" {
+		if open, wait := d.llm.failing(); open {
+			w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())))
+			http.Error(w, "demesne: the llama engine is failing; retry shortly (see /status)",
+				http.StatusServiceUnavailable)
+			return false
+		}
+	}
+	// A resident router that is still loading is not broken: wait a bounded while for its
+	// port rather than take a 502 from the proxy. Then say so plainly.
+	if s.booting() {
+		deadline := time.Now().Add(d.cfg.busyWait)
+		for s.booting() && time.Now().Before(deadline) {
+			time.Sleep(500 * time.Millisecond)
+		}
+		if s.booting() {
+			http.Error(w, "demesne: the "+s.specOf().name+" router is still starting; retry shortly",
+				http.StatusServiceUnavailable)
+			return false
+		}
+	}
+	// The group is the one of the slot the request actually reaches, not of the path: a
+	// model that lives on the small card must not kill a render on the big one.
+	if sd := d.slotByName("sd"); sd != nil && sd.specOf().group == s.specOf().group {
+		// If a render is in flight, wait for it to finish -- then say so plainly instead
+		// of killing it.
+		if n := atomic.LoadInt64(&sd.inflight); n > 0 {
+			deadline := time.Now().Add(d.cfg.busyWait)
+			for atomic.LoadInt64(&sd.inflight) > 0 && time.Now().Before(deadline) {
+				time.Sleep(500 * time.Millisecond)
+			}
+			if atomic.LoadInt64(&sd.inflight) > 0 {
+				http.Error(w, "demesne: an image generation is in progress on the card; retry shortly",
+					http.StatusServiceUnavailable)
+				return false
+			}
+		}
+		if up, _ := sd.isUp(); up {
+			d.evict(sd, stopChat, "a chat request wants the card")
+		}
+	}
+	return true
 }
 
 // ------------------------------------------------------------------- /status

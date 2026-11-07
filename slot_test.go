@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -992,5 +993,197 @@ func TestADownSlotAlwaysSaysWhy(t *testing.T) {
 	d.evict(sd, stopOperator, "operator stop")
 	if got := transition(); got != string(stopFailed) {
 		t.Fatalf("an operator stop masked a failure: %q", got)
+	}
+}
+
+// fimServer is a stand-in for llama.cpp's /infill: it records the request it was given and
+// answers in the two shapes a build may use -- SSE by default, or a JSON body when asked with
+// a (non-standard for /infill) stream:false.
+type fimServer struct {
+	*httptest.Server
+	mu       sync.Mutex
+	lastBody map[string]any
+	jsonMode bool
+}
+
+func newFimServer(t *testing.T, text string, jsonMode bool) *fimServer {
+	t.Helper()
+	f := &fimServer{jsonMode: jsonMode}
+	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		f.mu.Lock()
+		f.lastBody = body
+		f.mu.Unlock()
+		if r.URL.Path != "/infill" {
+			http.NotFound(w, r)
+			return
+		}
+		if f.jsonMode {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"content": text})
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		for _, piece := range strings.SplitAfter(text, " ") {
+			if piece == "" {
+				continue
+			}
+			b, _ := json.Marshal(map[string]any{"content": piece})
+			fmt.Fprintf(w, "data: %s\n\n", b)
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	return f
+}
+
+func (f *fimServer) last() map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastBody
+}
+
+// Mistral's FIM dialect is reachable at all: prompt+suffix become input_prefix/input_suffix,
+// the router gets its model field, and the text comes back enclosed in a chat.completion.
+func TestFIMIsATranslationNotAProxy(t *testing.T) {
+	up := newFimServer(t, "a + b", false)
+	defer up.Close()
+
+	cfg := testConfig(t)
+	cfg.llama = engineConfig{url: up.URL}
+	d := newTestDemesne(t, cfg)
+	d.models = newModelIndex()
+	d.refreshModels()
+
+	rec := httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/fim/completions", strings.NewReader(
+		`{"model":"big-model","prompt":"def add(a, b):\n    return ","suffix":"\n","max_tokens":16,"temperature":0.2}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	sent := up.last()
+	if sent["input_prefix"] != "def add(a, b):\n    return " || sent["input_suffix"] != "\n" {
+		t.Fatalf("the prefix/suffix were not translated: %v", sent)
+	}
+	if sent["model"] != "big-model" {
+		t.Fatalf("the router did not get its model field: %v", sent)
+	}
+	if sent["n_predict"] != float64(16) || sent["stream"] != true {
+		t.Fatalf("token budget or streaming flag wrong: %v", sent)
+	}
+
+	var out struct {
+		Object  string `json:"object"`
+		Model   string `json:"model"`
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+				Role    string `json:"role"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.Object != "chat.completion" || out.Model != "big-model" {
+		t.Fatalf("envelope wrong: %+v", out)
+	}
+	if len(out.Choices) != 1 || out.Choices[0].Message.Content != "a + b" || out.Choices[0].Message.Role != "assistant" {
+		t.Fatalf("choices wrong: %+v", out.Choices)
+	}
+	if out.Choices[0].FinishReason != "stop" {
+		t.Fatalf("finish_reason = %q", out.Choices[0].FinishReason)
+	}
+}
+
+// Streaming uses Mistral's own dialect for a streaming FIM request: data-only events,
+// each an OpenAI-shaped chunk, terminated by [DONE].
+func TestFIMStreamsOpenAIChunks(t *testing.T) {
+	up := newFimServer(t, "one two", false)
+	defer up.Close()
+
+	cfg := testConfig(t)
+	cfg.llama = engineConfig{url: up.URL}
+	d := newTestDemesne(t, cfg)
+
+	rec := httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/fim/completions", strings.NewReader(
+		`{"model":"big-model","prompt":"x","suffix":"y","stream":true}`)))
+	body := rec.Body.String()
+	if !strings.Contains(body, `"object":"chat.completion.chunk"`) {
+		t.Fatalf("no chunks in %q", body)
+	}
+	if !strings.HasSuffix(body, "data: [DONE]\n\n") {
+		t.Fatalf("stream does not end with [DONE]: %q", body)
+	}
+	if !strings.Contains(body, `"content":"one"`) && !strings.Contains(body, `"content":"one "`) {
+		t.Fatalf("the text never arrived: %q", body)
+	}
+}
+
+// A JSON body from a build that honours stream:false is read too, so the adapter does not
+// depend on which llama.cpp build is behind it.
+func TestFIMReadsAJSONUpstream(t *testing.T) {
+	up := newFimServer(t, "  return a + b", true)
+	defer up.Close()
+
+	cfg := testConfig(t)
+	cfg.llama = engineConfig{url: up.URL}
+	d := newTestDemesne(t, cfg)
+
+	rec := httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/fim/completions", strings.NewReader(
+		`{"model":"big-model","prompt":"def f():","suffix":"\n"}`)))
+	if !strings.Contains(rec.Body.String(), "return a + b") {
+		t.Fatalf("json upstream not read: %s", rec.Body.String())
+	}
+}
+
+// The engine's own refusal is the true answer and is passed through with its status: a model
+// without FIM tokens says 501, and pretending otherwise would be a worse lie than an error.
+func TestFIMPassesThroughTheEnginesRefusal(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotImplemented)
+		_, _ = io.WriteString(w, `{"error":{"code":501,"message":"Infill is not supported by this model: middle token is missing. "}}`)
+	}))
+	defer up.Close()
+
+	cfg := testConfig(t)
+	cfg.llama = engineConfig{url: up.URL}
+	d := newTestDemesne(t, cfg)
+
+	rec := httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/fim/completions", strings.NewReader(
+		`{"model":"m","prompt":"a","suffix":"b"}`)))
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status %d, want 501", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "middle token is missing") {
+		t.Fatalf("the engine's reason was lost: %s", rec.Body.String())
+	}
+}
+
+// And FIM claims the card like any other generation: it must take it from a running render.
+func TestFIMClaimsTheCard(t *testing.T) {
+	up := newFimServer(t, "x", false)
+	defer up.Close()
+
+	cfg := testConfig(t)
+	cfg.llama = engineConfig{url: up.URL}
+	d := newTestDemesne(t, cfg)
+	sd := d.slotByName("sd")
+	if err := d.ensure(sd); err != nil {
+		t.Fatalf("ensure(sd): %v", err)
+	}
+	rec := httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/fim/completions", strings.NewReader(
+		`{"model":"big-model","prompt":"a","suffix":"b"}`)))
+	if up, _ := sd.isUp(); up {
+		t.Fatal("a FIM request left the media child holding the card")
 	}
 }
