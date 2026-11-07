@@ -38,7 +38,13 @@ type modelLoad struct {
 	FinishedMS *int64   `json:"finished_ms"`
 	Error      *string  `json:"error"`
 	Progress   *float64 `json:"progress"`
-	Line       string   `json:"line"`
+	// ProgressSrc names the counter behind Progress, so a client never has to guess whether a
+	// bar is bytes read, a log percentage, or a clock.
+	ProgressSrc string `json:"progress_source,omitempty"`
+	ioBase      uint64
+	ioBaseSet   bool
+	total       uint64
+	Line        string `json:"line"`
 }
 
 type loadBoard struct {
@@ -163,29 +169,104 @@ func (b *loadBoard) fromLog(slot string) ([]string, *float64, *string) {
 	b.mu.Lock()
 	dir := b.logDir
 	b.mu.Unlock()
-	tail, err := tailFile(filepath.Join(dir, slot+".err"), 24<<10)
-	if err != nil {
-		return nil, nil, nil
-	}
+
+	// Both streams carry real marks: the child's stdout has load_tensors and the model loader's
+	// lines, and the router's stderr has the 'load:' argument dump and instance exits. The
+	// cancellation 500s live on stderr too, and they are NOT marks -- reading only that stream
+	// (as this did) gave a line of 500s and no load marks at all.
 	var lines []string
 	var progress *float64
-	var failure *string
-	for _, raw := range strings.Split(tail, "\n") {
-		if !hasLoadMark(raw) {
+	for _, name := range []string{slot + ".log", slot + ".err"} {
+		tail, err := tailFile(filepath.Join(dir, name), 24<<10)
+		if err != nil {
 			continue
 		}
-		line := strings.TrimSpace(raw)
-		lines = append(lines, line)
-		if p := percentIn(line); p >= 0 {
-			v := p
-			progress = &v
+		for _, raw := range strings.Split(tail, "\n") {
+			if !hasLoadMark(raw) {
+				continue
+			}
+			line := strings.TrimSpace(raw)
+			lines = append(lines, line)
+			if p := percentIn(line); p >= 0 {
+				v := p
+				progress = &v
+			}
 		}
-		if isLoadFailure(line) {
-			msg := line
+	}
+
+	var failure *string
+	for _, name := range []string{slot + ".log", slot + ".err"} {
+		tail, err := tailFile(filepath.Join(dir, name), 24<<10)
+		if err != nil {
+			continue
+		}
+		for _, raw := range strings.Split(tail, "\n") {
+			if !isLoadFailure(raw) {
+				continue
+			}
+			msg := strings.TrimSpace(raw)
 			failure = &msg
 		}
 	}
+	if failure != nil {
+		lines = append(lines, *failure)
+	}
 	return lines, progress, failure
+}
+
+// attachProgress measures the bytes the model's own child has read, against the files that load
+// must read. Only for a router that owns its children: an external engine's child is not ours to
+// inspect, and no measurement means no bar rather than a made-up one.
+func (d *demesne) attachProgress(s *slot) {
+	pid := 0
+	s.mu.Lock()
+	if s.up {
+		pid = s.pid
+	}
+	s.mu.Unlock()
+	if pid == 0 {
+		return
+	}
+	b := d.loads
+	b.mu.Lock()
+	var active []*modelLoad
+	for _, e := range b.entries {
+		if e.Slot == s.specOf().name && e.Phase == loadLoading {
+			active = append(active, e)
+		}
+	}
+	b.mu.Unlock()
+
+	for _, e := range active {
+		child, modelPath, extra := childForModel("/proc", pid, e.Model)
+		if child == 0 {
+			continue
+		}
+		read, ok := procIO("/proc", child)
+		if !ok {
+			continue
+		}
+		b.mu.Lock()
+		if e.total == 0 {
+			if n, ok := fileSize(modelPath); ok {
+				e.total = n
+				for _, x := range extra {
+					if m, ok := fileSize(x); ok {
+						e.total += m
+					}
+				}
+			}
+		}
+		if !e.ioBaseSet {
+			e.ioBase, e.ioBaseSet = read, true
+		}
+		if e.total > 0 {
+			v := ratio(read, e.ioBase, e.total)
+			e.Progress = &v
+			e.ProgressSrc = progressSourceIO
+		}
+		b.mu.Unlock()
+	}
 }
 
 func lineFor(lines []string, model string) string {
@@ -213,7 +294,7 @@ func hasLoadMark(line string) bool {
 	for _, mark := range []string{
 		"load_tensors", "llama_model_load", "llama_model_loader", "loading model",
 		"load: ", "instance name=", "failed to allocate", "unable to allocate",
-		"error loading model", "exited with status", "request cancelled while waiting",
+		"error loading model", "exited with status",
 	} {
 		if strings.Contains(line, mark) {
 			return true
@@ -562,10 +643,12 @@ func (d *demesne) pollLoads() {
 			// the engine's own log is the only witness during exactly the window a card
 			// cares about.
 			d.loads.observeFromLog(s.specOf().name)
+			d.attachProgress(s)
 			active = append(active, s.specOf().name)
 			continue
 		}
 		d.loads.observe(s.specOf().name, models)
+		d.attachProgress(s)
 		active = append(active, s.specOf().name)
 	}
 	d.loads.refreshLogs(active)

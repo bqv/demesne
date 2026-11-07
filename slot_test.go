@@ -2124,3 +2124,91 @@ func TestAFailedLoadReturnsToLoadingOnRetry(t *testing.T) {
 		t.Fatalf("a retried load stayed %v (error %v)", e.Phase, e.Error)
 	}
 }
+
+// Progress is measured, so its parts are testable without a live load: the child is found by the
+// --alias the router gives it, the model path is resolved against the child's cwd, and the io
+// counter is the same one the kernel keeps.
+func TestProgressFindsTheChildAndItsFiles(t *testing.T) {
+	root := t.TempDir()
+	router := 4242
+	mk := func(pid int, ppid int, cmdline string) string {
+		dir := filepath.Join(root, strconv.Itoa(pid))
+		if err := os.MkdirAll(filepath.Join(dir, "fd"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		stat := strconv.Itoa(pid) + " (llama-server) S " + strconv.Itoa(ppid) + " 0 0 0\n"
+		if err := os.WriteFile(filepath.Join(dir, "stat"), []byte(stat), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		raw := strings.ReplaceAll(cmdline, " ", "\x00") + "\x00"
+		if err := os.WriteFile(filepath.Join(dir, "cmdline"), []byte(raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "io"), []byte("rchar: 10\nread_bytes: 500\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	want := t.TempDir()
+	dir := mk(99, router, "--alias M1 --model ./M1.gguf --mmproj ../asset/M1.mmproj")
+	if err := os.Symlink(want, filepath.Join(dir, "cwd")); err != nil {
+		t.Fatal(err)
+	}
+	mk(77, router, "--alias OTHER --model ./OTHER.gguf")
+
+	pid, model, extra := childForModel(root, router, "M1")
+	if pid != 99 {
+		t.Fatalf("child = %d, want 99", pid)
+	}
+	if model != filepath.Join(want, "M1.gguf") {
+		t.Fatalf("model path = %q", model)
+	}
+	if len(extra) != 1 || extra[0] != filepath.Join(want, "..", "asset", "M1.mmproj") {
+		t.Fatalf("mmproj = %v", extra)
+	}
+	if read, ok := procIO(root, 99); !ok || read != 500 {
+		t.Fatalf("io read_bytes = %d %v", read, ok)
+	}
+}
+
+func TestProgressRatioIsClamped(t *testing.T) {
+	cases := []struct {
+		read, base, total uint64
+		want              float64
+	}{
+		{100, 100, 1000, 0},
+		{600, 100, 1000, 0.5},
+		{5000, 0, 1000, 1},
+		{10, 0, 0, 0},
+	}
+	for _, c := range cases {
+		if got := ratio(c.read, c.base, c.total); got != c.want {
+			t.Fatalf("ratio(%d,%d,%d) = %v, want %v", c.read, c.base, c.total, got, c.want)
+		}
+	}
+}
+
+// The child's stdout carries the load marks; stderr carries cancellations. Reading only stderr
+// gave a line of 500s and no marks -- which is the noise the owner saw.
+func TestLoadLinesComeFromStdoutNotStderr(t *testing.T) {
+	dir := t.TempDir()
+	stdout := "load_tensors: loading model tensors, this can take a while\n" +
+		"llama_model_loader: loaded meta data\n"
+	stderr := "srv operator(): got exception: {\"error\":{\"code\":500,\"message\":\"request cancelled while waiting for model name=M1\"}}\n"
+	if err := os.WriteFile(filepath.Join(dir, "llama.log"), []byte(stdout), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "llama.err"), []byte(stderr), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b := newLoadBoard(dir)
+	b.observe("llama", map[string]string{"M1": "loading"})
+	b.refreshLogs([]string{"llama"})
+	e := findLoad(t, b.snapshot(), "llama", "M1")
+	if strings.Contains(e.Line, "request cancelled") || strings.Contains(e.Line, "500") {
+		t.Fatalf("the line came from stderr: %q", e.Line)
+	}
+	if !strings.Contains(e.Line, "load_tensors") && !strings.Contains(e.Line, "llama_model_loader") {
+		t.Fatalf("the line is not a load mark: %q", e.Line)
+	}
+}
