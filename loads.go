@@ -434,21 +434,24 @@ func (b *loadBoard) observeFromLog(slot string) {
 // after the model's most recent load line in the tail. A clean stop from a previous instance sits
 // before it, and 'exited with status 0' is not a failure at all.
 func failureAfterStart(lines []string, model string) string {
-	start := -1
+	start, last := -1, -1
 	for i, l := range lines {
 		if m := modelFromLoadLine(l); m != "" && m == model {
 			start = i
 		}
-	}
-	if start < 0 {
-		return ""
-	}
-	for i := len(lines) - 1; i > start; i-- {
-		if namesModel(lines[i], model) && isLoadFailure(lines[i]) {
-			return lines[i]
+		if namesModel(l, model) && isLoadFailure(l) {
+			last = i
 		}
 	}
-	return ""
+	if last < 0 {
+		return ""
+	}
+	// With a load line for this model, a failure before it belongs to an earlier attempt. With
+	// none in the window, the failure is all the evidence there is -- and it is real evidence.
+	if start >= 0 && last < start {
+		return ""
+	}
+	return lines[last]
 }
 
 func modelFromLoadLine(line string) string {
