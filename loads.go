@@ -117,10 +117,12 @@ func (b *loadBoard) observe(slot string, models map[string]string) {
 				b.entries[loadKey(slot, model)] = e
 			}
 			if e.Phase != loadFailed {
-				if e.Phase != loadLoading {
-					changed = append(changed, *e)
-				}
+				was := e.Phase
 				e.Phase = loadLoading
+				if was != loadLoading {
+					changed = append(changed, *e)
+					b.fire(*e)
+				}
 			}
 		case "unloaded":
 			if has {
@@ -152,25 +154,26 @@ func (b *loadBoard) observe(slot string, models map[string]string) {
 	}
 }
 
-func (b *loadBoard) fromLog(slot string) (string, *float64, *string) {
+func (b *loadBoard) fromLog(slot string) ([]string, *float64, *string) {
 	if b.logDir == "" {
-		return "", nil, nil
+		return nil, nil, nil
 	}
 	b.mu.Lock()
 	dir := b.logDir
 	b.mu.Unlock()
 	tail, err := tailFile(filepath.Join(dir, slot+".err"), 24<<10)
 	if err != nil {
-		return "", nil, nil
+		return nil, nil, nil
 	}
-	var line string
+	var lines []string
 	var progress *float64
 	var failure *string
 	for _, raw := range strings.Split(tail, "\n") {
 		if !hasLoadMark(raw) {
 			continue
 		}
-		line = strings.TrimSpace(raw)
+		line := strings.TrimSpace(raw)
+		lines = append(lines, line)
 		if p := percentIn(line); p >= 0 {
 			v := p
 			progress = &v
@@ -180,7 +183,19 @@ func (b *loadBoard) fromLog(slot string) (string, *float64, *string) {
 			failure = &msg
 		}
 	}
-	return line, progress, failure
+	return lines, progress, failure
+}
+
+func lineFor(lines []string, model string) string {
+	if len(lines) == 0 {
+		return ""
+	}
+	for i := len(lines) - 1; i >= 0; i-- {
+		if model != "" && strings.Contains(lines[i], model) {
+			return lines[i]
+		}
+	}
+	return lines[len(lines)-1]
 }
 
 func hasLoadMark(line string) bool {
@@ -288,17 +303,18 @@ func (b *loadBoard) forget(slot string) {
 
 func (b *loadBoard) refreshLogs(slots []string) {
 	for _, slot := range slots {
-		line, progress, failure := b.fromLog(slot)
-		if line == "" {
+		lines, progress, failure := b.fromLog(slot)
+		if len(lines) == 0 {
 			continue
 		}
+		var changed []modelLoad
 		b.mu.Lock()
 		for _, e := range b.entries {
 			if e.Slot != slot || e.Phase == loadReady {
 				continue
 			}
-			if e.Line == "" || e.Line != line {
-				e.Line = line
+			if pick := lineFor(lines, e.Model); pick != "" {
+				e.Line = pick
 			}
 			if progress != nil {
 				e.Progress = progress
@@ -308,9 +324,13 @@ func (b *loadBoard) refreshLogs(slots []string) {
 				e.Error = failure
 				now := time.Now().UnixMilli()
 				e.FinishedMS = &now
+				changed = append(changed, *e)
 			}
 		}
 		b.mu.Unlock()
+		for _, l := range changed {
+			b.fire(l)
+		}
 	}
 }
 
