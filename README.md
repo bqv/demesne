@@ -658,6 +658,12 @@ and it is also the boot hook that prevents the problem after a reboot.
 Do not "clean up" a `denied { remove_name }` on that node: `nvidia-modprobe` tries to unlink and
 recreate it, and the denial is the only thing keeping the correctly labelled node in place.
 
+**The mode must be set at creation: `mknod -m 666`.** A plain `mknod` followed by `chmod` looks
+equivalent and is not — `chmod` on this node's type is itself denied (it is the same `{ setattr }`
+noise in the audit log), so the node stays 0644 and CUDA fails with `EACCES` on open, because it
+opens the node read-write as the user. That is a *different* message from `invalid device: CUDA0`,
+which is exactly why a future reader staring at a 0644 node would not connect the two.
+
 ## What is still open
 
 - **log rotation** is real and unaddressed; the answer is probably a `logrotate` config outside
