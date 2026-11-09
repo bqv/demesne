@@ -2251,24 +2251,32 @@ func TestAFreshLoadResetsTheBaseline(t *testing.T) {
 	}
 }
 
-// A stopped on-demand engine must still be reachable by name: routing learns names from
-// /v1/models, so forgetting them when the engine stops means no request can name its models and
-// the slot is never asked to start -- the request silently falls back to the router instead.
-func TestAStoppedEnginesModelsStillRoute(t *testing.T) {
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"data":[{"id":"strata-only-model","status":{"value":"loaded"}}]}`)
-	}))
+// A slot's configured models are routable even when the engine cannot answer -- which is the
+// only way a stopped on-demand engine can be addressed by name at all.
+func TestAConfiguredModelRoutesWithoutTheEngine(t *testing.T) {
 	cfg := testConfig(t)
-	cfg.llama = engineConfig{url: up.URL, bin: "/usr/bin/llama-server"}
+	cfg.llama = engineConfig{url: "http://127.0.0.1:1", bin: "/usr/bin/llama-server",
+		models: []string{"strata-only-model"}}
 	d := newTestDemesne(t, cfg)
 	d.refreshModels()
 	if got := d.slotForModel("strata-only-model"); got != "llama" {
-		t.Fatalf("while up, routes to %q", got)
+		t.Fatalf("a configured model routed to %q", got)
 	}
-	up.Close()
-	d.refreshModels()
-	if got := d.slotForModel("strata-only-model"); got != "llama" {
-		t.Fatalf("after the engine stopped, the name was forgotten (routes to %q)", got)
+}
+
+func TestModelListFromAFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "models.list")
+	body := "# strata's fixed set\nqwen3.8-flash-next-coder-iq1_m\n\nother-id\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := modelList(path)
+	if len(got) != 2 || got[0] != "qwen3.8-flash-next-coder-iq1_m" || got[1] != "other-id" {
+		t.Fatalf("file list = %v", got)
+	}
+	if live := modelList("a b"); len(live) != 2 || live[1] != "b" {
+		t.Fatalf("inline list = %v", live)
 	}
 }
 

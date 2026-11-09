@@ -64,10 +64,11 @@ const (
 // engineConfig is one engine's static configuration: where it answers, what to run,
 // and the memory fence that used to live in its init script.
 type engineConfig struct {
-	url  string
-	bin  string
-	args []string
-	env  []string
+	url    string
+	bin    string
+	args   []string
+	env    []string
+	models []string
 	// dir is the child's working directory. It is not cosmetic: a router's models.ini
 	// names its weights relative to the models directory (`model = ./d1-2B-Q8_0.gguf`,
 	// `mmproj = ../asset/...`), so a router started anywhere else loads nothing.
@@ -166,6 +167,31 @@ func envInt(flagVal int, key string, def int) int {
 }
 
 func fields(s string) []string { return strings.Fields(s) }
+
+// modelList is a slot's configured model ids: a value that names an existing file is read as
+// one id per line (blank lines and #comments ignored), anything else is split as words. So a
+// fixed set can live in the conf as one line or in a file the conf points at.
+func modelList(v string) []string {
+	if v == "" {
+		return nil
+	}
+	if st, err := os.Stat(v); err == nil && st.Mode().IsRegular() {
+		b, err := os.ReadFile(v)
+		if err != nil {
+			return nil
+		}
+		var out []string
+		for _, line := range strings.Split(string(b), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			out = append(out, strings.Fields(line)...)
+		}
+		return out
+	}
+	return fields(v)
+}
 
 // memLimitFor reads a slot's memory fence from the environment. Env-only on purpose:
 // these are set once in conf.d/demesne, never typed on a command line, and there are
@@ -360,6 +386,7 @@ func loadConfig() config {
 			args:   fields(envString(*fSDArgs, "SD_ARGS", "")),
 			env:    fields(envString(*fSDEnv, "SD_ENV", "")),
 			dir:    envString(*fSDDir, "SD_DIR", ""),
+			models: modelList(envRaw("SD_MODELS")),
 			cgroup: memLimitFor(cgroupRoot, "sd", envRaw),
 		},
 		llama: engineConfig{
@@ -368,6 +395,7 @@ func loadConfig() config {
 			args:   fields(envString(*fLlamaArgs, "LLAMA_ARGS", "")),
 			env:    fields(envString(*fLlamaEnv, "LLAMA_ENV", "")),
 			dir:    envString(*fLlamaDir, "LLAMA_DIR", ""),
+			models: modelList(envRaw("LLAMA_MODELS")),
 			cgroup: memLimitFor(cgroupRoot, "llama", envRaw),
 		},
 		llamb: engineConfig{
@@ -376,6 +404,7 @@ func loadConfig() config {
 			args:   fields(envString(*fLlambArgs, "LLAMB_ARGS", "")),
 			env:    fields(envString(*fLlambEnv, "LLAMB_ENV", "")),
 			dir:    envString(*fLlambDir, "LLAMB_DIR", ""),
+			models: modelList(envRaw("LLAMB_MODELS")),
 			cgroup: memLimitFor(cgroupRoot, "llamb", envRaw),
 		},
 		whisper: engineConfig{
@@ -384,6 +413,7 @@ func loadConfig() config {
 			args:   fields(envString(*fWhisperArgs, "WHISPER_ARGS", "")),
 			env:    fields(envString(*fWhisperEnv, "WHISPER_ENV", "")),
 			dir:    envString(*fWhisperDir, "WHISPER_DIR", ""),
+			models: modelList(envRaw("WHISPER_MODELS")),
 			cgroup: memLimitFor(cgroupRoot, "whisper", envRaw),
 		},
 		strata: engineConfig{
@@ -392,6 +422,7 @@ func loadConfig() config {
 			args:   fields(envString(*fStrataArgs, "STRATA_ARGS", "")),
 			env:    fields(envString(*fStrataEnv, "STRATA_ENV", "")),
 			dir:    envString(*fStrataDir, "STRATA_DIR", ""),
+			models: modelList(envRaw("STRATA_MODELS")),
 			cgroup: memLimitFor(cgroupRoot, "strata", envRaw),
 		},
 		idle:          envDur(*fIdle, "IDLE", 5*time.Minute),
@@ -465,7 +496,8 @@ func buildSlots(c config) []slotSpec {
 		}
 		return slotSpec{
 			name: name, url: e.url, bin: e.bin, args: e.args, env: e.env, dir: e.dir,
-			group: group, vram: true, policy: pol, idle: idle,
+			models: e.models,
+			group:  group, vram: true, policy: pol, idle: idle,
 			routed: routed, router: true, fallback: true, cgroup: e.cgroup,
 		}
 	}

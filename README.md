@@ -638,6 +638,30 @@ the right program.
 | 5 | no syslog; unrotated logs | not solved, only narrowed: one `<slot>.{log,err}` pair per engine, still unrotated |
 | 6 | orphaned VRAM freezes the LLM side for 24 h | unchanged on purpose: a restart cannot free an orphaned context, and a loop would only hide the fault. `/status` shows the three reasons separately (`orphaned`, `degraded`, `last_error`) |
 
+### Models an engine serves but cannot advertise
+
+Routing learns a model name from the engine that advertises it on `/v1/models`. An engine that is
+*down* cannot advertise, so a request naming one of its models would find the name unknown and fall
+through to the router — and on 2026-11-09 that meant llama tried to load a model absent from its own
+`models.ini`, failed, and restored its previous model, putting an unrelated `d1` back on the 7900 XT.
+
+So a slot may declare its set:
+
+```sh
+export DEMESNE_STRATA_MODELS="qwen3.8-flash-next-coder-iq1_m"     # inline
+export DEMESNE_STRATA_MODELS=/etc/demesne/strata.models           # or a file, one id per line
+```
+
+The declared ids are routable even when the engine has never answered, so a stopped on-demand engine
+can be *named*, which is what makes `ensure()` spawn it. A live `/v1/models` answer wins a clash,
+because it is the engine's own word; the declared list is the fallback. Declaring a model the engine
+no longer serves makes a request route to it and fail loudly rather than silently landing on the
+router — which is the point: a wrong engine that says so beats a right-looking one that does not.
+
+Do not try to derive this list from the engine's data directory. On this box `/srv/strata` names the
+same model three different ways — directory `coder-IQ1_M`, shard `Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf`,
+advertised id `qwen3.8-flash-next-coder-iq1_m` — and only the last is what a request says.
+
 ### When every aux model load fails
 
 If `llamb` refuses every model with `error while handling argument "--device": invalid device: CUDA0`

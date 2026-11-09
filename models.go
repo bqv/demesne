@@ -53,17 +53,11 @@ type modelIndex struct {
 	// does not would leave `loaded` at zero for an engine that may be holding gigabytes,
 	// so its silence is treated as "cannot tell" rather than "empty".
 	known map[string]bool
-	// lastSeen is what each slot last advertised while it was up. It is what makes an
-	// on-demand engine reachable by name: routing learns names from /v1/models, so without
-	// this a stopped engine contributes nothing, no request can name its models, and the slot
-	// is never asked to start -- the request silently falls back to the router instead.
-	lastSeen map[string][]string
-	seen     time.Time
+	seen  time.Time
 }
 
 func newModelIndex() modelIndex {
-	return modelIndex{byModel: map[string]string{}, loaded: map[string]int{},
-		known: map[string]bool{}, lastSeen: map[string][]string{}}
+	return modelIndex{byModel: map[string]string{}, loaded: map[string]int{}, known: map[string]bool{}}
 }
 
 // refreshModels asks every router what it serves and swaps the map in one step.
@@ -71,49 +65,41 @@ func (d *demesne) refreshModels() {
 	next := make(map[string]string)
 	loaded := make(map[string]int)
 	known := make(map[string]bool)
-	answered := make(map[string]bool)
-	lastSeen := make(map[string][]string, len(d.models.lastSeen))
-	for slot, ids := range d.models.lastSeen {
-		lastSeen[slot] = ids
-	}
 	for _, s := range d.slots {
 		if !s.specOf().router || !s.specOf().routed {
 			continue
 		}
-		name := s.specOf().name
 		items := fetchModels(s.specOf().url, modelListTimeout)
 		if items != nil {
-			answered[name] = true
 			n, saw := countLoaded(items)
-			loaded[name], known[name] = n, saw
-			ids := modelIDs(items)
-			lastSeen[name] = ids
-			for _, id := range ids {
-				// First router wins a clash. Two routers advertising one id is a
-				// configuration mistake, and picking the earlier slot is at least stable.
-				if _, taken := next[id]; !taken {
-					next[id] = name
-				}
+			loaded[s.specOf().name], known[s.specOf().name] = n, saw
+		}
+		for _, id := range modelIDs(items) {
+			// First router wins a clash. Two routers advertising one id is a
+			// configuration mistake, and picking the earlier slot is at least stable.
+			if _, taken := next[id]; !taken {
+				next[id] = s.specOf().name
 			}
 		}
 	}
-	// A slot that did not answer keeps the names it last advertised, so a stopped on-demand
-	// engine is still chosen by name and therefore asked to start. A slot that DID answer
-	// replaces its list, so a removed model stops routing.
-	for slot, ids := range lastSeen {
-		if answered[slot] {
+	// A slot's configured models are routable even when the engine cannot answer: an on-demand
+	// or external engine that is down has no /v1/models to read, so without this its names are
+	// unknown after every restart and a request for one falls through to the router instead of
+	// reaching the slot (or refusing). A live answer wins a clash, because it is the engine's
+	// own word; the configured list is what the engine is known to serve.
+	for _, s := range d.slots {
+		if !s.specOf().router || !s.specOf().routed {
 			continue
 		}
-		for _, id := range ids {
+		for _, id := range s.specOf().models {
 			if _, taken := next[id]; !taken {
-				next[id] = slot
+				next[id] = s.specOf().name
 			}
 		}
 	}
 	d.models.mu.Lock()
 	changed := len(next) != len(d.models.byModel)
 	d.models.byModel, d.models.loaded, d.models.known = next, loaded, known
-	d.models.lastSeen = lastSeen
 	d.models.seen = time.Now()
 	d.models.mu.Unlock()
 	if changed {
@@ -121,8 +107,6 @@ func (d *demesne) refreshModels() {
 	}
 }
 
-// logModelIndex says once which engine owns which model, so "why did that go to the small
-// card" has an answer in the log and not only in the source.
 func (d *demesne) logModelIndex(byModel map[string]string) {
 	if len(byModel) == 0 {
 		log.Printf("routing by model: no router is advertising models; unknown models go to the default slot")

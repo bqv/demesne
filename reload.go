@@ -96,11 +96,12 @@ func enginesFrom(get func(string) string) (map[string]engineConfig, time.Duratio
 	engine := func(urlKey, slot, defaultURL string) engineConfig {
 		key := strings.ToUpper(slot)
 		return engineConfig{
-			url:  firstNonEmpty(get(urlKey), defaultURL),
-			bin:  get(key + "_BIN"),
-			args: fields(get(key + "_ARGS")),
-			env:  fields(get(key + "_ENV")),
-			dir:  get(key + "_DIR"),
+			url:    firstNonEmpty(get(urlKey), defaultURL),
+			bin:    get(key + "_BIN"),
+			args:   fields(get(key + "_ARGS")),
+			env:    fields(get(key + "_ENV")),
+			dir:    get(key + "_DIR"),
+			models: modelList(get(key + "_MODELS")),
 		}
 	}
 	cgroupRoot := firstNonEmpty(get("CGROUP_ROOT"), cgroupRootDefault)
@@ -205,6 +206,7 @@ func (d *demesne) reload() (reloadReport, error) {
 
 		want := cur
 		want.url, want.bin, want.args, want.env, want.dir = e.url, e.bin, e.args, e.env, e.dir
+		want.models = e.models
 		want.policy = policyFor(name, e.bin)
 		switch name {
 		case "sd":
@@ -263,7 +265,7 @@ func (d *demesne) reload() (reloadReport, error) {
 func specEqual(a, b slotSpec) bool {
 	return a.url == b.url && a.bin == b.bin && sameStrings(a.args, b.args) &&
 		sameStrings(a.env, b.env) && a.dir == b.dir && a.policy == b.policy &&
-		a.idle == b.idle && a.cgroup == b.cgroup
+		a.idle == b.idle && a.cgroup == b.cgroup && sameStrings(a.models, b.models)
 }
 
 func sameStrings(a, b []string) bool {

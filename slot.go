@@ -163,6 +163,11 @@ type slotSpec struct {
 	bin  string   // empty: the slot owns no child (policyExternal)
 	args []string // the child's whole command line
 	env  []string // extra KEY=VALUE for the child, appended to demesne's own
+	// models seeds the routing index for a slot that cannot answer yet: an on-demand or
+	// external engine that is down has no /v1/models to read, so without a seed its names are
+	// unknown after every demesne restart and a request for them falls through to the router.
+	// It is a seed, not a source of truth: the first answer from the engine replaces it.
+	models []string
 	// dir is the child's working directory. A router's models.ini names its weights
 	// relative to it, so this is load-bearing, not tidiness.
 	dir string
