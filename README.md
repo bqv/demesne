@@ -638,6 +638,26 @@ the right program.
 | 5 | no syslog; unrotated logs | not solved, only narrowed: one `<slot>.{log,err}` pair per engine, still unrotated |
 | 6 | orphaned VRAM freezes the LLM side for 24 h | unchanged on purpose: a restart cannot free an orphaned context, and a loop would only hide the fault. `/status` shows the three reasons separately (`orphaned`, `degraded`, `last_error`) |
 
+### When every aux model load fails
+
+If `llamb` refuses every model with `error while handling argument "--device": invalid device: CUDA0`
+and `ggml_cuda_init: failed to initialize CUDA: unknown error`, while `nvidia-smi` works and the driver
+is loaded, the problem is the CUDA device node, not demesne and not the driver:
+
+```sh
+ls -lZ /dev/nvidia-uvm          # must exist, be 0666, and be xserver_misc_device_t
+sudo /etc/local.d/nvidia-uvm.start
+```
+
+On this box udev does not run: `/dev` is devtmpfs, so a device node created at runtime keeps the
+default `device_t` label and nothing will relabel it. That is why CUDA cannot initialise while the
+driver is perfectly healthy. `/etc/local.d/nvidia-uvm.start` is idempotent — `mknod -m 666` only
+creates what is missing, `restorecon` relabels what is there — so running it by hand is the repair,
+and it is also the boot hook that prevents the problem after a reboot.
+
+Do not "clean up" a `denied { remove_name }` on that node: `nvidia-modprobe` tries to unlink and
+recreate it, and the denial is the only thing keeping the correctly labelled node in place.
+
 ## What is still open
 
 - **log rotation** is real and unaddressed; the answer is probably a `logrotate` config outside
