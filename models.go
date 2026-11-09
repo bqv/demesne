@@ -53,11 +53,17 @@ type modelIndex struct {
 	// does not would leave `loaded` at zero for an engine that may be holding gigabytes,
 	// so its silence is treated as "cannot tell" rather than "empty".
 	known map[string]bool
-	seen  time.Time
+	// lastSeen is what each slot last advertised while it was up. It is what makes an
+	// on-demand engine reachable by name: routing learns names from /v1/models, so without
+	// this a stopped engine contributes nothing, no request can name its models, and the slot
+	// is never asked to start -- the request silently falls back to the router instead.
+	lastSeen map[string][]string
+	seen     time.Time
 }
 
 func newModelIndex() modelIndex {
-	return modelIndex{byModel: map[string]string{}, loaded: map[string]int{}, known: map[string]bool{}}
+	return modelIndex{byModel: map[string]string{}, loaded: map[string]int{},
+		known: map[string]bool{}, lastSeen: map[string][]string{}}
 }
 
 // refreshModels asks every router what it serves and swaps the map in one step.
@@ -65,26 +71,49 @@ func (d *demesne) refreshModels() {
 	next := make(map[string]string)
 	loaded := make(map[string]int)
 	known := make(map[string]bool)
+	answered := make(map[string]bool)
+	lastSeen := make(map[string][]string, len(d.models.lastSeen))
+	for slot, ids := range d.models.lastSeen {
+		lastSeen[slot] = ids
+	}
 	for _, s := range d.slots {
 		if !s.specOf().router || !s.specOf().routed {
 			continue
 		}
+		name := s.specOf().name
 		items := fetchModels(s.specOf().url, modelListTimeout)
 		if items != nil {
+			answered[name] = true
 			n, saw := countLoaded(items)
-			loaded[s.specOf().name], known[s.specOf().name] = n, saw
+			loaded[name], known[name] = n, saw
+			ids := modelIDs(items)
+			lastSeen[name] = ids
+			for _, id := range ids {
+				// First router wins a clash. Two routers advertising one id is a
+				// configuration mistake, and picking the earlier slot is at least stable.
+				if _, taken := next[id]; !taken {
+					next[id] = name
+				}
+			}
 		}
-		for _, id := range modelIDs(items) {
-			// First router wins a clash. Two routers advertising one id is a
-			// configuration mistake, and picking the earlier slot is at least stable.
+	}
+	// A slot that did not answer keeps the names it last advertised, so a stopped on-demand
+	// engine is still chosen by name and therefore asked to start. A slot that DID answer
+	// replaces its list, so a removed model stops routing.
+	for slot, ids := range lastSeen {
+		if answered[slot] {
+			continue
+		}
+		for _, id := range ids {
 			if _, taken := next[id]; !taken {
-				next[id] = s.specOf().name
+				next[id] = slot
 			}
 		}
 	}
 	d.models.mu.Lock()
 	changed := len(next) != len(d.models.byModel)
 	d.models.byModel, d.models.loaded, d.models.known = next, loaded, known
+	d.models.lastSeen = lastSeen
 	d.models.seen = time.Now()
 	d.models.mu.Unlock()
 	if changed {

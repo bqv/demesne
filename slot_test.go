@@ -2250,3 +2250,48 @@ func TestAFreshLoadResetsTheBaseline(t *testing.T) {
 			e.ioBase, e.ioBaseSet, e.total, e.childPID)
 	}
 }
+
+// A stopped on-demand engine must still be reachable by name: routing learns names from
+// /v1/models, so forgetting them when the engine stops means no request can name its models and
+// the slot is never asked to start -- the request silently falls back to the router instead.
+func TestAStoppedEnginesModelsStillRoute(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"data":[{"id":"strata-only-model","status":{"value":"loaded"}}]}`)
+	}))
+	cfg := testConfig(t)
+	cfg.llama = engineConfig{url: up.URL, bin: "/usr/bin/llama-server"}
+	d := newTestDemesne(t, cfg)
+	d.refreshModels()
+	if got := d.slotForModel("strata-only-model"); got != "llama" {
+		t.Fatalf("while up, routes to %q", got)
+	}
+	up.Close()
+	d.refreshModels()
+	if got := d.slotForModel("strata-only-model"); got != "llama" {
+		t.Fatalf("after the engine stopped, the name was forgotten (routes to %q)", got)
+	}
+}
+
+// And a slot that answers again replaces its list, so a model it no longer serves stops routing.
+func TestAReansweredListDropsRemovedModels(t *testing.T) {
+	list := `{"data":[{"id":"M1","status":{"value":"loaded"}},{"id":"M2","status":{"value":"loaded"}}]}`
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, list)
+	}))
+	defer up.Close()
+	cfg := testConfig(t)
+	cfg.llama = engineConfig{url: up.URL, bin: "/usr/bin/llama-server"}
+	d := newTestDemesne(t, cfg)
+	d.refreshModels()
+	if d.slotForModel("M2") != "llama" {
+		t.Fatal("M2 did not route while listed")
+	}
+	list = `{"data":[{"id":"M1","status":{"value":"loaded"}}]}`
+	d.refreshModels()
+	d.models.mu.Lock()
+	_, still := d.models.byModel["M2"]
+	d.models.mu.Unlock()
+	if still {
+		t.Fatal("a removed model kept routing")
+	}
+}
