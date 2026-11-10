@@ -147,7 +147,7 @@ func (d *demesne) handleFIM(w http.ResponseWriter, r *http.Request) {
 // deadline.
 func (d *demesne) streamFIM(w http.ResponseWriter, r *http.Request, s *tenant, payload []byte, id, model string) {
 	url := strings.TrimRight(s.specOf().url, "/") + "/infill"
-	out, resp, done, err := d.streamUpstream(w, r, url, payload)
+	out, resp, done, err := d.streamUpstream(w, r, url, payload, s)
 	defer done()
 	if err != nil || resp == nil {
 		return

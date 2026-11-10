@@ -871,7 +871,7 @@ func (d *demesne) route(w http.ResponseWriter, r *http.Request, in intent) {
 			writeModelNotFound(w, pk.model, d.knownModels())
 			return
 		}
-		if pk.model != "" && isRouterTenant(d.index[in.tenant].specOf().bin) {
+		if pk.model != "" && d.index[in.tenant].specOf().own() {
 			d.loads.noteRequest(in.tenant, pk.model)
 		}
 	}
@@ -932,8 +932,22 @@ func (d *demesne) route(w http.ResponseWriter, r *http.Request, in intent) {
 			return
 		}
 		if pk.stream {
+			// The stream opens first and keeps itself alive while the engine starts, so the
+			// spawn runs beside it rather than in front of it: a cold 27B must not hold the
+			// first byte for a minute.
+			if s.specOf().own() {
+				go d.spawnForStream(s)
+			}
 			d.streamChat(w, r, s, pk.body)
 			return
+		}
+		if s.specOf().own() {
+			err := d.ensure(s)
+			if err != nil {
+				log.Printf("%s request refused: %v", s.specOf().name, err)
+				http.Error(w, "demesne: "+err.Error(), http.StatusServiceUnavailable)
+				return
+			}
 		}
 		d.proxies[s.specOf().name].ServeHTTP(w, r)
 	}

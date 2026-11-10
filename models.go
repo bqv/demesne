@@ -69,7 +69,7 @@ func (d *demesne) seedModels() {
 		if !s.specOf().router || !s.specOf().routed {
 			continue
 		}
-		for _, id := range s.specOf().models {
+		for _, id := range append(append([]string{}, s.specOf().models...), s.specOf().aliases...) {
 			if _, taken := byModel[id]; !taken {
 				byModel[id] = s.specOf().name
 			}
@@ -112,10 +112,10 @@ func (d *demesne) refreshModels() {
 	// reaching the tenant (or refusing). A live answer wins a clash, because it is the engine's
 	// own word; the configured list is what the engine is known to serve.
 	for _, s := range d.tenants {
-		if !s.specOf().router || !s.specOf().routed {
+		if !s.specOf().routed {
 			continue
 		}
-		for _, id := range s.specOf().models {
+		for _, id := range append(append([]string{}, s.specOf().models...), s.specOf().aliases...) {
 			if _, taken := next[id]; !taken {
 				next[id] = s.specOf().name
 			}

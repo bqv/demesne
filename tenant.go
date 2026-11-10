@@ -583,7 +583,12 @@ func (d *demesne) waitReady(s *tenant, limit time.Duration) error {
 			return errors.New("the child exited while starting")
 		}
 		if portAlive(s.specOf().url) {
-			return nil
+			// A single-model llama-server binds its socket BEFORE the weights are ready and
+			// answers 503 "Loading model" meanwhile, so a dial alone is not readiness: the
+			// first request would be relayed that 503. Ask the engine.
+			if len(s.specOf().models) == 0 || d.modelAnswers(s) {
+				return nil
+			}
 		}
 		select {
 		case <-d.done:
@@ -592,6 +597,28 @@ func (d *demesne) waitReady(s *tenant, limit time.Duration) error {
 		}
 	}
 	return fmt.Errorf("timed out after %s", limit)
+}
+
+func (d *demesne) modelAnswers(s *tenant) bool {
+	client := http.DefaultClient
+	base := strings.TrimRight(s.specOf().url, "/")
+	if path := unixPath(s.specOf().url); path != "" {
+		client = &http.Client{Transport: unixDialer(path)}
+		base = "http://unix-socket"
+	}
+	req, err := http.NewRequest(http.MethodGet, base+"/health", nil)
+	if err != nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	resp, err := client.Do(req.WithContext(ctx))
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	return resp.StatusCode < 500
 }
 
 // reap notices an exit without waiting for a request to fail.

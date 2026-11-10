@@ -110,7 +110,13 @@ func (s *sse) copyFrom(src io.Reader) error {
 
 // streamUpstream answers the client, then asks the engine. The returned cleanup must be
 // deferred; it stops the heartbeat and releases the upstream context and body.
-func (d *demesne) streamUpstream(w http.ResponseWriter, r *http.Request, url string, body []byte) (*sse, *http.Response, func(), error) {
+func (d *demesne) spawnForStream(s *tenant) {
+	if err := d.ensure(s); err != nil {
+		log.Printf("%s: streaming request could not start the engine: %v", s.specOf().name, err)
+	}
+}
+
+func (d *demesne) streamUpstream(w http.ResponseWriter, r *http.Request, url string, body []byte, waitFor *tenant) (*sse, *http.Response, func(), error) {
 	out := newSSE(w)
 
 	// Deliberately NOT r.Context(): see the file comment. This context is cancelled only when
@@ -147,20 +153,34 @@ func (d *demesne) streamUpstream(w http.ResponseWriter, r *http.Request, url str
 		}
 	}()
 
-	req, err := http.NewRequestWithContext(ctx, r.Method, url, bytes.NewReader(body))
-	if err != nil {
-		cleanup()
-		out.event("error", map[string]any{"message": err.Error(), "code": http.StatusInternalServerError})
-		return out, nil, cleanup, err
-	}
-	if ct := r.Header.Get("Content-Type"); ct != "" {
-		req.Header.Set("Content-Type", ct)
-	}
-	if auth := r.Header.Get("Authorization"); auth != "" {
-		req.Header.Set("Authorization", auth)
+	attempt := func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, r.Method, url, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		if ct := r.Header.Get("Content-Type"); ct != "" {
+			req.Header.Set("Content-Type", ct)
+		}
+		if auth := r.Header.Get("Authorization"); auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		return http.DefaultClient.Do(req)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := attempt()
+	if waitFor != nil {
+		// A cold engine has no socket yet, and the dial would fail immediately. Wait for it
+		// rather than answer an error: the ticker above is already telling the client it is
+		// loading, and a stream that arrives is worth more than one that gives up.
+		deadline := time.Now().Add(d.cfg.loadWait)
+		for err != nil && time.Now().Before(deadline) && r.Context().Err() == nil {
+			select {
+			case <-time.After(200 * time.Millisecond):
+			case <-r.Context().Done():
+			}
+			resp, err = attempt()
+		}
+	}
 	if err != nil {
 		cleanup()
 		if r.Context().Err() == nil {
@@ -197,7 +217,7 @@ func (d *demesne) streamUpstream(w http.ResponseWriter, r *http.Request, url str
 // streamChat is the chat path when the caller asked for a stream: answer, then relay.
 func (d *demesne) streamChat(w http.ResponseWriter, r *http.Request, s *tenant, body []byte) {
 	url := strings.TrimRight(s.specOf().url, "/") + r.URL.Path
-	out, resp, done, err := d.streamUpstream(w, r, url, body)
+	out, resp, done, err := d.streamUpstream(w, r, url, body, s)
 	defer done()
 	if err != nil || resp == nil {
 		return
