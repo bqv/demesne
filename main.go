@@ -1148,7 +1148,7 @@ func (d *demesne) status(w http.ResponseWriter) {
 	used, _ := vramUsed()
 	statuses := d.tenantStatuses()
 	out := map[string]any{
-		// The estate, as tenants. "slots" is the deprecated alias hgtop still reads.
+		// The estate, as tenants.
 		"version":         version,
 		"listen":          d.cfg.listen,
 		"socket":          d.cfg.socket,
@@ -1156,7 +1156,6 @@ func (d *demesne) status(w http.ResponseWriter) {
 		"media_in_flight": inflight,
 		"llm_health":      d.llm.snapshot(),
 		"tenants":         statuses,
-		"slots":           statuses,
 		"loads":           d.loads.snapshot(),
 
 		// stadi's field names, kept because DSH and the habit of a year read them.
