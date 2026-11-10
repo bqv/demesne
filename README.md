@@ -649,7 +649,20 @@ export DEMESNE_STRATA_ARGS="--host /run/user/1000/models/strata.sock ..."
 ```
 
 Liveness is a **dial**, never a `stat`: `ENOENT` and `ECONNREFUSED` both mean dead, and a socket
-file left behind by a `SIGKILL` is not an engine. Because the installed engine does not unlink on
+file left behind by a `SIGKILL` is not an engine.
+
+The directory the socket lives in is **demesne's**: `pam` creates `/run/user/<uid>` and nothing
+creates its children, so before spawning demesne makes the parent directory `0700` — and refuses a
+path that exists as anything but a directory it owns and that no group or other user can write to.
+A socket directory anything else can write to is a squatting race, the same class as a squatted port.
+
+**The fence must exceed the model, not the VRAM figure.** A CPU-only load (`-ngl 0`) holds the whole
+file in host RAM, so an on-demand slot carrying a 1.7 GiB model needs a cgroup limit above ~1.7 GiB;
+the VRAM number that matters for a GPU load says nothing here. A 2 GiB `memory.max` silently
+OOM-kills such a load and the failure reads exactly like a broken unix path.
+
+Nothing prints "port in use" for a socket: the messages say *socket path*, and the hint an operator
+needs is `ss -xlp | grep <path>`, not `fuser -n tcp`. Because the installed engine does not unlink on
 bind or on exit, **demesne's launcher owns the file**: before spawning it removes a file that
 nothing answers on (and only if it is a socket — a regular file is refused, not clobbered), and
 `ENOENT` during that removal is success so a concurrent cleanup cannot fail a spawn. Reclaim finds

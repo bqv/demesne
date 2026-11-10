@@ -2509,3 +2509,42 @@ func TestAUnixSlotNeedsNoPort(t *testing.T) {
 		t.Fatal("two slots on one TCP port were accepted")
 	}
 }
+
+// The socket directory is the launcher's to make and to refuse: /run/user/<uid> is created by pam,
+// its children are not, and a directory anything else can write to is a squatting race.
+func TestTheSocketDirectoryIsOursOrRefused(t *testing.T) {
+	base := t.TempDir()
+	path := filepath.Join(base, "models", "d1.sock")
+	if err := ensureSocketDir(path); err != nil {
+		t.Fatalf("a missing directory was not created: %v", err)
+	}
+	fi, err := os.Stat(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if fi.Mode().Perm() != 0o700 {
+		t.Fatalf("mode = %o, want 700", fi.Mode().Perm())
+	}
+	if err := ensureSocketDir(path); err != nil {
+		t.Fatalf("an existing good directory was refused: %v", err)
+	}
+
+	loose := filepath.Join(base, "loose")
+	if err := os.Mkdir(loose, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(loose, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureSocketDir(filepath.Join(loose, "x.sock")); err == nil {
+		t.Fatal("a world-writable directory was accepted")
+	}
+
+	afile := filepath.Join(base, "afile")
+	if err := os.WriteFile(afile, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureSocketDir(filepath.Join(afile, "x.sock")); err == nil {
+		t.Fatal("a regular file standing in for the directory was accepted")
+	}
+}

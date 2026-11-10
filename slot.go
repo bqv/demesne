@@ -494,6 +494,9 @@ func (d *demesne) spawnLocked(s *slot) error {
 	}
 
 	if path := unixPath(s.specOf().url); path != "" {
+		if err := ensureSocketDir(path); err != nil {
+			return fmt.Errorf("%s: %w", s.specOf().name, err)
+		}
 		if fi, err := os.Lstat(path); err == nil {
 			if fi.Mode()&os.ModeSocket == 0 {
 				return fmt.Errorf("%s exists and is not a socket; refusing to clobber it", path)
@@ -1030,6 +1033,30 @@ func waitPort(base string, limit time.Duration, done <-chan struct{}) error {
 // an http URL with no port would otherwise look like a path.
 // endpointName is how a slot's address is described to an operator: a port for TCP, a socket
 // path for AF_UNIX. Messages that say "port" about a socket send people to the wrong tool.
+// ensureSocketDir makes the directory a unix slot's socket lives in, and refuses one it does not
+// own: /run/user/<uid> is created by pam and its children are not, so something has to own the
+// directory -- and a socket directory anything else can write to is a squatting race.
+func ensureSocketDir(path string) error {
+	dir := filepath.Dir(path)
+	fi, err := os.Stat(dir)
+	if err == nil {
+		if !fi.IsDir() {
+			return fmt.Errorf("%s exists and is not a directory", dir)
+		}
+		if fi.Mode().Perm()&0o022 != 0 {
+			return fmt.Errorf("%s is group- or world-writable; refusing to put a socket there", dir)
+		}
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Getuid() {
+			return fmt.Errorf("%s belongs to uid %d, not to us", dir, st.Uid)
+		}
+		return nil
+	}
+	if !os.IsNotExist(err) {
+		return err
+	}
+	return os.MkdirAll(dir, 0o700)
+}
+
 func (s *slot) endpointHint() string {
 	if path := unixPath(s.specOf().url); path != "" {
 		return "ss -xlp | grep " + path
