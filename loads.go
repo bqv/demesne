@@ -93,6 +93,42 @@ func (b *loadBoard) fire(l modelLoad) {
 	}
 }
 
+// noteLoading starts (or rejoins) a load row for a tenant that has no way to report its
+// own state: a per-model llama-server answers /v1/models only with its one model, and demesne
+// is the one that asked for the spawn.
+func (b *loadBoard) noteLoading(tenant, model string) {
+	b.mu.Lock()
+	e, ok := b.entries[loadKey(tenant, model)]
+	if !ok {
+		e = &modelLoad{Tenant: tenant, Model: model, StartedMS: time.Now().UnixMilli()}
+		b.entries[loadKey(tenant, model)] = e
+	}
+	e.Phase = loadLoading
+	e.Error, e.FinishedMS = nil, nil
+	snap := *e
+	b.mu.Unlock()
+	b.fire(snap)
+}
+
+// notePhase closes a row it opened: ready when the engine answered, failed with the reason.
+func (b *loadBoard) notePhase(tenant, model, phase string, cause error) {
+	b.mu.Lock()
+	e, ok := b.entries[loadKey(tenant, model)]
+	if !ok {
+		e = &modelLoad{Tenant: tenant, Model: model, StartedMS: time.Now().UnixMilli()}
+		b.entries[loadKey(tenant, model)] = e
+	}
+	now := time.Now().UnixMilli()
+	e.Phase, e.FinishedMS = phase, &now
+	if cause != nil {
+		msg := cause.Error()
+		e.Error = &msg
+	}
+	snap := *e
+	b.mu.Unlock()
+	b.fire(snap)
+}
+
 func (b *loadBoard) observe(tenant string, models map[string]string) {
 	var changed []modelLoad
 	defer func() {

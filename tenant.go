@@ -426,7 +426,19 @@ func (d *demesne) ensureLocked(s *tenant) error {
 	if err := d.clearGroupLocked(s); err != nil {
 		return err
 	}
-	return d.spawnLocked(s)
+	model := firstModel(s.specOf())
+	if model != "" {
+		d.loads.noteLoading(s.specOf().name, model)
+	}
+	err := d.spawnLocked(s)
+	if model != "" {
+		if err != nil {
+			d.loads.notePhase(s.specOf().name, model, loadFailed, err)
+		} else {
+			d.loads.notePhase(s.specOf().name, model, loadReady, nil)
+		}
+	}
+	return err
 }
 
 func (s tenantSpec) own() bool { return s.bin != "" && s.policy != policyExternal }

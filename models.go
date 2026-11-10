@@ -285,6 +285,9 @@ func cardLabel(spec tenantSpec) string {
 	case "aux":
 		return "GT1030"
 	}
+	if !spec.vram {
+		return "CPU"
+	}
 	return spec.name
 }
 

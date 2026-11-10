@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -181,5 +182,27 @@ func TestTheTenantLogIsInNameOrder(t *testing.T) {
 	}
 	if !strings.Contains(lines[0], "vram_mb=?") || !strings.Contains(lines[0], "reload_s=?") {
 		t.Fatalf("an undeclared tenant should say so: %q", lines[0])
+	}
+}
+
+// A per-model tenant cannot report its own load state: its engine answers /v1/models with one
+// model and nothing else, so the board is told by the side that asked for the spawn.
+func TestAPerModelTenantGetsALoadRow(t *testing.T) {
+	b := newLoadBoard(t.TempDir())
+	b.noteLoading("spark", "spark")
+	snap := b.snapshot()
+	if len(snap) != 1 || snap[0].Phase != loadLoading || snap[0].Tenant != "spark" {
+		t.Fatalf("after noteLoading: %+v", snap)
+	}
+	b.notePhase("spark", "spark", loadReady, nil)
+	snap = b.snapshot()
+	if len(snap) != 1 || snap[0].Phase != loadReady || snap[0].FinishedMS == nil {
+		t.Fatalf("after notePhase(ready): %+v", snap)
+	}
+	b.noteLoading("spark", "spark")
+	b.notePhase("spark", "spark", loadFailed, errors.New("the child exited while starting"))
+	snap = b.snapshot()
+	if snap[0].Phase != loadFailed || snap[0].Error == nil {
+		t.Fatalf("after notePhase(failed): %+v", snap)
 	}
 }
