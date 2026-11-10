@@ -80,7 +80,7 @@ func writeSlots(t *testing.T, body string) string {
 
 func TestASlotFileDefinesAndOverrides(t *testing.T) {
 	cfg := goldenConfig()
-	cfg.slotsFile = writeSlots(t, `
+	path := writeSlots(t, `
 [llama]
 url = http://127.0.0.1:55556
 models = m1, m2
@@ -97,7 +97,7 @@ group = gpu
 vram_mb = 3200
 idle = 5m
 `)
-	specs, notes, err := slotsFromConfig(cfg)
+	specs, notes, err := slotsFromFile(cfg, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,8 +162,7 @@ models = b
 	}
 	for name, body := range cases {
 		cfg := goldenConfig()
-		cfg.slotsFile = writeSlots(t, body)
-		if _, _, err := slotsFromConfig(cfg); err == nil {
+		if _, _, err := slotsFromFile(cfg, writeSlots(t, body)); err == nil {
 			t.Fatalf("%s was accepted", name)
 		}
 	}

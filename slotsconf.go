@@ -193,12 +193,9 @@ func (c config) memLimits(slot string, kv map[string]string) memLimit {
 	return m
 }
 
-func slotsFromConfig(c config) ([]slotSpec, []string, error) {
+func slotsFromFile(c config, path string) ([]slotSpec, []string, error) {
 	base := buildSlots(c)
-	if c.slotsFile == "" {
-		return base, nil, nil
-	}
-	sections, err := parseSlotsFile(c.slotsFile)
+	sections, err := parseSlotsFile(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("slots file: %w", err)
 	}
@@ -214,7 +211,7 @@ func slotsFromConfig(c config) ([]slotSpec, []string, error) {
 		}
 		if old, ok := byName[sp.name]; ok {
 			notes = append(notes, fmt.Sprintf("%s: defined in %s, replacing the built-in default (%s %s)",
-				sp.name, c.slotsFile, old.policy, old.url))
+				sp.name, path, old.policy, old.url))
 		}
 		byName[sp.name] = sp
 	}
@@ -229,23 +226,6 @@ func sortedSpecs(in []slotSpec) []slotSpec {
 	out := append([]slotSpec(nil), in...)
 	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
 	return out
-}
-
-func runCheck(cfg config) {
-	specs, notes, err := slotsFromConfig(cfg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "demesne: %v\n", err)
-		os.Exit(1)
-	}
-	for _, note := range notes {
-		fmt.Println("note: " + note)
-	}
-	for _, sp := range sortedSpecs(specs) {
-		fmt.Println(slotLogLine(sp))
-	}
-	if len(notes) > 0 {
-		fmt.Printf("%d slot(s) replaced a built-in default\n", len(notes))
-	}
 }
 
 func sortedSlotPtrs(in []*slot) []*slot {

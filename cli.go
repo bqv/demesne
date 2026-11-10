@@ -81,9 +81,6 @@ func runSubcommand(sub string, cfg config) {
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 		return
-	case "check":
-		runCheck(cfg)
-		return
 	case "status", "release", "load", "start", "stop", "reload":
 	default:
 		fmt.Fprintf(os.Stderr, "demesne: unknown subcommand %q\n\n%s", sub, usage)

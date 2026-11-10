@@ -81,7 +81,6 @@ type config struct {
 	listen                            string // where demesne itself listens (the port DSH uses)
 	socket                            string // the same API on a unix socket; empty = no socket
 	confFile                          string // what SIGHUP re-reads; empty = nothing to reload from
-	slotsFile                         string // slots.ini describing every engine; empty = the built-in five
 	sd, llama, llamb, whisper, strata engineConfig
 	idle                              time.Duration // evict an on-demand child after this
 	whisperIdle                       time.Duration
@@ -298,10 +297,10 @@ func defaultRCService() string {
 
 func loadConfig() config {
 	var (
-		fListen  = flag.String("listen", "", "address to listen on (env "+envPrefix+"LISTEN)")
-		fSocket  = flag.String("socket", "", "serve the same API on this unix socket too (env "+envPrefix+"SOCKET)")
-		fConf    = flag.String("conf", "", "the configuration file SIGHUP re-reads (env "+envPrefix+"CONF)")
-		fSlots   = flag.String("slots", "", "slots file describing every engine (env "+envPrefix+"SLOTS)")
+		fListen = flag.String("listen", "", "address to listen on (env "+envPrefix+"LISTEN)")
+		fSocket = flag.String("socket", "", "serve the same API on this unix socket too (env "+envPrefix+"SOCKET)")
+		fConf   = flag.String("conf", "", "the configuration file SIGHUP re-reads (env "+envPrefix+"CONF)")
+
 		fLLM     = flag.String("llm", "", "the llama router's base URL (env "+envPrefix+"LLM)")
 		fSD      = flag.String("sd", "", "URL the sd child comes up on (env "+envPrefix+"SD)")
 		fLlamb   = flag.String("llamb", "", "the auxiliary router's base URL (env "+envPrefix+"LLAMB)")
@@ -380,10 +379,9 @@ func loadConfig() config {
 	cgroupRoot := envString(*fCgroup, "CGROUP_ROOT", cgroupRootDefault)
 
 	return config{
-		listen:    envString(*fListen, "LISTEN", "127.0.0.1:55558"),
-		socket:    envString(*fSocket, "SOCKET", ""),
-		confFile:  envString(*fConf, "CONF", ""),
-		slotsFile: envString(*fSlots, "SLOTS", ""),
+		listen:   envString(*fListen, "LISTEN", "127.0.0.1:55558"),
+		socket:   envString(*fSocket, "SOCKET", ""),
+		confFile: envString(*fConf, "CONF", ""),
 		sd: engineConfig{
 			url:    envString(*fSD, "SD", defaultSDURL),
 			bin:    envString(*fSDBin, "SD_BIN", defaultBin("sd-server")),
@@ -578,8 +576,8 @@ type demesne struct {
 	history *history   // the last transitions, for the cards
 
 	startedAt time.Time
-	slotNotes []string
-	slotsErr  error
+	specNotes []string
+	specErr   error
 
 	done    chan struct{}
 	closing atomic.Bool
@@ -599,12 +597,7 @@ func newDemesne(cfg config) *demesne {
 		done:      make(chan struct{}),
 	}
 	d.models = newModelIndex()
-	specs, notes, err := slotsFromConfig(cfg)
-	d.slotNotes, d.slotsErr = notes, err
-	if err != nil {
-		specs = sortedSpecs(buildSlots(cfg))
-	}
-	for _, spec := range specs {
+	for _, spec := range buildSlots(cfg) {
 		s := &slot{spec: spec, owner: d}
 		d.slots = append(d.slots, s)
 		d.index[spec.name] = s
@@ -1390,14 +1383,8 @@ func main() {
 	}
 
 	d := newDemesne(cfg)
-	if d.slotsErr != nil {
-		log.Fatal(d.slotsErr)
-	}
 	if err := cfg.validate(d.slots); err != nil {
 		log.Fatal(err)
-	}
-	for _, note := range d.slotNotes {
-		log.Printf("slots: %s", note)
 	}
 
 	log.Printf("listening on %s | llama %s | sd %s | whisper %s | llamb %s | idle %s | vram %s",
@@ -1405,8 +1392,13 @@ func main() {
 	if cfg.socket != "" {
 		log.Printf("the same API is also on unix:%s (mode 0600)", cfg.socket)
 	}
-	for _, s := range sortedSlotPtrs(d.slots) {
-		log.Print(slotLogLine(s.specOf()))
+	for _, s := range d.slots {
+		note := ""
+		if s.specOf().policy == policyExternal {
+			note = " (external: routed, not owned)"
+		}
+		log.Printf("slot %-8s %-24s policy=%-10s group=%-4s%v",
+			s.specOf().name, s.specOf().url, s.specOf().policy, orNone(s.specOf().group), note)
 	}
 
 	// A port answering before demesne started the engine is either a leftover or
