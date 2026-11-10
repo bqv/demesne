@@ -36,11 +36,13 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -491,6 +493,20 @@ func (d *demesne) spawnLocked(s *slot) error {
 		return fmt.Errorf("open %s stderr: %w", s.specOf().name, err)
 	}
 
+	if path := unixPath(s.specOf().url); path != "" {
+		if fi, err := os.Lstat(path); err == nil {
+			if fi.Mode()&os.ModeSocket == 0 {
+				return fmt.Errorf("%s exists and is not a socket; refusing to clobber it", path)
+			}
+			if !portAliveWithin(s.specOf().url, 150*time.Millisecond) {
+				// A socket file left by a SIGKILL: nothing answers, and nothing will remove
+				// it for us, so the launcher does.
+				_ = os.Remove(path)
+			} else {
+				return fmt.Errorf("%s is already served by another process", path)
+			}
+		}
+	}
 	cmd := exec.Command(s.specOf().bin, s.specOf().args...)
 	cmd.Dir = s.specOf().dir
 	cmd.Stdout, cmd.Stderr = out, errf
@@ -959,6 +975,16 @@ func openLog(dir, name string) (*os.File, error) {
 func portAlive(base string) bool { return portAliveWithin(base, 750*time.Millisecond) }
 
 func portAliveWithin(base string, timeout time.Duration) bool {
+	if path := unixPath(base); path != "" {
+		// Dial, never stat: a socket file left by a SIGKILL is not a live engine, and the
+		// child (or the launcher) removes it. ENOENT and ECONNREFUSED are both "dead".
+		c, err := net.DialTimeout("unix", path, timeout)
+		if err != nil {
+			return false
+		}
+		c.Close()
+		return true
+	}
 	hp := uriHostPort(base)
 	if hp == "" {
 		return false
@@ -969,6 +995,17 @@ func portAliveWithin(base string, timeout time.Duration) bool {
 	}
 	c.Close()
 	return true
+}
+
+// unixDialer is the transport a unix slot's proxy needs: the request URL is a placeholder,
+// and every connection goes to the socket path.
+func unixDialer(path string) *http.Transport {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "unix", path)
+	}
+	return tr
 }
 
 // waitPort bounds the wait for a child's port. done makes it interruptible, so a
@@ -986,6 +1023,19 @@ func waitPort(base string, limit time.Duration, done <-chan struct{}) error {
 		}
 	}
 	return fmt.Errorf("timed out after %s", limit)
+}
+
+// unixPath is a slot's AF_UNIX endpoint, or "" for a TCP one. The scheme is the only marker:
+// an http URL with no port would otherwise look like a path.
+func unixPath(base string) string {
+	u, err := url.Parse(base)
+	if err != nil || u.Scheme != "unix" {
+		return ""
+	}
+	if u.Path == "" || !strings.HasPrefix(u.Path, "/") {
+		return ""
+	}
+	return u.Path
 }
 
 func uriHostPort(base string) string {

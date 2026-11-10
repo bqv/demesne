@@ -227,44 +227,50 @@ func routerModels(base string) ([]string, error) {
 
 // recoverLLM is the only mutation in this file. It runs in its own goroutine so the
 // failed request returns immediately instead of waiting out a model load.
-func (d *demesne) recoverLLM(reason string) {
-	if !d.llm.budget(time.Now(), d.cfg.restartWindow, d.cfg.restartMax) {
+func (d *demesne) recoverLLM(s *slot, reason string) {
+	watcher := d.watchFor(s.specOf().name)
+	if !watcher.budget(time.Now(), d.cfg.restartWindow, d.cfg.restartMax) {
 		log.Printf("watch: llama failed (%s) but no restart is allowed now "+
 			"(budget spent, or an earlier restart is still finishing) -- failing fast", reason)
 		return
 	}
 	go func() {
-		defer d.llm.restartDone()
+		defer watcher.restartDone()
 
 		// Orphaned context: the engine is gone but the driver still holds its VRAM.
 		// Seen at 21:46: port dead, ~15 GiB still allocated. Restarting into that state
 		// cannot succeed -- llama would fail to allocate and we would be restarting in a
 		// loop, so say what it is and stop.
-		if !portAlive(d.cfg.llama.url) {
+		if !portAlive(s.specOf().url) {
 			if used, err := vramUsed(); err == nil && used > d.cfg.orphanAbove {
 				detail := fmt.Sprintf("llama is not listening but %.2f GiB of VRAM is still allocated; "+
 					"restarting cannot free an orphaned context", float64(used)/(1<<30))
 				log.Printf("watch: %s", detail)
-				d.llm.markOrphaned(detail)
+				watcher.markOrphaned(detail)
 				return
 			}
 		}
 
-		if s := d.slotByName("llama"); s != nil && s.specOf().own() {
+		if s.specOf().own() {
 			// demesne owns the router: the supervisor is the only actor that starts it,
 			// so the useful thing here is to take down a child that is not answering.
 			// If it is already gone, this is a no-op and the supervisor is already
 			// dealing with it -- which is the double restart, removed.
-			log.Printf("watch: restarting the llama child after: %s", reason)
+			log.Printf("watch: restarting the %s child after: %s", s.specOf().name, reason)
 			d.evict(s, stopFailed, "the watch decided the router is wedged")
 			return
 		}
 
+		if s.specOf().name != d.cfg.llmService {
+			log.Printf("watch: %s failed (%s) and is not ours to restart; leaving it",
+				s.specOf().name, reason)
+			return
+		}
 		log.Printf("watch: restarting %s after: %s", d.cfg.llmService, reason)
 		if out, err := exec.Command(d.cfg.rcService, "--user", d.cfg.llmService, "restart").CombinedOutput(); err != nil {
 			detail := fmt.Sprintf("restart of %s failed: %v: %s", d.cfg.llmService, err, trim(string(out), 300))
 			log.Printf("watch: %s", detail)
-			d.llm.markOrphaned(detail) // no further attempts: a human decides
+			watcher.markOrphaned(detail) // no further attempts: a human decides
 			return
 		}
 		if err := waitPort(d.cfg.llama.url, d.cfg.llmRestartWait, d.done); err != nil {
@@ -273,7 +279,7 @@ func (d *demesne) recoverLLM(reason string) {
 			log.Printf("watch: %s", detail)
 			return
 		}
-		d.llm.restarted()
+		watcher.restarted()
 		log.Printf("watch: %s is back on %s (%s)", d.cfg.llmService, d.cfg.llama.url, vramString())
 	}()
 }

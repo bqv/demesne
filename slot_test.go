@@ -2389,3 +2389,82 @@ func TestAnUnknownModelIsA404(t *testing.T) {
 		t.Fatalf("a declared model was not routed: %s", rec.Body.String())
 	}
 }
+
+// A unix endpoint is live only when something answers on it: a socket file left by a SIGKILL is
+// not an engine, and nothing may use file existence as liveness.
+func TestAUnixEndpointIsLivenessByDial(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "m.sock")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	// Keep the file after close, which is what a SIGKILLed engine leaves behind.
+	ln.(*net.UnixListener).SetUnlinkOnClose(false)
+	url := "unix:" + path
+	if !portAlive(url) {
+		t.Fatal("a listening socket read as dead")
+	}
+	ln.Close()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("the stale socket file is not there, so this test proves nothing: %v", err)
+	}
+	if portAlive(url) {
+		t.Fatal("a stale socket file read as alive: liveness is a dial, not a stat")
+	}
+	if unixPath(url) != path {
+		t.Fatalf("unixPath = %q", unixPath(url))
+	}
+	if unixPath("http://127.0.0.1:55556") != "" {
+		t.Fatal("a TCP URL was read as a unix endpoint")
+	}
+}
+
+// And a chat request for a unix slot reaches the engine through the socket.
+func TestTheProxyDialsTheSocket(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "m.sock")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"from":"unix"}`)
+	})}
+	go srv.Serve(ln)
+	defer srv.Close()
+
+	cfg := testConfig(t)
+	cfg.llama = engineConfig{url: "unix:" + path, bin: "/usr/bin/llama-server"}
+	d := newTestDemesne(t, cfg)
+	d.seedModels()
+
+	rec := httptest.NewRecorder()
+	d.proxies["llama"].ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m"}`)))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "unix") {
+		t.Fatalf("the request did not reach the socket: %d %q", rec.Code, rec.Body.String())
+	}
+	if len(unixInodes(path)) == 0 {
+		t.Fatal("the live socket is not in /proc/net/unix, so reclaim could not find it")
+	}
+}
+
+// One engine's breaker must not refuse another engine's requests.
+func TestABreakerIsPerSlot(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.llama = engineConfig{url: "http://127.0.0.1:1", bin: "/usr/bin/llama-server"}
+	cfg.llamb = engineConfig{url: "http://127.0.0.1:2", bin: "/usr/bin/llama-server"}
+	d := newTestDemesne(t, cfg)
+
+	bad := d.watchFor("llama")
+	for i := 0; i < cfg.failThreshold+2; i++ {
+		bad.fail(errors.New("connection refused"), cfg.failThreshold, cfg.breakerFor)
+	}
+	if open, _ := bad.failing(); !open {
+		t.Fatal("the failing engine's breaker did not open")
+	}
+	if open, _ := d.watchFor("llamb").failing(); open {
+		t.Fatal("a healthy engine inherited its neighbour's breaker")
+	}
+}

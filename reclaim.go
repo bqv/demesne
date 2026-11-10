@@ -34,7 +34,11 @@ import (
 // procPortPID finds the pid listening on a TCP port, by the same route ss takes: the socket
 // inode from /proc/net/tcp, then the process holding it in /proc/<pid>/fd.
 func procPortPID(port int) (int, bool) {
-	inodes := listenInodes(port)
+	return inodeHolder(listenInodes(port))
+}
+
+// inodeHolder finds the process holding one of these socket inodes, by walking /proc/<pid>/fd.
+func inodeHolder(inodes map[string]bool) (int, bool) {
 	if len(inodes) == 0 {
 		return 0, false
 	}
@@ -93,7 +97,7 @@ func listenInodes(port int) map[string]bool {
 // whether it killed anything; an error is a refusal with the reason, and the port is left
 // alone.
 func (d *demesne) reclaimSlot(s *slot) (bool, error) {
-	pid, ok := procPortPID(s.port())
+	pid, ok := procEndpointPID(s.specOf().url, s.port())
 	if !ok {
 		return false, nil
 	}
@@ -120,15 +124,54 @@ func (d *demesne) reclaimSlot(s *slot) (bool, error) {
 		s.specOf().name, pid, s.port(), m.leaf, filepath.Base(exe))
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
 	_ = syscall.Kill(pid, syscall.SIGTERM)
-	if waitPortFree(s.port(), 5*time.Second) {
+	if waitEndpointFree(s.specOf().url, 5*time.Second) {
 		return true, nil
 	}
 	_ = syscall.Kill(-pid, syscall.SIGKILL)
 	_ = syscall.Kill(pid, syscall.SIGKILL)
-	if waitPortFree(s.port(), 5*time.Second) {
+	if waitEndpointFree(s.specOf().url, 5*time.Second) {
 		return true, nil
 	}
 	return false, errors.New("port " + strconv.Itoa(s.port()) + " is still held after SIGKILL")
+}
+
+// procEndpointPID is procPortPID for either kind of endpoint: a unix socket is found in
+// /proc/net/unix by its path, a TCP listener in /proc/net/tcp by its port, and both give an
+// inode whose holder is found the same way.
+func procEndpointPID(base string, port int) (int, bool) {
+	if path := unixPath(base); path != "" {
+		return inodeHolder(unixInodes(path))
+	}
+	return procPortPID(port)
+}
+
+func unixInodes(path string) map[string]bool {
+	out := map[string]bool{}
+	b, err := os.ReadFile("/proc/net/unix")
+	if err != nil {
+		return out
+	}
+	for _, line := range strings.Split(string(b), "\n")[1:] {
+		fields := strings.Fields(line)
+		if len(fields) < 8 || fields[7] != path {
+			continue
+		}
+		out[fields[6]] = true
+	}
+	return out
+}
+
+// waitEndpointFree waits for the listener to go, without a polling sleep process and without
+// holding anything: a short ticker, and the caller's own bound.
+func waitEndpointFree(base string, limit time.Duration) bool {
+	deadline := time.Now().Add(limit)
+	for time.Now().Before(deadline) {
+		if !portAlive(base) {
+			return true
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return !portAlive(base)
 }
 
 // waitPortFree waits for the listener to go, without a polling sleep process and without

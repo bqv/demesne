@@ -558,7 +558,9 @@ type demesne struct {
 	// during a restart would otherwise trip the breaker and ask for a restart of an engine
 	// that was simply starting -- the same mistake the /v1/models handler made once.
 	probes  map[string]*httputil.ReverseProxy
-	llm     *llmWatch
+	llm     *llmWatch // the default slot's watch: /status keeps its shape
+	watchMu sync.Mutex
+	watches map[string]*llmWatch
 	models  modelIndex // which engine advertises which model (models.go)
 	loads   *loadBoard // which model each router is loading, if any (loads.go)
 	hub     *eventHub  // the subscription feed (events.go)
@@ -576,7 +578,7 @@ func newDemesne(cfg config) *demesne {
 		index:     map[string]*slot{},
 		proxies:   map[string]*httputil.ReverseProxy{},
 		probes:    map[string]*httputil.ReverseProxy{},
-		llm:       newLLMWatch(),
+		watches:   map[string]*llmWatch{},
 		loads:     newLoadBoard(cfg.logDir),
 		hub:       newEventHub(),
 		history:   &history{},
@@ -592,9 +594,14 @@ func newDemesne(cfg config) *demesne {
 	// Declared models route from the first request, before any refresh: an on-demand engine
 	// that has never answered must still be nameable.
 	d.seedModels()
+	if s := d.defaultSlot(); s != nil {
+		d.llm = d.watchFor(s.specOf().name)
+	} else {
+		d.llm = newLLMWatch()
+	}
 	for _, s := range d.slots {
-		d.proxies[s.specOf().name] = reverseProxy(d, s.specOf().url, s.specOf().router)
-		d.probes[s.specOf().name] = reverseProxy(d, s.specOf().url, false)
+		d.proxies[s.specOf().name] = reverseProxy(d, s, s.specOf().router)
+		d.probes[s.specOf().name] = reverseProxy(d, s, false)
 		// A resident slot is somebody's responsibility from the start. A reload can hand
 		// an engine back to OpenRC and take it again, so the flag is a real one and not a
 		// property of the spec.
@@ -727,12 +734,23 @@ func resolve(p string) intent {
 // reverseProxy builds the pass-through. isLLM adds the watch: a failed dial or a
 // stream that broke mid-body is the strongest evidence about the router, and it
 // arrives before any probe could fire, so the policy hangs off this edge.
-func reverseProxy(d *demesne, base string, isLLM bool) *httputil.ReverseProxy {
+func reverseProxy(d *demesne, s *slot, watch bool) *httputil.ReverseProxy {
+	base := s.specOf().url
+	watcher := d.watchFor(s.specOf().name)
 	target, err := url.Parse(base)
 	if err != nil {
 		log.Fatalf("bad target %q: %v", base, err)
 	}
-	p := httputil.NewSingleHostReverseProxy(target)
+	var p *httputil.ReverseProxy
+	if path := unixPath(base); path != "" {
+		// The stdlib transport picks its network from the URL scheme, so a `unix:` target is
+		// rewritten to a placeholder http URL and every connection goes to the socket.
+		placeholder, _ := url.Parse("http://unix-socket")
+		p = httputil.NewSingleHostReverseProxy(placeholder)
+		p.Transport = unixDialer(path)
+	} else {
+		p = httputil.NewSingleHostReverseProxy(target)
+	}
 	// -1 flushes every write straight through: chat is SSE, and sd streams
 	// image_generation.* events.
 	p.FlushInterval = -1
@@ -748,19 +766,19 @@ func reverseProxy(d *demesne, base string, isLLM bool) *httputil.ReverseProxy {
 			return
 		}
 		log.Printf("%s %s -> %s: %v", r.Method, r.URL.Path, base, err)
-		if isLLM {
-			if restart := d.llm.fail(err, d.cfg.failThreshold, d.cfg.breakerFor); restart {
-				d.recoverLLM(err.Error())
+		if watch {
+			if restart := watcher.fail(err, d.cfg.failThreshold, d.cfg.breakerFor); restart {
+				d.recoverLLM(s, err.Error())
 			}
 		}
 		http.Error(w, "demesne: upstream failed: "+err.Error(), http.StatusBadGateway)
 	}
-	if isLLM {
+	if watch {
 		// Any answer below 500 means the engine really answered -- a streamed 200 is
 		// worth more than a health check, because it proves the model ran.
 		p.ModifyResponse = func(resp *http.Response) error {
 			if resp.StatusCode < 500 {
-				d.llm.ok()
+				watcher.ok()
 			}
 			return nil
 		}
@@ -898,6 +916,19 @@ func (d *demesne) route(w http.ResponseWriter, r *http.Request, in intent) {
 	}
 }
 
+// watchFor is one breaker per engine: a model that crash-loops must not refuse requests to its
+// neighbours, which is the whole point of one process per model.
+func (d *demesne) watchFor(name string) *llmWatch {
+	d.watchMu.Lock()
+	defer d.watchMu.Unlock()
+	if w, ok := d.watches[name]; ok {
+		return w
+	}
+	w := newLLMWatch()
+	d.watches[name] = w
+	return w
+}
+
 // claimCard is the preflight every request that WANTS the card needs, whichever dialect it
 // arrived in: the router's breaker, the bounded wait for a booting engine, and the eviction of
 // the media child when it shares the group. It writes its own refusal and reports whether the
@@ -907,7 +938,7 @@ func (d *demesne) claimCard(w http.ResponseWriter, r *http.Request, s *slot) boo
 	// advertises models is one, so a per-model slot gets a breaker too instead of silently
 	// having none. It is still one shared watch; per-slot watches are the follow-up.
 	if s.specOf().router {
-		if open, wait := d.llm.failing(); open {
+		if open, wait := d.watchFor(s.specOf().name).failing(); open {
 			w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())))
 			http.Error(w, "demesne: the "+s.specOf().name+
 				" engine is failing; retry shortly (see /status)", http.StatusServiceUnavailable)
