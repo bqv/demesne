@@ -461,6 +461,11 @@ func (c config) validate(slots []*slot) error {
 		if s.specOf().url == "" {
 			continue
 		}
+		// A unix slot has no port to read, claim or collide: its address is a path, and two
+		// slots cannot collide on one because the launcher refuses a path that answers.
+		if unixPath(s.specOf().url) != "" {
+			continue
+		}
 		p := s.port()
 		if p == 0 {
 			return fmt.Errorf("%s: cannot read a port from %q", s.specOf().name, s.specOf().url)

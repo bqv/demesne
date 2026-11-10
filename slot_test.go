@@ -2483,3 +2483,29 @@ func TestSocketEndpointsAreNamedAsSockets(t *testing.T) {
 	}
 	_ = s
 }
+
+// A unix slot has no port to read, claim or collide, and validation must not demand one: it did,
+// and on 2026-11-10 that crash-looped the whole estate until the check was taught the difference.
+func TestAUnixSlotNeedsNoPort(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.sd.args = []string{"--stub"}
+	cfg.whisper = engineConfig{url: "unix:/run/user/1000/models/d1.sock",
+		bin: "/usr/bin/llama-server", args: []string{"--host", "/run/user/1000/models/d1.sock"}}
+	var slots []*slot
+	for _, sp := range buildSlots(cfg) {
+		slots = append(slots, &slot{spec: sp})
+	}
+	if err := cfg.validate(slots); err != nil {
+		t.Fatalf("a unix slot was rejected: %v", err)
+	}
+
+	cfg.whisper = engineConfig{url: cfg.llama.url, bin: "/usr/bin/llama-server",
+		args: []string{"--port", "1"}}
+	slots = nil
+	for _, sp := range buildSlots(cfg) {
+		slots = append(slots, &slot{spec: sp})
+	}
+	if err := cfg.validate(slots); err == nil {
+		t.Fatal("two slots on one TCP port were accepted")
+	}
+}
