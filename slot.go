@@ -208,8 +208,9 @@ type slot struct {
 	pid      int
 	started  time.Time
 	readyAt  time.Time
-	stopping bool // the exit was ordered, so do not count it as a crash
-	foreign  bool // the port answers but the process is not ours
+	used     time.Time // last request routed to this slot; drives LRU eviction
+	stopping bool      // the exit was ordered, so do not count it as a crash
+	foreign  bool      // the port answers but the process is not ours
 	lastErr  string
 	stopped  stopReason // why the child last stopped; cleared when it is ready again
 	restarts int
@@ -333,6 +334,18 @@ func (s *slot) noteReady() {
 // start: a cold render takes ~8-10 minutes, so a five-minute timer armed before it
 // would kill the child mid-load. The in-flight count is what tells the timer a
 // request is still running.
+func (s *slot) lastUsed() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.used
+}
+
+func (s *slot) noteUse() {
+	s.mu.Lock()
+	s.used = time.Now()
+	s.mu.Unlock()
+}
+
 func (s *slot) armIdle(d *demesne) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

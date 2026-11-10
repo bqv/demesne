@@ -20,6 +20,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -58,6 +59,29 @@ type modelIndex struct {
 
 func newModelIndex() modelIndex {
 	return modelIndex{byModel: map[string]string{}, loaded: map[string]int{}, known: map[string]bool{}}
+}
+
+// seedModels puts each slot's declared models into the index before anything is asked. It is
+// what makes a declared model routable on the first request rather than after a refresh.
+func (d *demesne) seedModels() {
+	byModel := make(map[string]string)
+	for _, s := range d.slots {
+		if !s.specOf().router || !s.specOf().routed {
+			continue
+		}
+		for _, id := range s.specOf().models {
+			if _, taken := byModel[id]; !taken {
+				byModel[id] = s.specOf().name
+			}
+		}
+	}
+	d.models.mu.Lock()
+	for id, slot := range byModel {
+		if _, taken := d.models.byModel[id]; !taken {
+			d.models.byModel[id] = slot
+		}
+	}
+	d.models.mu.Unlock()
 }
 
 // refreshModels asks every router what it serves and swaps the map in one step.
@@ -252,6 +276,35 @@ func (d *demesne) followModels() {
 // modelsHandler answers /v1/models for the whole estate. A client that dials the one port
 // should see every model it can ask for, not only the ones the engine behind that path
 // happens to know about.
+// knownModels is the routing index's names, sorted, for an error message that helps.
+func (d *demesne) knownModels() []string {
+	d.models.mu.Lock()
+	defer d.models.mu.Unlock()
+	out := make([]string, 0, len(d.models.byModel))
+	for id := range d.models.byModel {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// writeModelNotFound answers in the shape an OpenAI client already understands.
+func writeModelNotFound(w http.ResponseWriter, model string, known []string) {
+	if len(known) > 8 {
+		known = known[:8]
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotFound)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"message": "no slot serves model " + model + "; declared and advertised models: " +
+				strings.Join(known, ", "),
+			"type": "invalid_request_error",
+			"code": "model_not_found",
+		},
+	})
+}
+
 func (d *demesne) modelsHandler(w http.ResponseWriter, r *http.Request) {
 	data := []json.RawMessage{}
 	answered := 0
@@ -270,7 +323,7 @@ func (d *demesne) modelsHandler(w http.ResponseWriter, r *http.Request) {
 		// Nobody answered. Let the default engine produce its own error instead of
 		// inventing an empty list: "no models" and "the router is down" are not the same
 		// answer, and the second one is the true one.
-		if s := d.slotByName("llama"); s != nil {
+		if s := d.defaultSlot(); s != nil {
 			d.proxies[s.specOf().name].ServeHTTP(w, r)
 			return
 		}

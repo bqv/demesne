@@ -41,6 +41,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -582,13 +583,17 @@ func newDemesne(cfg config) *demesne {
 		startedAt: time.Now(),
 		done:      make(chan struct{}),
 	}
+	d.models = newModelIndex()
 	for _, spec := range buildSlots(cfg) {
 		s := &slot{spec: spec, owner: d}
 		d.slots = append(d.slots, s)
 		d.index[spec.name] = s
 	}
+	// Declared models route from the first request, before any refresh: an on-demand engine
+	// that has never answered must still be nameable.
+	d.seedModels()
 	for _, s := range d.slots {
-		d.proxies[s.specOf().name] = reverseProxy(d, s.specOf().url, s.specOf().name == "llama")
+		d.proxies[s.specOf().name] = reverseProxy(d, s.specOf().url, s.specOf().router)
 		d.probes[s.specOf().name] = reverseProxy(d, s.specOf().url, false)
 		// A resident slot is somebody's responsibility from the start. A reload can hand
 		// an engine back to OpenRC and take it again, so the flag is a real one and not a
@@ -812,8 +817,18 @@ func (d *demesne) route(w http.ResponseWriter, r *http.Request, in intent) {
 	var pk peeked
 	if in.kind == kindChat {
 		pk = peekRequest(r)
-		if name := d.slotForModel(pk.model); name != "" {
+		name := d.slotForModel(pk.model)
+		if name != "" {
 			in.slot = name
+		}
+		// A model that no slot declares or advertises is a 404, not a silent fall through to
+		// the default engine: on 2026-11-09 a request for a stopped on-demand engine's model
+		// reached llama, which failed to load a name absent from its own models.ini and then
+		// restored its previous model, putting an unrelated d1 back on the card. The request
+		// was well formed; the model was absent.
+		if pk.model != "" && name == "" {
+			writeModelNotFound(w, pk.model, d.knownModels())
+			return
 		}
 		if pk.model != "" && isRouterSlot(d.index[in.slot].specOf().bin) {
 			d.loads.noteRequest(in.slot, pk.model)
@@ -830,6 +845,7 @@ func (d *demesne) route(w http.ResponseWriter, r *http.Request, in intent) {
 		return
 	}
 	if in.kind != kindProxy && in.kind != kindMetadata {
+		s.noteUse()
 		s.requests.Add(1)
 		s.active.Add(1)
 		t0 := time.Now()
@@ -887,13 +903,14 @@ func (d *demesne) route(w http.ResponseWriter, r *http.Request, in intent) {
 // the media child when it shares the group. It writes its own refusal and reports whether the
 // caller may proceed.
 func (d *demesne) claimCard(w http.ResponseWriter, r *http.Request, s *slot) bool {
-	// The breaker is the llama router's: it is built from that engine's failures, and
-	// applying it to the aux card would refuse requests over another engine's fault.
-	if s.specOf().name == "llama" {
+	// The breaker is a property of an ENGINE, not of the slot called llama: any slot that
+	// advertises models is one, so a per-model slot gets a breaker too instead of silently
+	// having none. It is still one shared watch; per-slot watches are the follow-up.
+	if s.specOf().router {
 		if open, wait := d.llm.failing(); open {
 			w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())))
-			http.Error(w, "demesne: the llama engine is failing; retry shortly (see /status)",
-				http.StatusServiceUnavailable)
+			http.Error(w, "demesne: the "+s.specOf().name+
+				" engine is failing; retry shortly (see /status)", http.StatusServiceUnavailable)
 			return false
 		}
 	}
@@ -930,7 +947,57 @@ func (d *demesne) claimCard(w http.ResponseWriter, r *http.Request, s *slot) boo
 			d.evict(sd, stopChat, "a chat request wants the card")
 		}
 	}
+	// Sibling MODEL slots share the card too. A request may take it from any other slot in
+	// the group -- least recently used first -- but never from the slot it is being routed
+	// to, and never from a resident one: resident is the operator saying keep it.
+	for _, other := range d.cardSiblings(s) {
+		d.evict(other, stopChat, "a request for "+s.specOf().name+" wants the card")
+	}
 	return true
+}
+
+// defaultSlot is the engine that answers when no slot declares or advertises the model, and
+// the one whose own /v1/models is used when no router answered. It is the llama slot when the
+// estate has one, so no caller has to know the name.
+func (d *demesne) defaultSlot() *slot {
+	if s := d.slotByName("llama"); s != nil {
+		return s
+	}
+	for _, s := range d.slots {
+		if s.specOf().router && s.specOf().routed {
+			return s
+		}
+	}
+	return nil
+}
+
+// cardSiblings lists the slots that hold part of the same card and may be asked to give it
+// back, least recently used first. The requester is never in the list.
+func (d *demesne) cardSiblings(s *slot) []*slot {
+	group := s.specOf().group
+	if group == "" {
+		return nil
+	}
+	var out []*slot
+	for _, other := range d.slots {
+		spec := other.specOf()
+		if other == s || spec.group != group || !spec.vram || spec.policy == policyResident {
+			continue
+		}
+		// Only a slot demesne owns can be told to give the card back; an external engine's
+		// VRAM is not ours to reclaim, and pretending otherwise would lie in /status.
+		if !spec.own() {
+			continue
+		}
+		if up, _ := other.isUp(); !up {
+			continue
+		}
+		out = append(out, other)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].lastUsed().Before(out[j].lastUsed())
+	})
+	return out
 }
 
 // ------------------------------------------------------------------- /status

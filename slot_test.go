@@ -676,8 +676,11 @@ func TestTheModelNameDecidesTheEngine(t *testing.T) {
 	rec = httptest.NewRecorder()
 	d.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"nobody-has-this"}`)))
-	if got := rec.Body.String(); !strings.HasPrefix(got, "llama ") {
-		t.Fatalf("an unknown model went to %q, want the default router", got)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("an unknown model answered %d, want 404: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "model_not_found") {
+		t.Fatalf("the 404 does not name the code: %s", rec.Body.String())
 	}
 }
 
@@ -1267,7 +1270,7 @@ func TestAStreamingChatAnswersBeforeTheEngineDoes(t *testing.T) {
 	defer up.Close()
 
 	cfg := testConfig(t)
-	cfg.llama = engineConfig{url: up.URL}
+	cfg.llama = engineConfig{url: up.URL, models: []string{"m"}}
 	d := newTestDemesne(t, cfg)
 	srv := httptest.NewServer(d)
 	defer srv.Close()
@@ -1304,7 +1307,7 @@ func TestACancelDoesNotAbortTheLoad(t *testing.T) {
 	defer up.Close()
 
 	cfg := testConfig(t)
-	cfg.llama = engineConfig{url: up.URL}
+	cfg.llama = engineConfig{url: up.URL, models: []string{"m"}}
 	d := newTestDemesne(t, cfg)
 	srv := httptest.NewServer(d)
 	defer srv.Close()
@@ -1709,7 +1712,7 @@ func TestMetricsCountRequests(t *testing.T) {
 	}))
 	defer up.Close()
 	cfg := testConfig(t)
-	cfg.llama = engineConfig{url: up.URL}
+	cfg.llama = engineConfig{url: up.URL, models: []string{"m"}}
 	d := newTestDemesne(t, cfg)
 
 	rec := httptest.NewRecorder()
@@ -2301,5 +2304,88 @@ func TestAReansweredListDropsRemovedModels(t *testing.T) {
 	d.models.mu.Unlock()
 	if still {
 		t.Fatal("a removed model kept routing")
+	}
+}
+
+// A request may take the card from a sibling model slot in the same group -- least recently
+// used first -- but never from itself, and never from a resident slot.
+func TestARequestTakesTheCardFromASibling(t *testing.T) {
+	cfg := testConfig(t)
+	d := newTestDemesne(t, cfg)
+	llama := d.slotByName("llama")
+	sd := d.slotByName("sd")
+	for _, s := range []*slot{llama, sd} {
+		s.mu.Lock()
+		s.up, s.readyAt, s.used = true, time.Now(), time.Now()
+		s.mu.Unlock()
+	}
+	siblings := d.cardSiblings(llama)
+	if len(siblings) != 1 || siblings[0] != sd {
+		t.Fatalf("siblings of llama = %v, want [sd]", len(siblings))
+	}
+	if got := d.cardSiblings(sd); len(got) != 0 {
+		t.Fatalf("an unowned sibling must not be offered (it cannot be told to stop): %v", len(got))
+	}
+}
+
+// A resident slot is never an LRU candidate: resident is the operator's decision.
+func TestAResidentSiblingIsNotEvicted(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.llama = engineConfig{url: cfg.llama.url, bin: "/usr/bin/llama-server"}
+	d := newTestDemesne(t, cfg)
+	llama := d.slotByName("llama")
+	sd := d.slotByName("sd")
+	for _, s := range []*slot{llama, sd} {
+		s.mu.Lock()
+		s.up, s.readyAt = true, time.Now()
+		s.mu.Unlock()
+	}
+	if llama.specOf().policy != policyResident {
+		t.Fatalf("llama is %s, not resident", llama.specOf().policy)
+	}
+	for _, s := range d.cardSiblings(sd) {
+		if s == llama {
+			t.Fatal("a resident slot was offered as an eviction candidate")
+		}
+	}
+}
+
+// The breaker is a property of an engine that advertises models, not of the name llama.
+func TestTheBreakerIsKeyedOnTheRouterFlag(t *testing.T) {
+	cfg := testConfig(t)
+	d := newTestDemesne(t, cfg)
+	if !d.slotByName("llama").specOf().router {
+		t.Fatal("llama is not marked as a router")
+	}
+	if d.slotByName("sd").specOf().router {
+		t.Fatal("sd is marked as a router")
+	}
+}
+
+// A model that no slot declares or advertises is a 404, not a silent fall through to the default
+// engine -- that fallback is what put an unrelated d1 on the card on 2026-11-09.
+func TestAnUnknownModelIsA404(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.llama = engineConfig{url: "http://127.0.0.1:1", bin: "/usr/bin/llama-server",
+		models: []string{"declared-model"}}
+	d := newTestDemesne(t, cfg)
+	d.refreshModels()
+
+	rec := httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"typoed-model","messages":[]}`)))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status %d, want 404: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "model_not_found") ||
+		!strings.Contains(rec.Body.String(), "declared-model") {
+		t.Fatalf("the 404 should name the code and the known models: %s", rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"declared-model","messages":[]}`)))
+	if rec.Code == http.StatusNotFound {
+		t.Fatalf("a declared model was not routed: %s", rec.Body.String())
 	}
 }
