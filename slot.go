@@ -174,6 +174,12 @@ type slotSpec struct {
 	// relative to it, so this is load-bearing, not tidiness.
 	dir string
 
+	kind         slotKind
+	aliases      []string
+	vramMB       int
+	readMBs      float64
+	weightsBytes int64
+
 	group  string // exclusivity group ("" = contends for nothing)
 	vram   bool   // the slot's processes hold part of the card
 	policy policy

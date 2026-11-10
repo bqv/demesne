@@ -638,6 +638,48 @@ the right program.
 | 5 | no syslog; unrotated logs | not solved, only narrowed: one `<slot>.{log,err}` pair per engine, still unrotated |
 | 6 | orphaned VRAM freezes the LLM side for 24 h | unchanged on purpose: a restart cannot free an orphaned context, and a loop would only hide the fault. `/status` shows the three reasons separately (`orphaned`, `degraded`, `last_error`) |
 
+### Slots from a file
+
+By default the five built-in slots are what runs. `DEMESNE_SLOTS=/home/user/etc/slots.ini` (or
+`-slots`) replaces that with a file, one section per slot; a section named after a built-in replaces
+it, and a section with a new name adds a slot. The built-ins stay as the defaults so an estate that
+configures nothing behaves as it did.
+
+```ini
+[spark]
+url         = unix:/home/user/run/models/spark.sock
+bin         = /usr/bin/llama-server
+args        = -m /home/user/var/model/llm/Spark-X2.5-4B-Q4_K_M.gguf --alias spark --host /home/user/run/models/spark.sock -c 32768 -ngl 99
+models      = Spark-X2.5-4B-Q4_K_M
+aliases     = spark, spark-4b
+kind        = model
+group       = gpu
+policy      = on-demand
+vram_mb     = 3200
+idle        = 5m
+memory_high = 2G
+memory_max  = 3G
+```
+
+`kind` is `model` (chosen by model name), `media` (`/sdapi/*`) or `audio` (`/v1/audio/*`) — it
+replaces the name checks that used to recognise sd and whisper. `policy` is `on-demand` or
+`external`; **`warm` and `resident` are refused**: nothing in this estate is warm, and the idle timer
+is the knob instead. `vram_mb` is the slot's declared peak card footprint, `read_mb_s` overrides the
+direct-read rate used to price a reload, and `idle` falls back to `DEMESNE_IDLE`.
+
+Check a file before restarting into it:
+
+```
+demesne check -slots /home/user/etc/slots.ini
+```
+
+That prints one line per slot in name order — `kind`, `policy`, `group`, `url`, models, declared
+vram, reload cost and idle — and refuses what would lie: an unknown key, `kind=model` with nothing
+to address it, a relative or non-`.sock` unix path, a duplicate section, a key outside a section.
+It also notes every slot that replaces a built-in. A malformed file is fatal at startup; the same
+file is deliberately not re-read by `reload`, because a slot's identity, kind and cgroup cannot
+change under a running child — restart to apply it.
+
 ### A slot that listens on a socket instead of a port
 
 Set the slot's URL to `unix:/abs/path.sock` and the engine to bind the same path — llama.cpp

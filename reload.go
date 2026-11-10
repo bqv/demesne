@@ -153,6 +153,10 @@ func policyFor(name, bin string) policy {
 // reload re-reads the configuration file and applies what changed. Everything it does not
 // have to touch, it does not touch.
 func (d *demesne) reload() (reloadReport, error) {
+	if d.cfg.slotsFile != "" {
+		return reloadReport{Refused: []string{"slots (" + d.cfg.slotsFile +
+			" is read at startup only: a slot's identity, kind and cgroup cannot change under a running child; restart to apply)"}}, nil
+	}
 	var rep reloadReport
 	values, err := readConfFile(d.cfg.confFile)
 	if err != nil {
