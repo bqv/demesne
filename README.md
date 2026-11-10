@@ -638,6 +638,21 @@ the right program.
 | 5 | no syslog; unrotated logs | not solved, only narrowed: one `<tenant>.{log,err}` pair per engine, still unrotated |
 | 6 | orphaned VRAM freezes the LLM side for 24 h | unchanged on purpose: a restart cannot free an orphaned context, and a loop would only hide the fault. `/status` shows the three reasons separately (`orphaned`, `degraded`, `last_error`) |
 
+### What a picker sees
+
+`/v1/models` is the union of every routed tenant: what each answered, plus what each *declares*,
+so a model is listable before its first request and a cold on-demand tenant is not invisible. Each
+entry's `owned_by` is the tenant's placement label, and `/status`'s `tenants[]` carries it as
+`device`:
+
+- `CPU` when the tenant's own command line says `-ngl 0` — a tenant in the `gpu` group can still be
+  a CPU tenant, and saying `RX7900` about it would be confidently wrong;
+- `RX7900` for the `gpu` group, `GT1030` for `aux`.
+
+A **reasoning model** answers in `reasoning_content` and leaves `content` empty until it finishes
+thinking, so a picker that shows only `content` will look blank for every reasoning rung. Read both
+fields and show the reasoning one while `content` is empty.
+
 ### The word slot
 
 **Slot means llama-server's parallel lanes** (`--parallel`, `n_parallel`, `GET /slots`), and nothing

@@ -1,7 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -204,5 +207,60 @@ func TestAPerModelTenantGetsALoadRow(t *testing.T) {
 	snap = b.snapshot()
 	if snap[0].Phase != loadFailed || snap[0].Error == nil {
 		t.Fatalf("after notePhase(failed): %+v", snap)
+	}
+}
+
+// Placement is a fact about where the weights run, not about which scheduling group the tenant
+// belongs to: a -ngl 0 tenant is on the CPU even when it is in the gpu group, and a field that
+// says RX7900 about it is worse than no field.
+func TestPlacementFollowsTheCommandLine(t *testing.T) {
+	cases := []struct {
+		spec tenantSpec
+		want string
+	}{
+		{tenantSpec{group: "gpu", vram: true, args: []string{"-ngl", "0"}}, "CPU"},
+		{tenantSpec{group: "gpu", vram: true, args: []string{"-ngl", "99", "-c", "4096"}}, "RX7900"},
+		{tenantSpec{group: "aux", vram: true, args: []string{"--n-gpu-layers=99"}}, "GT1030"},
+		{tenantSpec{group: "gpu", vram: true, args: []string{"--models-dir", "/x"}}, "RX7900"},
+		{tenantSpec{args: []string{"--model", "/x.bin"}}, "CPU"},
+	}
+	for _, c := range cases {
+		if got := cardLabel(c.spec); got != c.want {
+			t.Fatalf("cardLabel(%v) = %q, want %q", c.spec.args, got, c.want)
+		}
+	}
+}
+
+// A cold tenant's declared models and aliases must be in /v1/models before its first request,
+// or a picker cannot offer what it cannot see.
+func TestAColdTenantIsListed(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.llama = engineConfig{url: "http://127.0.0.1:1"}
+	d := newTestDemesne(t, cfg)
+	sparkSpec := tenantSpec{
+		name: "spark", url: "unix:/tmp/spark.sock", kind: kindModel, models: []string{"Spark-X2.5"},
+		aliases: []string{"spark"}, group: "gpu", policy: policyOnDemand, routed: true, router: true,
+	}
+	sp := &tenant{spec: sparkSpec, owner: d}
+	d.tenants = append(d.tenants, sp)
+	d.index["spark"] = sp
+
+	rec := httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	var body struct {
+		Data []struct {
+			ID      string `json:"id"`
+			OwnedBy string `json:"owned_by"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("%v: %s", err, rec.Body.String())
+	}
+	got := map[string]string{}
+	for _, m := range body.Data {
+		got[m.ID] = m.OwnedBy
+	}
+	if got["spark"] != "RX7900" || got["Spark-X2.5"] != "RX7900" {
+		t.Fatalf("a cold tenant's names are missing or mislabelled: %v", got)
 	}
 }

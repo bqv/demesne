@@ -21,6 +21,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -279,16 +280,38 @@ func (d *demesne) followModels() {
 // cardLabel is the name a person uses for the card a tenant runs on, in the order the
 // estate already does: the 7900 XT is "gpu", the GT 1030 is "aux".
 func cardLabel(spec tenantSpec) string {
+	if gpuLayers(spec) == 0 && spec.group != "" {
+		return "CPU"
+	}
 	switch spec.group {
 	case "gpu":
 		return "RX7900"
 	case "aux":
 		return "GT1030"
 	}
-	if !spec.vram {
-		return "CPU"
+	return "CPU"
+}
+
+// gpuLayers is how many layers the tenant's own command line offloads. -1 means it did not
+// say, which is not the same as 0: a router leaves it to its preset.
+func gpuLayers(spec tenantSpec) int {
+	for i, a := range spec.args {
+		switch {
+		case a == "-ngl" || a == "--n-gpu-layers" || a == "--gpu-layers":
+			if i+1 < len(spec.args) {
+				n, err := strconv.Atoi(spec.args[i+1])
+				if err == nil {
+					return n
+				}
+			}
+		case strings.HasPrefix(a, "--n-gpu-layers="):
+			n, err := strconv.Atoi(strings.TrimPrefix(a, "--n-gpu-layers="))
+			if err == nil {
+				return n
+			}
+		}
 	}
-	return spec.name
+	return -1
 }
 
 // labelModels rewrites owned_by so a client shows the card rather than the engine family:
@@ -347,20 +370,36 @@ func writeModelNotFound(w http.ResponseWriter, model string, known []string) {
 
 func (d *demesne) modelsHandler(w http.ResponseWriter, r *http.Request) {
 	data := []json.RawMessage{}
-	answered := 0
+	seen := map[string]bool{}
 	for _, s := range d.tenants {
-		if !s.specOf().router || !s.specOf().routed {
+		if !s.specOf().routed {
 			continue
 		}
-		items := fetchModels(s.specOf().url, modelListTimeout)
-		if items == nil {
-			continue
+		label := cardLabel(s.specOf())
+		items := []json.RawMessage{}
+		items = nil
+		if s.specOf().router {
+			items = fetchModels(s.specOf().url, modelListTimeout)
 		}
-		answered++
-		data = append(data, labelModels(items, cardLabel(s.specOf()))...)
+		for _, id := range modelIDs(items) {
+			seen[id] = true
+		}
+		labeled := labelModels(items, label)
+		data = append(data, labeled...)
+		// A tenant that is cold still declares what it serves, and a picker must be able to
+		// offer it before the first request: that is what makes an on-demand estate usable.
+		for _, id := range append(append([]string{}, s.specOf().models...), s.specOf().aliases...) {
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			if enc, err := json.Marshal(map[string]any{"id": id, "object": "model", "owned_by": label}); err == nil {
+				data = append(data, enc)
+			}
+		}
 	}
-	if answered == 0 {
-		// Nobody answered. Let the default engine produce its own error instead of
+	if len(data) == 0 {
+		// Nothing at all to list. Let the default engine produce its own error instead of
 		// inventing an empty list: "no models" and "the router is down" are not the same
 		// answer, and the second one is the true one.
 		if s := d.defaultTenant(); s != nil {
