@@ -264,3 +264,51 @@ func TestAColdTenantIsListed(t *testing.T) {
 		t.Fatalf("a cold tenant's names are missing or mislabelled: %v", got)
 	}
 }
+
+// A built-in can be dropped, which is how a router is retired once its models are tenants of
+// their own; and a tenant may be resident, which is how two models cohabit a small card without
+// an idle timer deciding to evict the one recall is using.
+func TestATenantCanReplaceAndDropABuiltIn(t *testing.T) {
+	cfg := goldenConfig()
+	cfg.tenantsFile = writeTenants(t, `
+[llamb]
+enabled = false
+
+[embed]
+url = http://127.0.0.1:55562
+models = Qwen3-Embedding-0.6B-Q8_0
+group = aux
+policy = resident
+vram_mb = 700
+`)
+	specs, notes, err := tenantsFromConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sp := range specs {
+		if sp.name == "llamb" {
+			t.Fatal("a disabled built-in is still in the estate")
+		}
+	}
+	var embed *tenantSpec
+	for i := range specs {
+		if specs[i].name == "embed" {
+			embed = &specs[i]
+		}
+	}
+	if embed == nil {
+		t.Fatal("the resident tenant was not added")
+	}
+	if embed.policy != policyResident || embed.vramMB != 700 || embed.group != "aux" {
+		t.Fatalf("embed = %+v", embed)
+	}
+	found := false
+	for _, n := range notes {
+		if strings.Contains(n, "llamb: disabled") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("dropping a built-in was not noted: %v", notes)
+	}
+}

@@ -22,6 +22,7 @@ const (
 	keyEnv       = "env"
 	keyDir       = "dir"
 	keyPolicy    = "policy"
+	keyEnabled   = "enabled"
 	keyGroup     = "group"
 	keyVRAM      = "vram_mb"
 	keyIdle      = "idle"
@@ -37,7 +38,7 @@ var tenantKeys = map[string]bool{
 	keyKind: true, keyModels: true, keyAliases: true, keyURL: true, keyBin: true,
 	keyArgs: true, keyEnv: true, keyDir: true, keyPolicy: true, keyGroup: true,
 	keyVRAM: true, keyIdle: true, keyMemHigh: true, keyMemMax: true, keyMemSwap: true,
-	keyReadMBs: true, keyFallback: true, keyModelsBad: true,
+	keyReadMBs: true, keyFallback: true, keyModelsBad: true, keyEnabled: true,
 }
 
 type tenantSection struct {
@@ -170,8 +171,10 @@ func parsePolicy(s string) (policy, error) {
 		return policyOnDemand, nil
 	case "external":
 		return policyExternal, nil
-	case "warm", "resident":
-		return 0, fmt.Errorf("policy %q is retired: nothing in this estate is warm, and an idle timer is the knob instead", s)
+	case "resident":
+		return policyResident, nil
+	case "warm":
+		return 0, fmt.Errorf("policy %q is retired: a tenant that must stay up is %q, and the big card keeps nothing resident", s, "resident")
 	}
 	return 0, fmt.Errorf("unknown policy %q (on-demand or external)", s)
 }
@@ -209,6 +212,11 @@ func tenantsFromConfig(c config) ([]tenantSpec, []string, error) {
 	}
 	var notes []string
 	for _, sec := range sections {
+		if off, ok := sec.kv[keyEnabled]; ok && !strings.EqualFold(off, "true") && off != "" {
+			delete(byName, sec.name)
+			notes = append(notes, fmt.Sprintf("%s: disabled by %s", sec.name, path))
+			continue
+		}
 		sp, err := specFromSection(sec, c)
 		if err != nil {
 			return nil, nil, err
