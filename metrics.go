@@ -18,7 +18,7 @@ const historyLen = 32
 
 type transitionRecord struct {
 	AtMS   int64  `json:"at_ms"`
-	Slot   string `json:"slot"`
+	Tenant string `json:"tenant"`
 	Kind   string `json:"kind"`
 	To     string `json:"to"`
 	Reason string `json:"reason,omitempty"`
@@ -36,7 +36,7 @@ func (h *history) record(r transitionRecord) {
 	// consumer counting entries would read that as two events.
 	if n := len(h.ring); n > 0 {
 		last := h.ring[n-1]
-		if last.Slot == r.Slot && last.Kind == r.Kind && last.To == r.To && last.Reason == r.Reason &&
+		if last.Tenant == r.Tenant && last.Kind == r.Kind && last.To == r.To && last.Reason == r.Reason &&
 			r.AtMS-last.AtMS < 2000 && r.AtMS >= last.AtMS {
 			return
 		}
@@ -55,13 +55,13 @@ func (h *history) snapshot() []transitionRecord {
 	return out
 }
 
-func (d *demesne) recordTransition(slot, kind, to, reason string) {
-	r := transitionRecord{AtMS: time.Now().UnixMilli(), Slot: slot, Kind: kind, To: to, Reason: reason}
+func (d *demesne) recordTransition(tenant, kind, to, reason string) {
+	r := transitionRecord{AtMS: time.Now().UnixMilli(), Tenant: tenant, Kind: kind, To: to, Reason: reason}
 	d.history.record(r)
 	d.hub.publish(eventFrame{Type: "transition", AtMS: r.AtMS, Transition: &r})
 }
 
-type slotRuntime struct {
+type tenantRuntime struct {
 	SinceMS       int64    `json:"since_ms"`
 	RequestsTotal int64    `json:"requests_total"`
 	Active        int64    `json:"active"`
@@ -76,25 +76,25 @@ type cgroupStat struct {
 	OOMKills     int64  `json:"oom_kills"`
 }
 
-type slotMetrics struct {
-	Name           string      `json:"name"`
-	URL            string      `json:"url"`
-	Port           int         `json:"port"`
-	Policy         string      `json:"policy"`
-	Group          string      `json:"group"`
-	Up             bool        `json:"up"`
-	Booting        bool        `json:"booting"`
-	PID            *int        `json:"pid"`
-	Foreign        bool        `json:"foreign"`
-	UptimeS        *float64    `json:"uptime_s"`
-	Restarts       int         `json:"restarts"`
-	InFlight       int64       `json:"in_flight"`
-	LastTransition string      `json:"last_transition,omitempty"`
-	LastError      *string     `json:"last_error"`
-	Load           *modelLoad  `json:"load"`
-	ResidentModels []string    `json:"resident_models"`
-	Runtime        slotRuntime `json:"runtime"`
-	Cgroup         *cgroupStat `json:"cgroup"`
+type tenantMetrics struct {
+	Name           string        `json:"name"`
+	URL            string        `json:"url"`
+	Port           int           `json:"port"`
+	Policy         string        `json:"policy"`
+	Group          string        `json:"group"`
+	Up             bool          `json:"up"`
+	Booting        bool          `json:"booting"`
+	PID            *int          `json:"pid"`
+	Foreign        bool          `json:"foreign"`
+	UptimeS        *float64      `json:"uptime_s"`
+	Restarts       int           `json:"restarts"`
+	InFlight       int64         `json:"in_flight"`
+	LastTransition string        `json:"last_transition,omitempty"`
+	LastError      *string       `json:"last_error"`
+	Load           *modelLoad    `json:"load"`
+	ResidentModels []string      `json:"resident_models"`
+	Runtime        tenantRuntime `json:"runtime"`
+	Cgroup         *cgroupStat   `json:"cgroup"`
 }
 
 type metricsDoc struct {
@@ -111,7 +111,7 @@ type metricsDoc struct {
 	Models        map[string][]string `json:"models"`
 	Owner         map[string]string   `json:"owner"`
 	Unavailable   []string            `json:"unavailable"`
-	Slots         []slotMetrics       `json:"slots"`
+	Tenants       []tenantMetrics     `json:"tenants"`
 	Loads         []modelLoad         `json:"loads"`
 	History       []transitionRecord  `json:"history"`
 }
@@ -180,7 +180,7 @@ func (d *demesne) metrics() metricsDoc {
 		Owner:        map[string]string{},
 		Unavailable:  []string{"tokens_in", "tokens_out", "prefill_tps", "decode_tps", "queue_depth", "wait_ms"},
 	}
-	if sd := d.slotByName("sd"); sd != nil {
+	if sd := d.tenantByName("sd"); sd != nil {
 		doc.MediaInFlight = atomic.LoadInt64(&sd.inflight)
 	}
 	doc.VramUsedGiB = float64(used) / (1 << 30)
@@ -190,18 +190,18 @@ func (d *demesne) metrics() metricsDoc {
 	}
 
 	byModel, _ := d.modelsSnapshot()
-	for model, slot := range byModel {
-		doc.Owner[model] = slot
-		doc.Models[slot] = append(doc.Models[slot], model)
+	for model, tenant := range byModel {
+		doc.Owner[model] = tenant
+		doc.Models[tenant] = append(doc.Models[tenant], model)
 	}
-	for slot := range doc.Models {
-		sortStrings(doc.Models[slot])
+	for tenant := range doc.Models {
+		sortStrings(doc.Models[tenant])
 	}
 
-	for _, s := range d.slots {
+	for _, s := range d.tenants {
 		spec := s.specOf()
-		st := slotStatusOf(s)
-		m := slotMetrics{
+		st := tenantStatusOf(s)
+		m := tenantMetrics{
 			Name:           spec.name,
 			URL:            spec.url,
 			Port:           s.port(),
@@ -213,7 +213,7 @@ func (d *demesne) metrics() metricsDoc {
 			Restarts:       st.Restarts,
 			InFlight:       st.InFlight,
 			LastTransition: string(st.LastTransition),
-			Runtime: slotRuntime{
+			Runtime: tenantRuntime{
 				SinceMS:       d.startedAt.UnixMilli(),
 				RequestsTotal: s.requests.Load(),
 				Active:        s.active.Load(),
@@ -242,17 +242,17 @@ func (d *demesne) metrics() metricsDoc {
 			m.Load = l
 		}
 		m.Cgroup = readCgroup(spec.cgroup.leaf)
-		doc.Slots = append(doc.Slots, m)
+		doc.Tenants = append(doc.Tenants, m)
 	}
 	doc.Loads = d.loads.snapshot()
 	doc.History = d.history.snapshot()
 	return doc
 }
 
-func latestLoad(loads []modelLoad, slot string) *modelLoad {
+func latestLoad(loads []modelLoad, tenant string) *modelLoad {
 	var out *modelLoad
 	for i := range loads {
-		if loads[i].Slot != slot {
+		if loads[i].Tenant != tenant {
 			continue
 		}
 		if out == nil || loads[i].StartedMS > out.StartedMS {

@@ -51,10 +51,10 @@ type rpcResponse struct {
 	Error   *rpcError       `json:"error,omitempty"`
 }
 
-// slotParams is the one parameter shape several methods take.
-type slotParams struct {
-	Slot  string `json:"slot"`
-	Group string `json:"group"`
+// tenantParams is the one parameter shape several methods take.
+type tenantParams struct {
+	Tenant string `json:"tenant"`
+	Group  string `json:"group"`
 }
 
 // handleRPC answers one request, or a batch, or nothing for a notification. A notification is
@@ -129,7 +129,7 @@ func (d *demesne) oneRPC(req rpcRequest) (rpcResponse, bool) {
 
 // rpcCall is the whole vocabulary in one place.
 func (d *demesne) rpcCall(method string, raw json.RawMessage) (any, *rpcError) {
-	var p slotParams
+	var p tenantParams
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, &rpcError{Code: rpcBadParams, Message: "params: " + err.Error()}
@@ -140,7 +140,7 @@ func (d *demesne) rpcCall(method string, raw json.RawMessage) (any, *rpcError) {
 	case "estate.status":
 		return map[string]any{
 			"version": version,
-			"slots":   d.slotStatuses(),
+			"tenants": d.tenantStatuses(),
 			"loads":   d.loads.snapshot(),
 		}, nil
 
@@ -158,67 +158,67 @@ func (d *demesne) rpcCall(method string, raw json.RawMessage) (any, *rpcError) {
 		}
 		return rep, nil
 
-	case "slots.status":
-		s := d.slotByName(p.Slot)
+	case "tenants.status":
+		s := d.tenantByName(p.Tenant)
 		if s == nil {
-			return nil, d.unknownSlot(p.Slot)
+			return nil, d.unknownTenant(p.Tenant)
 		}
-		return slotStatusOf(s), nil
+		return tenantStatusOf(s), nil
 
-	case "slots.load":
-		s := d.slotByName(p.Slot)
+	case "tenants.load":
+		s := d.tenantByName(p.Tenant)
 		if s == nil {
-			return nil, d.unknownSlot(p.Slot)
+			return nil, d.unknownTenant(p.Tenant)
 		}
 		if err := d.ensure(s); err != nil {
 			return nil, &rpcError{Code: rpcInternal, Message: err.Error()}
 		}
-		return map[string]any{"slot": s.specOf().name, "state": "running"}, nil
+		return map[string]any{"tenant": s.specOf().name, "state": "running"}, nil
 
-	case "slots.reload":
-		s := d.slotByName(p.Slot)
+	case "tenants.reload":
+		s := d.tenantByName(p.Tenant)
 		if s == nil {
-			return nil, d.unknownSlot(p.Slot)
+			return nil, d.unknownTenant(p.Tenant)
 		}
 		n, err := d.reloadPreset(s)
 		if err != nil {
 			return nil, &rpcError{Code: rpcInternal, Message: err.Error()}
 		}
-		return map[string]any{"slot": s.specOf().name, "reloaded": true, "models": n}, nil
+		return map[string]any{"tenant": s.specOf().name, "reloaded": true, "models": n}, nil
 
-	case "slots.reclaim":
-		s := d.slotByName(p.Slot)
+	case "tenants.reclaim":
+		s := d.tenantByName(p.Tenant)
 		if s == nil {
-			return nil, d.unknownSlot(p.Slot)
+			return nil, d.unknownTenant(p.Tenant)
 		}
-		killed, err := d.reclaimSlot(s)
+		killed, err := d.reclaimTenant(s)
 		if err != nil {
 			return nil, &rpcError{Code: rpcInternal, Message: err.Error()}
 		}
-		return map[string]any{"slot": s.specOf().name, "reclaimed": killed}, nil
+		return map[string]any{"tenant": s.specOf().name, "reclaimed": killed}, nil
 
-	case "slots.stop":
-		s := d.slotByName(p.Slot)
+	case "tenants.stop":
+		s := d.tenantByName(p.Tenant)
 		if s == nil {
-			return nil, d.unknownSlot(p.Slot)
+			return nil, d.unknownTenant(p.Tenant)
 		}
 		d.evict(s, stopOperator, "operator stop over the control plane")
-		return map[string]any{"slot": s.specOf().name, "state": "stopped"}, nil
+		return map[string]any{"tenant": s.specOf().name, "state": "stopped"}, nil
 	}
 	return nil, &rpcError{Code: rpcNoMethod, Message: "no such method: " + method,
-		Data: []string{"estate.status", "estate.card", "estate.reload", "slots.status", "slots.load", "slots.stop"}}
+		Data: []string{"estate.status", "estate.card", "estate.reload", "tenants.status", "tenants.load", "tenants.stop"}}
 }
 
-func (d *demesne) unknownSlot(name string) *rpcError {
+func (d *demesne) unknownTenant(name string) *rpcError {
 	if name == "" {
-		return &rpcError{Code: rpcBadParams, Message: "params.slot is required", Data: d.slotNames()}
+		return &rpcError{Code: rpcBadParams, Message: "params.tenant is required", Data: d.tenantNames()}
 	}
-	return &rpcError{Code: rpcBadParams, Message: "no such slot: " + name, Data: d.slotNames()}
+	return &rpcError{Code: rpcBadParams, Message: "no such tenant: " + name, Data: d.tenantNames()}
 }
 
-func (d *demesne) slotNames() []string {
-	out := make([]string, 0, len(d.slots))
-	for _, s := range d.slots {
+func (d *demesne) tenantNames() []string {
+	out := make([]string, 0, len(d.tenants))
+	for _, s := range d.tenants {
 		out = append(out, s.specOf().name)
 	}
 	return out

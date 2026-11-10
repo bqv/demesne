@@ -6,15 +6,15 @@
 // before Pdeathsig existed -- sat on port 55557 for a day and nineteen hours, and every new
 // llamb crashed against it with a bare `exit status 1`.
 //
-// So a slot whose port is answered gets one chance to take it back, and the bar for killing
+// So a tenant whose port is answered gets one chance to take it back, and the bar for killing
 // anything is evidence, not a guess:
 //
-//  1. the process must be in the slot's OWN cgroup leaf. Only demesne ever moves a process
+//  1. the process must be in the tenant's OWN cgroup leaf. Only demesne ever moves a process
 //     there, so this is close to proof of ownership; and
-//  2. its executable must be the binary the slot is configured to run.
+//  2. its executable must be the binary the tenant is configured to run.
 //
-// A slot with no fence configured has no (1), so it is refused rather than guessed at. The
-// cost of refusing is a stuck slot with a clear reason; the cost of guessing is killing
+// A tenant with no fence configured has no (1), so it is refused rather than guessed at. The
+// cost of refusing is a stuck tenant with a clear reason; the cost of guessing is killing
 // somebody else's process, which is not a trade this program makes.
 
 package main
@@ -93,17 +93,17 @@ func listenInodes(port int) map[string]bool {
 	return out
 }
 
-// reclaimSlot takes the slot's port back from a process that is provably ours. It reports
+// reclaimTenant takes the tenant's port back from a process that is provably ours. It reports
 // whether it killed anything; an error is a refusal with the reason, and the port is left
 // alone.
-func (d *demesne) reclaimSlot(s *slot) (bool, error) {
+func (d *demesne) reclaimTenant(s *tenant) (bool, error) {
 	pid, ok := procEndpointPID(s.specOf().url, s.port())
 	if !ok {
 		return false, nil
 	}
 	m := s.specOf().cgroup
 	if !m.set() {
-		return false, fmt.Errorf("%s is held by pid %d, and this slot has no cgroup fence "+
+		return false, fmt.Errorf("%s is held by pid %d, and this tenant has no cgroup fence "+
 			"to prove the holder is ours; refusing to kill it", endpointName(s.specOf().url, s.port()), pid)
 	}
 	if joined, err := inCgroup(pid, m.leaf); err != nil || !joined {

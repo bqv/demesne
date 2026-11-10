@@ -33,25 +33,25 @@ const (
 	keyModelsBad = "model"
 )
 
-var slotKeys = map[string]bool{
+var tenantKeys = map[string]bool{
 	keyKind: true, keyModels: true, keyAliases: true, keyURL: true, keyBin: true,
 	keyArgs: true, keyEnv: true, keyDir: true, keyPolicy: true, keyGroup: true,
 	keyVRAM: true, keyIdle: true, keyMemHigh: true, keyMemMax: true, keyMemSwap: true,
 	keyReadMBs: true, keyFallback: true, keyModelsBad: true,
 }
 
-type slotSection struct {
+type tenantSection struct {
 	name string
 	kv   map[string]string
 	line int
 }
 
-func parseSlotsFile(path string) ([]slotSection, error) {
+func parseTenantsFile(path string) ([]tenantSection, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	var out []slotSection
+	var out []tenantSection
 	cur := -1
 	for i, raw := range strings.Split(string(b), "\n") {
 		line := strings.TrimSpace(raw)
@@ -68,15 +68,15 @@ func parseSlotsFile(path string) ([]slotSection, error) {
 			}
 			for _, prev := range out {
 				if prev.name == name {
-					return nil, fmt.Errorf("%s:%d: duplicate slot %q", path, i+1, name)
+					return nil, fmt.Errorf("%s:%d: duplicate tenant %q", path, i+1, name)
 				}
 			}
-			out = append(out, slotSection{name: name, kv: map[string]string{}, line: i + 1})
+			out = append(out, tenantSection{name: name, kv: map[string]string{}, line: i + 1})
 			cur = len(out) - 1
 			continue
 		}
 		if cur < 0 {
-			return nil, fmt.Errorf("%s:%d: %q is outside any [slot]", path, i+1, line)
+			return nil, fmt.Errorf("%s:%d: %q is outside any [tenant]", path, i+1, line)
 		}
 		key, value, ok := strings.Cut(line, "=")
 		if !ok {
@@ -84,11 +84,11 @@ func parseSlotsFile(path string) ([]slotSection, error) {
 		}
 		key = strings.ToLower(strings.TrimSpace(key))
 		value = strings.TrimSpace(value)
-		if !slotKeys[key] {
+		if !tenantKeys[key] {
 			return nil, fmt.Errorf("%s:%d: unknown key %q in [%s]", path, i+1, key, out[cur].name)
 		}
 		if key == keyModelsBad {
-			return nil, fmt.Errorf("%s:%d: use %q, not %q, in [%s] -- a slot serves a set",
+			return nil, fmt.Errorf("%s:%d: use %q, not %q, in [%s] -- a tenant serves a set",
 				path, i+1, keyModels, keyModelsBad, out[cur].name)
 		}
 		out[cur].kv[key] = value
@@ -96,26 +96,26 @@ func parseSlotsFile(path string) ([]slotSection, error) {
 	return out, nil
 }
 
-func specFromSection(sec slotSection, c config) (slotSpec, error) {
+func specFromSection(sec tenantSection, c config) (tenantSpec, error) {
 	kv := sec.kv
-	kind, err := parseSlotKind(kv[keyKind])
+	kind, err := parseTenantKind(kv[keyKind])
 	if err != nil {
-		return slotSpec{}, fmt.Errorf("%s: %w", sec.name, err)
+		return tenantSpec{}, fmt.Errorf("%s: %w", sec.name, err)
 	}
 	url := kv[keyURL]
 	if url == "" {
-		return slotSpec{}, fmt.Errorf("%s: url is required", sec.name)
+		return tenantSpec{}, fmt.Errorf("%s: url is required", sec.name)
 	}
 	pol, err := parsePolicy(kv[keyPolicy])
 	if err != nil {
-		return slotSpec{}, fmt.Errorf("%s: %w", sec.name, err)
+		return tenantSpec{}, fmt.Errorf("%s: %w", sec.name, err)
 	}
 	models := splitNames(kv[keyModels])
 	aliases := splitNames(kv[keyAliases])
 	if kind == kindModel && len(models) == 0 && len(aliases) == 0 {
-		return slotSpec{}, fmt.Errorf("%s: kind=model needs models or aliases, or nothing can address it", sec.name)
+		return tenantSpec{}, fmt.Errorf("%s: kind=model needs models or aliases, or nothing can address it", sec.name)
 	}
-	spec := slotSpec{
+	spec := tenantSpec{
 		name: sec.name, url: url, bin: kv[keyBin], args: fields(kv[keyArgs]),
 		env: fields(kv[keyEnv]), dir: kv[keyDir], models: models, aliases: aliases,
 		group: kv[keyGroup], policy: pol, kind: kind, cgroup: c.memLimits(sec.name, kv),
@@ -123,7 +123,7 @@ func specFromSection(sec slotSection, c config) (slotSpec, error) {
 	if s := kv[keyIdle]; s != "" {
 		d, err := time.ParseDuration(s)
 		if err != nil || d < 0 {
-			return slotSpec{}, fmt.Errorf("%s: idle %q is not a duration", sec.name, s)
+			return tenantSpec{}, fmt.Errorf("%s: idle %q is not a duration", sec.name, s)
 		}
 		spec.idle = d
 	} else if pol == policyOnDemand {
@@ -132,14 +132,14 @@ func specFromSection(sec slotSection, c config) (slotSpec, error) {
 	if s := kv[keyVRAM]; s != "" {
 		n, err := strconv.Atoi(s)
 		if err != nil || n < 0 {
-			return slotSpec{}, fmt.Errorf("%s: vram_mb %q is not a number", sec.name, s)
+			return tenantSpec{}, fmt.Errorf("%s: vram_mb %q is not a number", sec.name, s)
 		}
 		spec.vramMB = n
 	}
 	if s := kv[keyReadMBs]; s != "" {
 		f, err := strconv.ParseFloat(s, 64)
 		if err != nil || f <= 0 {
-			return slotSpec{}, fmt.Errorf("%s: read_mb_s %q is not a positive number", sec.name, s)
+			return tenantSpec{}, fmt.Errorf("%s: read_mb_s %q is not a positive number", sec.name, s)
 		}
 		spec.readMBs = f
 	}
@@ -149,10 +149,10 @@ func specFromSection(sec slotSection, c config) (slotSpec, error) {
 	spec.fallback = strings.EqualFold(kv[keyFallback], "true")
 	if path := unixPath(url); url != "" && strings.HasPrefix(url, "unix:") {
 		if path == "" || !filepath.IsAbs(path) {
-			return slotSpec{}, fmt.Errorf("%s: unix url needs an absolute path, got %q", sec.name, url)
+			return tenantSpec{}, fmt.Errorf("%s: unix url needs an absolute path, got %q", sec.name, url)
 		}
 		if !strings.HasSuffix(path, ".sock") {
-			return slotSpec{}, fmt.Errorf("%s: %q must end in .sock or the engine treats it as a TCP host", sec.name, path)
+			return tenantSpec{}, fmt.Errorf("%s: %q must end in .sock or the engine treats it as a TCP host", sec.name, path)
 		}
 	}
 	return spec, nil
@@ -176,10 +176,10 @@ func parsePolicy(s string) (policy, error) {
 	return 0, fmt.Errorf("unknown policy %q (on-demand or external)", s)
 }
 
-func (c config) memLimits(slot string, kv map[string]string) memLimit {
-	m := memLimitFor(c.cgroupRoot, slot, envRaw)
+func (c config) memLimits(tenant string, kv map[string]string) memLimit {
+	m := memLimitFor(c.cgroupRoot, tenant, envRaw)
 	if m.leaf == "" {
-		m.leaf = filepath.Join(c.cgroupRoot, cgroupLeaf(slot))
+		m.leaf = filepath.Join(c.cgroupRoot, cgroupLeaf(tenant))
 	}
 	if v := kv[keyMemHigh]; v != "" {
 		m.high = v
@@ -193,13 +193,17 @@ func (c config) memLimits(slot string, kv map[string]string) memLimit {
 	return m
 }
 
-func slotsFromFile(c config, path string) ([]slotSpec, []string, error) {
-	base := buildSlots(c)
-	sections, err := parseSlotsFile(path)
-	if err != nil {
-		return nil, nil, fmt.Errorf("slots file: %w", err)
+func tenantsFromConfig(c config) ([]tenantSpec, []string, error) {
+	base := buildTenants(c)
+	if c.tenantsFile == "" {
+		return base, nil, nil
 	}
-	byName := map[string]slotSpec{}
+	path := c.tenantsFile
+	sections, err := parseTenantsFile(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("tenants file: %w", err)
+	}
+	byName := map[string]tenantSpec{}
 	for _, sp := range base {
 		byName[sp.name] = sp
 	}
@@ -215,55 +219,80 @@ func slotsFromFile(c config, path string) ([]slotSpec, []string, error) {
 		}
 		byName[sp.name] = sp
 	}
-	out := make([]slotSpec, 0, len(byName))
+	out := make([]tenantSpec, 0, len(byName))
 	for _, sp := range byName {
 		out = append(out, sp)
 	}
-	return sortedSpecs(out), notes, nil
+	return sortedTenants(out), notes, nil
 }
 
-func sortedSpecs(in []slotSpec) []slotSpec {
-	out := append([]slotSpec(nil), in...)
+func sortedTenants(in []tenantSpec) []tenantSpec {
+	out := append([]tenantSpec(nil), in...)
 	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
 	return out
 }
 
-func sortedSlotPtrs(in []*slot) []*slot {
-	out := append([]*slot(nil), in...)
+func sortedTenantPtrs(in []*tenant) []*tenant {
+	out := append([]*tenant(nil), in...)
 	sort.Slice(out, func(i, j int) bool { return out[i].specOf().name < out[j].specOf().name })
 	return out
 }
 
-func slotLogLine(sp slotSpec) string {
-	return fmt.Sprintf("slot %-10s kind=%-6s policy=%-9s group=%-4s url=%-42s models=%-34s vram=%-9s reload=%-9s idle=%s",
+func runCheck(cfg config) {
+	specs, notes, err := tenantsFromConfig(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "demesne: %v\n", err)
+		os.Exit(1)
+	}
+	for _, note := range notes {
+		fmt.Println("note: " + note)
+	}
+	for _, sp := range sortedTenants(specs) {
+		fmt.Println(tenantLogLine(sp))
+	}
+	if len(notes) > 0 {
+		fmt.Printf("%d tenant(s) replaced a built-in default\n", len(notes))
+	}
+}
+
+func tenantLogLine(sp tenantSpec) string {
+	return fmt.Sprintf("tenant %-10s kind=%-6s policy=%-9s group=%-4s url=%-42s models=%-34s vram_mb=%-7s reload_s=%-5s idle=%s",
 		sp.name, sp.kind, sp.policy, orNone(sp.group), sp.url, strings.Join(append(append([]string{}, sp.models...), sp.aliases...), ","),
 		vramDeclared(sp), reloadCost(sp), idleString(sp))
 }
 
-func vramDeclared(sp slotSpec) string {
+func vramDeclared(sp tenantSpec) string {
 	if sp.vramMB == 0 {
-		return "undeclared"
+		return "?"
 	}
-	return fmt.Sprintf("%dMiB", sp.vramMB)
+	return fmt.Sprintf("%d", sp.vramMB)
 }
 
-func idleString(sp slotSpec) string {
+func idleString(sp tenantSpec) string {
 	if sp.idle == 0 {
 		return "never"
 	}
 	return sp.idle.String()
 }
 
-func reloadCost(sp slotSpec) string {
+func reloadCost(sp tenantSpec) string {
 	n := weightsBytes(sp)
 	if n == 0 {
-		return "unknown"
+		return "?"
 	}
 	secs := float64(n) / (defaultReadMBs * 1e6)
-	return fmt.Sprintf("%.1fGiB/%.0fs", float64(n)/(1<<30), secs)
+	return fmt.Sprintf("%.0f", secs)
 }
 
-func weightsBytes(sp slotSpec) int64 {
+func reloadSeconds(sp tenantSpec) string {
+	n := weightsBytes(sp)
+	if n == 0 {
+		return "?"
+	}
+	return fmt.Sprintf("%.0fs", float64(n)/(defaultReadMBs*1e6))
+}
+
+func weightsBytes(sp tenantSpec) int64 {
 	path := modelPath(sp)
 	if path == "" {
 		return 0
@@ -275,7 +304,7 @@ func weightsBytes(sp slotSpec) int64 {
 	return fi.Size()
 }
 
-func modelPath(sp slotSpec) string {
+func modelPath(sp tenantSpec) string {
 	args := sp.args
 	for i := 0; i < len(args); i++ {
 		switch args[i] {

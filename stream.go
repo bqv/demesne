@@ -195,7 +195,7 @@ func (d *demesne) streamUpstream(w http.ResponseWriter, r *http.Request, url str
 }
 
 // streamChat is the chat path when the caller asked for a stream: answer, then relay.
-func (d *demesne) streamChat(w http.ResponseWriter, r *http.Request, s *slot, body []byte) {
+func (d *demesne) streamChat(w http.ResponseWriter, r *http.Request, s *tenant, body []byte) {
 	url := strings.TrimRight(s.specOf().url, "/") + r.URL.Path
 	out, resp, done, err := d.streamUpstream(w, r, url, body)
 	defer done()

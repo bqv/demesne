@@ -27,9 +27,9 @@ const usage = `demesne -- one owner for the box's local-inference estate
 
   demesne                       run the estate (OpenRC starts this)
   demesne status                the whole estate, from /status
-  demesne release [slot]        evict one on-demand engine, or all that are up
-  demesne load <slot>           start an engine and wait for its port
-  demesne stop <slot>           stop an engine
+  demesne release [tenant]        evict one on-demand engine, or all that are up
+  demesne load <tenant>           start an engine and wait for its port
+  demesne stop <tenant>           stop an engine
   demesne reload                re-read the config file; only what changed is touched
   demesne version               print the version
 
@@ -81,6 +81,9 @@ func runSubcommand(sub string, cfg config) {
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 		return
+	case "check":
+		runCheck(cfg)
+		return
 	case "status", "release", "load", "start", "stop", "reload":
 	default:
 		fmt.Fprintf(os.Stderr, "demesne: unknown subcommand %q\n\n%s", sub, usage)
@@ -92,12 +95,12 @@ func runSubcommand(sub string, cfg config) {
 	case "release":
 		path = "/release"
 		if args := flag.Args(); len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-			path += "?slot=" + args[0]
+			path += "?tenant=" + args[0]
 		}
 	case "load", "start":
-		method, path = http.MethodPost, "/slots/"+slotArg(sub)+"/load"
+		method, path = http.MethodPost, "/tenants/"+tenantArg(sub)+"/load"
 	case "stop":
-		method, path = http.MethodPost, "/slots/"+slotArg(sub)+"/stop"
+		method, path = http.MethodPost, "/tenants/"+tenantArg(sub)+"/stop"
 	case "reload":
 		method, path = http.MethodPost, "/reload"
 	}
@@ -109,10 +112,10 @@ func runSubcommand(sub string, cfg config) {
 	fmt.Print(body)
 }
 
-func slotArg(sub string) string {
+func tenantArg(sub string) string {
 	args := flag.Args()
 	if len(args) == 0 {
-		fmt.Fprintf(os.Stderr, "demesne: %s wants a slot name (llama, llamb, sd, whisper)\n", sub)
+		fmt.Fprintf(os.Stderr, "demesne: %s wants a tenant name (llama, llamb, sd, whisper)\n", sub)
 		os.Exit(2)
 	}
 	return args[0]

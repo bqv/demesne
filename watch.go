@@ -101,7 +101,7 @@ func (w *llmWatch) ok() {
 	w.orphaned = false
 }
 
-// budget reports whether one more restart is allowed, and claims the slot so two
+// budget reports whether one more restart is allowed, and claims the tenant so two
 // failing requests cannot start two restarts.
 func (w *llmWatch) budget(now time.Time, window time.Duration, max int) bool {
 	w.mu.Lock()
@@ -227,7 +227,7 @@ func routerModels(base string) ([]string, error) {
 
 // recoverLLM is the only mutation in this file. It runs in its own goroutine so the
 // failed request returns immediately instead of waiting out a model load.
-func (d *demesne) recoverLLM(s *slot, reason string) {
+func (d *demesne) recoverLLM(s *tenant, reason string) {
 	watcher := d.watchFor(s.specOf().name)
 	if !watcher.budget(time.Now(), d.cfg.restartWindow, d.cfg.restartMax) {
 		log.Printf("watch: llama failed (%s) but no restart is allowed now "+

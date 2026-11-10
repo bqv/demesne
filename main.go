@@ -10,9 +10,9 @@
 //	llamb   :55556  the aux router on the second card (GT 1030). Supervised, not routed:
 //	                its clients address it directly.
 //	whisper :55559  whisper.cpp, CPU-only. It used to claim 55557 as well -- the port
-//	                story slot.go settles.
+//	                story tenant.go settles.
 //
-// The rules are in slot.go; this file is configuration, routing, /status and the
+// The rules are in tenant.go; this file is configuration, routing, /status and the
 // operator's CLI.
 //
 // stadi's duties survive unchanged: the proxy in front of the router, the LLM breaker,
@@ -81,6 +81,7 @@ type config struct {
 	listen                            string // where demesne itself listens (the port DSH uses)
 	socket                            string // the same API on a unix socket; empty = no socket
 	confFile                          string // what SIGHUP re-reads; empty = nothing to reload from
+	tenantsFile                       string // tenants.ini describing every engine; empty = the built-in five
 	sd, llama, llamb, whisper, strata engineConfig
 	idle                              time.Duration // evict an on-demand child after this
 	whisperIdle                       time.Duration
@@ -169,7 +170,7 @@ func envInt(flagVal int, key string, def int) int {
 
 func fields(s string) []string { return strings.Fields(s) }
 
-// modelList is a slot's configured model ids: a value that names an existing file is read as
+// modelList is a tenant's configured model ids: a value that names an existing file is read as
 // one id per line (blank lines and #comments ignored), anything else is split as words. So a
 // fixed set can live in the conf as one line or in a file the conf points at.
 func modelList(v string) []string {
@@ -194,15 +195,15 @@ func modelList(v string) []string {
 	return fields(v)
 }
 
-// memLimitFor reads a slot's memory fence from the environment. Env-only on purpose:
+// memLimitFor reads a tenant's memory fence from the environment. Env-only on purpose:
 // these are set once in conf.d/demesne, never typed on a command line, and there are
-// three of them per slot.
-func memLimitFor(root, slot string, get func(string) string) memLimit {
-	// The key is the slot's name UPPERCASED. It was not, which is why every fence in the
+// three of them per tenant.
+func memLimitFor(root, tenant string, get func(string) string) memLimit {
+	// The key is the tenant's name UPPERCASED. It was not, which is why every fence in the
 	// estate was silently unlimited: DEMESNE_sd_MEMORY_HIGH is not a variable anybody sets.
-	key := strings.ToUpper(slot)
+	key := strings.ToUpper(tenant)
 	m := memLimit{
-		leaf:     filepath.Join(root, cgroupLeaf(slot)),
+		leaf:     filepath.Join(root, cgroupLeaf(tenant)),
 		high:     get(key + "_MEMORY_HIGH"),
 		max:      get(key + "_MEMORY_MAX"),
 		swapHigh: get(key + "_SWAP_HIGH"),
@@ -213,7 +214,7 @@ func memLimitFor(root, slot string, get func(string) string) memLimit {
 	return m
 }
 
-// llamaURL keeps the slot's name on the slot's URL. Every other knob of that engine is
+// llamaURL keeps the tenant's name on the tenant's URL. Every other knob of that engine is
 // DEMESNE_LLAMA_*, so DEMESNE_LLM was the one name that did not match the thing it named --
 // and a value silently accepted under an old spelling is how an afternoon gets spent
 // wondering why the documented one did nothing.
@@ -222,7 +223,7 @@ func llamaURL(flagVal string) string {
 		return v
 	}
 	if v := envRaw("LLM"); v != "" {
-		log.Printf("note: DEMESNE_LLM is the old spelling of DEMESNE_LLAMA; using it, but the slot's name is the one to set")
+		log.Printf("note: DEMESNE_LLM is the old spelling of DEMESNE_LLAMA; using it, but the tenant's name is the one to set")
 		return v
 	}
 	return defaultLlamaURL
@@ -297,9 +298,10 @@ func defaultRCService() string {
 
 func loadConfig() config {
 	var (
-		fListen = flag.String("listen", "", "address to listen on (env "+envPrefix+"LISTEN)")
-		fSocket = flag.String("socket", "", "serve the same API on this unix socket too (env "+envPrefix+"SOCKET)")
-		fConf   = flag.String("conf", "", "the configuration file SIGHUP re-reads (env "+envPrefix+"CONF)")
+		fListen  = flag.String("listen", "", "address to listen on (env "+envPrefix+"LISTEN)")
+		fSocket  = flag.String("socket", "", "serve the same API on this unix socket too (env "+envPrefix+"SOCKET)")
+		fConf    = flag.String("conf", "", "the configuration file SIGHUP re-reads (env "+envPrefix+"CONF)")
+		fTenants = flag.String("tenants", "", "file describing every tenant (env "+envPrefix+"TENANTS)")
 
 		fLLM     = flag.String("llm", "", "the llama router's base URL (env "+envPrefix+"LLM)")
 		fSD      = flag.String("sd", "", "URL the sd child comes up on (env "+envPrefix+"SD)")
@@ -317,7 +319,7 @@ func loadConfig() config {
 
 		fLogDir    = flag.String("log-dir", "", "directory for demesne's and the children's logs (env "+envPrefix+"LOG_DIR)")
 		fSDLogDir  = flag.String("sd-log-dir", "", "deprecated: use -log-dir")
-		fCgroup    = flag.String("cgroup-root", "", "delegated cgroup v2 subtree for the slots (env "+envPrefix+"CGROUP_ROOT)")
+		fCgroup    = flag.String("cgroup-root", "", "delegated cgroup v2 subtree for the tenants (env "+envPrefix+"CGROUP_ROOT)")
 		fCgPrepare = flag.String("cgroup-prepare", "", "cgroup-prepare helper, run via sudo -n (env "+envPrefix+"CGROUP_PREPARE)")
 		fCgJoin    = flag.String("cgroup-join", "", "cgroup-join helper, run via sudo -n (env "+envPrefix+"CGROUP_JOIN)")
 
@@ -379,9 +381,10 @@ func loadConfig() config {
 	cgroupRoot := envString(*fCgroup, "CGROUP_ROOT", cgroupRootDefault)
 
 	return config{
-		listen:   envString(*fListen, "LISTEN", "127.0.0.1:55558"),
-		socket:   envString(*fSocket, "SOCKET", ""),
-		confFile: envString(*fConf, "CONF", ""),
+		listen:      envString(*fListen, "LISTEN", "127.0.0.1:55558"),
+		socket:      envString(*fSocket, "SOCKET", ""),
+		confFile:    envString(*fConf, "CONF", ""),
+		tenantsFile: envString(*fTenants, "TENANTS", ""),
 		sd: engineConfig{
 			url:    envString(*fSD, "SD", defaultSDURL),
 			bin:    envString(*fSDBin, "SD_BIN", defaultBin("sd-server")),
@@ -452,18 +455,18 @@ func loadConfig() config {
 
 // validate refuses the configurations that cannot be true. The first is the sd
 // command line (there is no sensible default for it); the rest are the invariants the
-// slot model relies on: one slot per port, and one resident holder of a card per group.
-func (c config) validate(slots []*slot) error {
+// tenant model relies on: one tenant per port, and one resident holder of a card per group.
+func (c config) validate(tenants []*tenant) error {
 	if len(c.sd.args) == 0 {
 		return fmt.Errorf("no sd-server command line given: pass -sd-args \"...\" or set %sSD_ARGS", envPrefix)
 	}
 	ports := map[int]string{}
-	for _, s := range slots {
+	for _, s := range tenants {
 		if s.specOf().url == "" {
 			continue
 		}
-		// A unix slot has no port to read, claim or collide: its address is a path, and two
-		// slots cannot collide on one because the launcher refuses a path that answers.
+		// A unix tenant has no port to read, claim or collide: its address is a path, and two
+		// tenants cannot collide on one because the launcher refuses a path that answers.
 		if unixPath(s.specOf().url) != "" {
 			continue
 		}
@@ -472,14 +475,14 @@ func (c config) validate(slots []*slot) error {
 			return fmt.Errorf("%s: cannot read a port from %q", s.specOf().name, s.specOf().url)
 		}
 		if other, taken := ports[p]; taken {
-			return fmt.Errorf("two slots claim port %d: %s and %s. A port belongs to exactly "+
-				"one slot; move one of them (whisper is CPU-only and does not need 55557)",
+			return fmt.Errorf("two tenants claim port %d: %s and %s. A port belongs to exactly "+
+				"one tenant; move one of them (whisper is CPU-only and does not need 55557)",
 				p, other, s.specOf().name)
 		}
 		ports[p] = s.specOf().name
 	}
 	card := map[string]string{}
-	for _, s := range slots {
+	for _, s := range tenants {
 		if s.specOf().policy != policyResident || !s.specOf().vram || s.specOf().group == "" {
 			continue
 		}
@@ -492,16 +495,16 @@ func (c config) validate(slots []*slot) error {
 	return nil
 }
 
-// buildSlots turns the configuration into the estate. This is the whole slot model in
-// data: the lifecycle in slot.go is generic, and a fifth engine is a literal here.
-func buildSlots(c config) []slotSpec {
-	resident := func(name string, e engineConfig, group string, routed bool, idle time.Duration) slotSpec {
+// buildTenants turns the configuration into the estate. This is the whole tenant model in
+// data: the lifecycle in tenant.go is generic, and a fifth engine is a literal here.
+func buildTenants(c config) []tenantSpec {
+	resident := func(name string, e engineConfig, group string, routed bool, idle time.Duration) tenantSpec {
 		own := e.bin != ""
 		pol := policyResident
 		if !own {
 			pol = policyExternal
 		}
-		return slotSpec{
+		return tenantSpec{
 			name: name, url: e.url, bin: e.bin, args: e.args, env: e.env, dir: e.dir,
 			models: e.models, kind: kindModel,
 			group: group, vram: true, policy: pol, idle: idle,
@@ -516,7 +519,7 @@ func buildSlots(c config) []slotSpec {
 	if c.strata.bin != "" {
 		strataPolicy = policyOnDemand
 	}
-	slots := []slotSpec{
+	tenants := []tenantSpec{
 		// The router: resident, and it keeps the card by keeping models.
 		resident("llama", c.llama, "gpu", true, 0),
 		// The media child: on demand, because it has no other way to give the card back.
@@ -542,7 +545,7 @@ func buildSlots(c config) []slotSpec {
 		resident("llamb", c.llamb, "aux", true, 0),
 	}
 	if c.strata.url != "" {
-		slots = append(slots, slotSpec{
+		tenants = append(tenants, tenantSpec{
 			name: "strata", url: c.strata.url, bin: c.strata.bin,
 			args: c.strata.args, env: c.strata.env, dir: c.strata.dir,
 			kind:  kindModel,
@@ -550,15 +553,15 @@ func buildSlots(c config) []slotSpec {
 			routed: true, router: true, fallback: c.strata.bin == "", cgroup: c.strata.cgroup,
 		})
 	}
-	return slots
+	return tenants
 }
 
 // ----------------------------------------------------------------------- estate
 
 type demesne struct {
-	cfg   config
-	slots []*slot
-	index map[string]*slot
+	cfg     config
+	tenants []*tenant
+	index   map[string]*tenant
 
 	transition sync.Mutex // one transition at a time; never held across a proxy
 	proxies    map[string]*httputil.ReverseProxy
@@ -567,7 +570,7 @@ type demesne struct {
 	// during a restart would otherwise trip the breaker and ask for a restart of an engine
 	// that was simply starting -- the same mistake the /v1/models handler made once.
 	probes  map[string]*httputil.ReverseProxy
-	llm     *llmWatch // the default slot's watch: /status keeps its shape
+	llm     *llmWatch // the default tenant's watch: /status keeps its shape
 	watchMu sync.Mutex
 	watches map[string]*llmWatch
 	models  modelIndex // which engine advertises which model (models.go)
@@ -575,9 +578,11 @@ type demesne struct {
 	hub     *eventHub  // the subscription feed (events.go)
 	history *history   // the last transitions, for the cards
 
-	startedAt time.Time
-	specNotes []string
-	specErr   error
+	startedAt   time.Time
+	tenantNotes []string
+	tenantsErr  error
+	specNotes   []string
+	specErr     error
 
 	done    chan struct{}
 	closing atomic.Bool
@@ -586,7 +591,7 @@ type demesne struct {
 func newDemesne(cfg config) *demesne {
 	d := &demesne{
 		cfg:       cfg,
-		index:     map[string]*slot{},
+		index:     map[string]*tenant{},
 		proxies:   map[string]*httputil.ReverseProxy{},
 		probes:    map[string]*httputil.ReverseProxy{},
 		watches:   map[string]*llmWatch{},
@@ -597,23 +602,28 @@ func newDemesne(cfg config) *demesne {
 		done:      make(chan struct{}),
 	}
 	d.models = newModelIndex()
-	for _, spec := range buildSlots(cfg) {
-		s := &slot{spec: spec, owner: d}
-		d.slots = append(d.slots, s)
+	specs, notes, err := tenantsFromConfig(cfg)
+	d.tenantNotes, d.tenantsErr = notes, err
+	if err != nil {
+		specs = sortedTenants(buildTenants(cfg))
+	}
+	for _, spec := range specs {
+		s := &tenant{spec: spec, owner: d}
+		d.tenants = append(d.tenants, s)
 		d.index[spec.name] = s
 	}
 	// Declared models route from the first request, before any refresh: an on-demand engine
 	// that has never answered must still be nameable.
 	d.seedModels()
-	if s := d.defaultSlot(); s != nil {
+	if s := d.defaultTenant(); s != nil {
 		d.llm = d.watchFor(s.specOf().name)
 	} else {
 		d.llm = newLLMWatch()
 	}
-	for _, s := range d.slots {
+	for _, s := range d.tenants {
 		d.proxies[s.specOf().name] = reverseProxy(d, s, s.specOf().router)
 		d.probes[s.specOf().name] = reverseProxy(d, s, false)
-		// A resident slot is somebody's responsibility from the start. A reload can hand
+		// A resident tenant is somebody's responsibility from the start. A reload can hand
 		// an engine back to OpenRC and take it again, so the flag is a real one and not a
 		// property of the spec.
 		if s.specOf().policy == policyResident {
@@ -623,7 +633,7 @@ func newDemesne(cfg config) *demesne {
 	return d
 }
 
-func (d *demesne) slotByName(name string) *slot { return d.index[name] }
+func (d *demesne) tenantByName(name string) *tenant { return d.index[name] }
 
 // ------------------------------------------------------------------- the card
 
@@ -694,13 +704,13 @@ const (
 	kindChat        routeKind = iota // a request that WANTS the card: wait for a render, evict it, proxy
 	kindProxy                        // proxied to an engine that needs nothing: no card, no eviction
 	kindMetadata                     // proxy untouched: the router loads nothing for these
-	kindGeneration                   // may spawn the slot and re-arm its idle clock
-	kindObservation                  // only ever reports on a slot: never spawns
+	kindGeneration                   // may spawn the tenant and re-arm its idle clock
+	kindObservation                  // only ever reports on a tenant: never spawns
 )
 
 type intent struct {
-	slot string
-	kind routeKind
+	tenant string
+	kind   routeKind
 }
 
 // resolve is the routing table, in one place and as data about paths.
@@ -733,9 +743,9 @@ func resolve(p string) intent {
 		strings.HasPrefix(p, "/v1/chat/completions/"):
 		return intent{"llama", kindChat}
 	}
-	// Anything else that reaches llama is proxied WITHOUT claiming the card: /slots, /metrics,
+	// Anything else that reaches llama is proxied WITHOUT claiming the card: /tenants, /metrics,
 	// /tokenize, /detokenize, /apply-template and whatever the next llama.cpp build adds. The
-	// catch-all used to be chat, which meant a monitoring probe of /slots on the front door
+	// catch-all used to be chat, which meant a monitoring probe of /tenants on the front door
 	// evicted a running render -- a probe is not a claim. What does claim is enumerated above,
 	// because a path nobody recognised must fail safe: a request that quietly loses its card
 	// claim is a slow load, while a probe that quietly takes the card kills someone's render.
@@ -745,7 +755,7 @@ func resolve(p string) intent {
 // reverseProxy builds the pass-through. isLLM adds the watch: a failed dial or a
 // stream that broke mid-body is the strongest evidence about the router, and it
 // arrives before any probe could fire, so the policy hangs off this edge.
-func reverseProxy(d *demesne, s *slot, watch bool) *httputil.ReverseProxy {
+func reverseProxy(d *demesne, s *tenant, watch bool) *httputil.ReverseProxy {
 	base := s.specOf().url
 	watcher := d.watchFor(s.specOf().name)
 	target, err := url.Parse(base)
@@ -832,8 +842,8 @@ func (d *demesne) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.handleEvents(w, r)
 	case p == "/release":
 		d.handleRelease(w, r)
-	case strings.HasPrefix(p, "/slots/"):
-		d.handleSlotControl(w, r)
+	case strings.HasPrefix(p, "/tenants/"):
+		d.handleTenantControl(w, r)
 	default:
 		d.route(w, r, resolve(p))
 	}
@@ -842,15 +852,15 @@ func (d *demesne) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (d *demesne) route(w http.ResponseWriter, r *http.Request, in intent) {
 	// A chat request names the model it wants, and the model decides the engine: demesne
 	// answers on the number every caller already means, so the name has to choose. The
-	// path still decides the KIND of request; only the slot moves.
+	// path still decides the KIND of request; only the tenant moves.
 	var pk peeked
 	if in.kind == kindChat {
 		pk = peekRequest(r)
-		name := d.slotForModel(pk.model)
+		name := d.tenantForModel(pk.model)
 		if name != "" {
-			in.slot = name
+			in.tenant = name
 		}
-		// A model that no slot declares or advertises is a 404, not a silent fall through to
+		// A model that no tenant declares or advertises is a 404, not a silent fall through to
 		// the default engine: on 2026-11-09 a request for a stopped on-demand engine's model
 		// reached llama, which failed to load a name absent from its own models.ini and then
 		// restored its previous model, putting an unrelated d1 back on the card. The request
@@ -859,13 +869,13 @@ func (d *demesne) route(w http.ResponseWriter, r *http.Request, in intent) {
 			writeModelNotFound(w, pk.model, d.knownModels())
 			return
 		}
-		if pk.model != "" && isRouterSlot(d.index[in.slot].specOf().bin) {
-			d.loads.noteRequest(in.slot, pk.model)
+		if pk.model != "" && isRouterTenant(d.index[in.tenant].specOf().bin) {
+			d.loads.noteRequest(in.tenant, pk.model)
 		}
 	}
-	s := d.slotByName(in.slot)
+	s := d.tenantByName(in.tenant)
 	if s == nil {
-		http.Error(w, "demesne: no such slot: "+in.slot, http.StatusInternalServerError)
+		http.Error(w, "demesne: no such tenant: "+in.tenant, http.StatusInternalServerError)
 		return
 	}
 	if !s.specOf().own() && !s.specOf().fallback {
@@ -944,10 +954,10 @@ func (d *demesne) watchFor(name string) *llmWatch {
 // arrived in: the router's breaker, the bounded wait for a booting engine, and the eviction of
 // the media child when it shares the group. It writes its own refusal and reports whether the
 // caller may proceed.
-func (d *demesne) claimCard(w http.ResponseWriter, r *http.Request, s *slot) bool {
-	// The breaker is a property of an ENGINE, not of the slot called llama: any slot that
-	// advertises models is one, so a per-model slot gets a breaker too instead of silently
-	// having none. It is still one shared watch; per-slot watches are the follow-up.
+func (d *demesne) claimCard(w http.ResponseWriter, r *http.Request, s *tenant) bool {
+	// The breaker is a property of an ENGINE, not of the tenant called llama: any tenant that
+	// advertises models is one, so a per-model tenant gets a breaker too instead of silently
+	// having none. It is still one shared watch; per-tenant watches are the follow-up.
 	if s.specOf().router {
 		if open, wait := d.watchFor(s.specOf().name).failing(); open {
 			w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())))
@@ -969,9 +979,9 @@ func (d *demesne) claimCard(w http.ResponseWriter, r *http.Request, s *slot) boo
 			return false
 		}
 	}
-	// The group is the one of the slot the request actually reaches, not of the path: a
+	// The group is the one of the tenant the request actually reaches, not of the path: a
 	// model that lives on the small card must not kill a render on the big one.
-	if sd := d.slotByName("sd"); sd != nil && sd.specOf().group == s.specOf().group {
+	if sd := d.tenantByName("sd"); sd != nil && sd.specOf().group == s.specOf().group {
 		// If a render is in flight, wait for it to finish -- then say so plainly instead
 		// of killing it.
 		if n := atomic.LoadInt64(&sd.inflight); n > 0 {
@@ -989,8 +999,8 @@ func (d *demesne) claimCard(w http.ResponseWriter, r *http.Request, s *slot) boo
 			d.evict(sd, stopChat, "a chat request wants the card")
 		}
 	}
-	// Sibling MODEL slots share the card too. A request may take it from any other slot in
-	// the group -- least recently used first -- but never from the slot it is being routed
+	// Sibling MODEL tenants share the card too. A request may take it from any other tenant in
+	// the group -- least recently used first -- but never from the tenant it is being routed
 	// to, and never from a resident one: resident is the operator saying keep it.
 	for _, other := range d.cardSiblings(s) {
 		d.evict(other, stopChat, "a request for "+s.specOf().name+" wants the card")
@@ -998,14 +1008,14 @@ func (d *demesne) claimCard(w http.ResponseWriter, r *http.Request, s *slot) boo
 	return true
 }
 
-// defaultSlot is the engine that answers when no slot declares or advertises the model, and
-// the one whose own /v1/models is used when no router answered. It is the llama slot when the
+// defaultTenant is the engine that answers when no tenant declares or advertises the model, and
+// the one whose own /v1/models is used when no router answered. It is the llama tenant when the
 // estate has one, so no caller has to know the name.
-func (d *demesne) defaultSlot() *slot {
-	if s := d.slotByName("llama"); s != nil {
+func (d *demesne) defaultTenant() *tenant {
+	if s := d.tenantByName("llama"); s != nil {
 		return s
 	}
-	for _, s := range d.slots {
+	for _, s := range d.tenants {
 		if s.specOf().router && s.specOf().routed {
 			return s
 		}
@@ -1013,20 +1023,20 @@ func (d *demesne) defaultSlot() *slot {
 	return nil
 }
 
-// cardSiblings lists the slots that hold part of the same card and may be asked to give it
+// cardSiblings lists the tenants that hold part of the same card and may be asked to give it
 // back, least recently used first. The requester is never in the list.
-func (d *demesne) cardSiblings(s *slot) []*slot {
+func (d *demesne) cardSiblings(s *tenant) []*tenant {
 	group := s.specOf().group
 	if group == "" {
 		return nil
 	}
-	var out []*slot
-	for _, other := range d.slots {
+	var out []*tenant
+	for _, other := range d.tenants {
 		spec := other.specOf()
 		if other == s || spec.group != group || !spec.vram || spec.policy == policyResident {
 			continue
 		}
-		// Only a slot demesne owns can be told to give the card back; an external engine's
+		// Only a tenant demesne owns can be told to give the card back; an external engine's
 		// VRAM is not ours to reclaim, and pretending otherwise would lie in /status.
 		if !spec.own() {
 			continue
@@ -1044,7 +1054,7 @@ func (d *demesne) cardSiblings(s *slot) []*slot {
 
 // ------------------------------------------------------------------- /status
 
-type slotStatus struct {
+type tenantStatus struct {
 	Name       string  `json:"name"`
 	Listen     string  `json:"listen"`
 	ListenPort int     `json:"port"`
@@ -1060,26 +1070,26 @@ type slotStatus struct {
 	UptimeSecs float64 `json:"uptime_s,omitempty"`
 	Restarts   int     `json:"restarts"`
 	LastError  string  `json:"last_error,omitempty"`
-	// LastTransition is why this slot's child is not running: idle, chat-claims-card,
+	// LastTransition is why this tenant's child is not running: idle, chat-claims-card,
 	// operator or failed. Absent while it is running, because then there is nothing to
 	// explain -- it is cleared on readiness for the same reason last_error is.
 	LastTransition stopReason    `json:"last_transition,omitempty"`
 	Cgroup         *cgroupStatus `json:"cgroup,omitempty"`
 }
 
-func (d *demesne) slotStatuses() []slotStatus {
-	out := make([]slotStatus, 0, len(d.slots))
-	for _, s := range d.slots {
-		out = append(out, slotStatusOf(s))
+func (d *demesne) tenantStatuses() []tenantStatus {
+	out := make([]tenantStatus, 0, len(d.tenants))
+	for _, s := range d.tenants {
+		out = append(out, tenantStatusOf(s))
 	}
 	return out
 }
 
-// slotStatusOf reads one slot without the transition lock, so a status poll is never
+// tenantStatusOf reads one tenant without the transition lock, so a status poll is never
 // stuck behind an eight-minute cold load.
-func slotStatusOf(s *slot) slotStatus {
+func tenantStatusOf(s *tenant) tenantStatus {
 	s.mu.Lock()
-	st := slotStatus{
+	st := tenantStatus{
 		Name: s.specOf().name, Listen: s.specOf().url, ListenPort: s.port(),
 		Group: s.specOf().group, Policy: s.specOf().policy.String(), Owned: s.specOf().own(),
 		Up: s.up, Booting: s.up && s.readyAt.IsZero(), PID: s.pid,
@@ -1116,7 +1126,7 @@ func slotStatusOf(s *slot) slotStatus {
 		return st
 	}
 
-	// A port answered while the slot is down means someone else owns it. Bounded
+	// A port answered while the tenant is down means someone else owns it. Bounded
 	// short: /status is polled, and it must never be the slowest thing on the box.
 	if !st.Up && portAliveWithin(s.specOf().url, 150*time.Millisecond) {
 		foreign = true
@@ -1128,7 +1138,7 @@ func slotStatusOf(s *slot) slotStatus {
 }
 
 func (d *demesne) status(w http.ResponseWriter) {
-	sd := d.slotByName("sd")
+	sd := d.tenantByName("sd")
 	up, pid := false, 0
 	inflight := int64(0)
 	if sd != nil {
@@ -1136,19 +1146,21 @@ func (d *demesne) status(w http.ResponseWriter) {
 		inflight = atomic.LoadInt64(&sd.inflight)
 	}
 	used, _ := vramUsed()
+	statuses := d.tenantStatuses()
 	out := map[string]any{
-		// The estate, as slots.
+		// The estate, as tenants. "slots" is the deprecated alias hgtop still reads.
 		"version":         version,
 		"listen":          d.cfg.listen,
 		"socket":          d.cfg.socket,
 		"vram_used_gib":   float64(used) / (1 << 30),
 		"media_in_flight": inflight,
 		"llm_health":      d.llm.snapshot(),
-		"slots":           d.slotStatuses(),
+		"tenants":         statuses,
+		"slots":           statuses,
 		"loads":           d.loads.snapshot(),
 
 		// stadi's field names, kept because DSH and the habit of a year read them.
-		"slot":           slotName(up),
+		"tenant":         tenantName(up),
 		"sd_child_up":    up,
 		"sd_child_pid":   pid,
 		"sd_listen":      d.cfg.sd.url,
@@ -1161,9 +1173,9 @@ func (d *demesne) status(w http.ResponseWriter) {
 	_ = enc.Encode(out)
 }
 
-// slotName is stadi's one-bit answer to "who holds the card", kept as-is: it is what
+// tenantName is stadi's one-bit answer to "who holds the card", kept as-is: it is what
 // the old /status published and nothing gained by renaming it.
-func slotName(sdUp bool) string {
+func tenantName(sdUp bool) string {
 	if sdUp {
 		return "sd"
 	}
@@ -1177,13 +1189,13 @@ func slotName(sdUp bool) string {
 // to parse four kilobytes of operator detail to find two booleans, and every field it
 // parses is a field it comes to depend on. The four fields below are the whole contract.
 type estateCard struct {
-	Group   string     `json:"group"`
-	Holders []string   `json:"holders"`
-	SinceMS int64      `json:"since_ms"`
-	Slots   []cardSlot `json:"slots"`
+	Group   string       `json:"group"`
+	Holders []string     `json:"holders"`
+	SinceMS int64        `json:"since_ms"`
+	Tenants []cardTenant `json:"tenants"`
 }
 
-type cardSlot struct {
+type cardTenant struct {
 	Name  string `json:"name"`
 	State string `json:"state"`
 }
@@ -1210,12 +1222,12 @@ func (d *demesne) card(w http.ResponseWriter, r *http.Request) {
 // cardDocument is the card answer itself, so the HTTP endpoint and the typed control plane
 // cannot drift apart: one builds it, the other wraps it.
 func (d *demesne) cardDocument(group string) estateCard {
-	out := estateCard{Group: group, Holders: []string{}, Slots: []cardSlot{}}
-	for _, s := range d.slots {
+	out := estateCard{Group: group, Holders: []string{}, Tenants: []cardTenant{}}
+	for _, s := range d.tenants {
 		if s.specOf().group != group {
 			continue
 		}
-		st := slotStatusOf(s)
+		st := tenantStatusOf(s)
 		state := "stopped"
 		switch {
 		case st.Up && st.Booting:
@@ -1223,7 +1235,7 @@ func (d *demesne) cardDocument(group string) estateCard {
 		case st.Up:
 			state = "running"
 		}
-		out.Slots = append(out.Slots, cardSlot{Name: s.specOf().name, State: state})
+		out.Tenants = append(out.Tenants, cardTenant{Name: s.specOf().name, State: state})
 		if state != "running" || !d.holdsTheCard(s) {
 			continue
 		}
@@ -1235,10 +1247,10 @@ func (d *demesne) cardDocument(group string) estateCard {
 	return out
 }
 
-// downReason makes last_transition a total function for a slot that is down: a slot that has
+// downReason makes last_transition a total function for a tenant that is down: a tenant that has
 // never run is down for want of a request, which is the same situation the idle timer produces,
 // so it says "idle" rather than leaving a client to interpret an absent field as an unknown
-// state. While the slot is up the field is absent -- there is nothing to explain.
+// state. While the tenant is up the field is absent -- there is nothing to explain.
 func downReason(reason stopReason, up bool) stopReason {
 	if up || reason != "" {
 		return reason
@@ -1254,7 +1266,7 @@ func downReason(reason stopReason, up bool) stopReason {
 // The evidence, in order: a request in flight (it is loading or answering), then the router's
 // own model status, then -- for a build that publishes none -- the process itself, which is
 // the coarse answer but never the wrong way round.
-func (d *demesne) holdsTheCard(s *slot) bool {
+func (d *demesne) holdsTheCard(s *tenant) bool {
 	if !s.specOf().router {
 		return true
 	}
@@ -1270,13 +1282,13 @@ func (d *demesne) holdsTheCard(s *slot) bool {
 // ------------------------------------------------------------------ /release
 
 func (d *demesne) handleRelease(w http.ResponseWriter, r *http.Request) {
-	name := r.URL.Query().Get("slot")
-	if name != "" && d.slotByName(name) == nil {
-		http.Error(w, "demesne: no such slot: "+name, http.StatusNotFound)
+	name := r.URL.Query().Get("tenant")
+	if name != "" && d.tenantByName(name) == nil {
+		http.Error(w, "demesne: no such tenant: "+name, http.StatusNotFound)
 		return
 	}
 	released := []string{}
-	for _, s := range d.slots {
+	for _, s := range d.tenants {
 		if name != "" && s.specOf().name != name {
 			continue
 		}
@@ -1296,18 +1308,18 @@ func (d *demesne) handleRelease(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "released %s\n", strings.Join(released, " "))
 }
 
-// handleSlotControl is the per-engine operator interface: /slots/<name>{,/status,
+// handleTenantControl is the per-engine operator interface: /tenants/<name>{,/status,
 // /load,/stop}. It replaces "rc-service --user llama restart" as the way to touch one
 // engine, because rc-service can no longer see a child demesne forked.
-func (d *demesne) handleSlotControl(w http.ResponseWriter, r *http.Request) {
-	rest := strings.TrimPrefix(r.URL.Path, "/slots/")
+func (d *demesne) handleTenantControl(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/tenants/")
 	name, action := rest, ""
 	if i := strings.IndexByte(rest, '/'); i >= 0 {
 		name, action = rest[:i], rest[i+1:]
 	}
-	s := d.slotByName(name)
+	s := d.tenantByName(name)
 	if s == nil {
-		http.Error(w, "demesne: no such slot: "+name, http.StatusNotFound)
+		http.Error(w, "demesne: no such tenant: "+name, http.StatusNotFound)
 		return
 	}
 	switch action {
@@ -1315,7 +1327,7 @@ func (d *demesne) handleSlotControl(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		enc := json.NewEncoder(w)
 		enc.SetIndent("", "  ")
-		_ = enc.Encode(slotStatusOf(s))
+		_ = enc.Encode(tenantStatusOf(s))
 	case "load", "start":
 		if r.Method != http.MethodPost {
 			http.Error(w, "demesne: POST required", http.StatusMethodNotAllowed)
@@ -1349,7 +1361,7 @@ func (d *demesne) handleSlotControl(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "demesne: POST required", http.StatusMethodNotAllowed)
 			return
 		}
-		killed, err := d.reclaimSlot(s)
+		killed, err := d.reclaimTenant(s)
 		if err != nil {
 			http.Error(w, "demesne: "+err.Error(), http.StatusConflict)
 			return
@@ -1360,7 +1372,7 @@ func (d *demesne) handleSlotControl(w http.ResponseWriter, r *http.Request) {
 		}
 		fmt.Fprintf(w, "%s: port taken back\n", s.specOf().name)
 	default:
-		http.Error(w, "demesne: try /slots/<name>, /load or /stop", http.StatusNotFound)
+		http.Error(w, "demesne: try /tenants/<name>, /load or /stop", http.StatusNotFound)
 	}
 }
 
@@ -1383,7 +1395,7 @@ func main() {
 	}
 
 	d := newDemesne(cfg)
-	if err := cfg.validate(d.slots); err != nil {
+	if err := cfg.validate(d.tenants); err != nil {
 		log.Fatal(err)
 	}
 
@@ -1392,18 +1404,13 @@ func main() {
 	if cfg.socket != "" {
 		log.Printf("the same API is also on unix:%s (mode 0600)", cfg.socket)
 	}
-	for _, s := range d.slots {
-		note := ""
-		if s.specOf().policy == policyExternal {
-			note = " (external: routed, not owned)"
-		}
-		log.Printf("slot %-8s %-24s policy=%-10s group=%-4s%v",
-			s.specOf().name, s.specOf().url, s.specOf().policy, orNone(s.specOf().group), note)
+	for _, t := range sortedTenantPtrs(d.tenants) {
+		log.Print(tenantLogLine(t.specOf()))
 	}
 
 	// A port answering before demesne started the engine is either a leftover or
 	// another supervisor; either way it is the collision this program refuses to race.
-	for _, s := range d.slots {
+	for _, s := range d.tenants {
 		if s.specOf().url == "" || s.specOf().policy == policyExternal {
 			continue
 		}
@@ -1414,7 +1421,7 @@ func main() {
 	}
 
 	d.prepareCgroupRoot()
-	for _, s := range d.slots {
+	for _, s := range d.tenants {
 		d.prepareCgroup(s)
 	}
 
@@ -1447,7 +1454,7 @@ func main() {
 		os.Exit(0)
 	}()
 
-	for _, s := range d.slots {
+	for _, s := range d.tenants {
 		if s.specOf().policy == policyResident {
 			go d.supervise(s)
 		}
@@ -1504,7 +1511,7 @@ func main() {
 //
 // Why a socket and not a second protocol: everything that would have to change to take
 // HTTP off this path is shared with DSH, which is not ours to change -- the same handler
-// answers both, so the OpenAI dialect, SSE streaming and the slot control endpoints are
+// answers both, so the OpenAI dialect, SSE streaming and the tenant control endpoints are
 // one implementation either way. What a socket buys that a protocol cannot is the absence
 // of a port (nobody can collide with it, so the 55557 class of bug is gone by
 // construction) and an access control that is the filesystem: mode 0600, no token, no

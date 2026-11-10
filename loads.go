@@ -31,7 +31,7 @@ var (
 )
 
 type modelLoad struct {
-	Slot       string   `json:"slot"`
+	Tenant     string   `json:"tenant"`
 	Model      string   `json:"model"`
 	Phase      string   `json:"phase"`
 	StartedMS  int64    `json:"started_ms"`
@@ -64,25 +64,25 @@ func newLoadBoard(logDir string) *loadBoard {
 	}
 }
 
-func loadKey(slot, model string) string { return slot + "\x00" + model }
+func loadKey(tenant, model string) string { return tenant + "\x00" + model }
 
-func (b *loadBoard) noteRequest(slot, model string) {
+func (b *loadBoard) noteRequest(tenant, model string) {
 	if model == "" {
 		return
 	}
 	b.mu.Lock()
-	if b.loaded[slot][model] {
+	if b.loaded[tenant][model] {
 		b.mu.Unlock()
 		return
 	}
-	if _, ok := b.entries[loadKey(slot, model)]; ok {
+	if _, ok := b.entries[loadKey(tenant, model)]; ok {
 		b.mu.Unlock()
 		return
 	}
 	entry := &modelLoad{
-		Slot: slot, Model: model, Phase: loadQueued, StartedMS: time.Now().UnixMilli(),
+		Tenant: tenant, Model: model, Phase: loadQueued, StartedMS: time.Now().UnixMilli(),
 	}
-	b.entries[loadKey(slot, model)] = entry
+	b.entries[loadKey(tenant, model)] = entry
 	b.mu.Unlock()
 	b.fire(*entry)
 }
@@ -93,7 +93,7 @@ func (b *loadBoard) fire(l modelLoad) {
 	}
 }
 
-func (b *loadBoard) observe(slot string, models map[string]string) {
+func (b *loadBoard) observe(tenant string, models map[string]string) {
 	var changed []modelLoad
 	defer func() {
 		for _, l := range changed {
@@ -103,26 +103,26 @@ func (b *loadBoard) observe(slot string, models map[string]string) {
 	now := time.Now().UnixMilli()
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.loaded[slot] == nil {
-		b.loaded[slot] = map[string]bool{}
+	if b.loaded[tenant] == nil {
+		b.loaded[tenant] = map[string]bool{}
 	}
 	for model, value := range models {
-		has := b.loaded[slot][model]
+		has := b.loaded[tenant][model]
 		switch value {
 		case "loaded":
 			if !has {
-				if e, ok := b.entries[loadKey(slot, model)]; ok && e.Phase != loadFailed {
+				if e, ok := b.entries[loadKey(tenant, model)]; ok && e.Phase != loadFailed {
 					e.Phase, e.FinishedMS = loadReady, &now
 					changed = append(changed, *e)
 				}
-				b.loaded[slot][model] = true
+				b.loaded[tenant][model] = true
 			}
 		case "loading":
-			b.loaded[slot][model] = false
-			e, ok := b.entries[loadKey(slot, model)]
+			b.loaded[tenant][model] = false
+			e, ok := b.entries[loadKey(tenant, model)]
 			if !ok {
-				e = &modelLoad{Slot: slot, Model: model, StartedMS: now}
-				b.entries[loadKey(slot, model)] = e
+				e = &modelLoad{Tenant: tenant, Model: model, StartedMS: now}
+				b.entries[loadKey(tenant, model)] = e
 			}
 			if e.Phase != loadLoading {
 				was := e.Phase
@@ -139,9 +139,9 @@ func (b *loadBoard) observe(slot string, models map[string]string) {
 			}
 		case "unloaded":
 			if has {
-				delete(b.loaded[slot], model)
+				delete(b.loaded[tenant], model)
 			}
-			if e, ok := b.entries[loadKey(slot, model)]; ok && e.Phase == loadLoading {
+			if e, ok := b.entries[loadKey(tenant, model)]; ok && e.Phase == loadLoading {
 				e.Phase = loadFailed
 				msg := "the router unloaded the model before it was ready"
 				e.Error, e.FinishedMS = &msg, &now
@@ -150,7 +150,7 @@ func (b *loadBoard) observe(slot string, models map[string]string) {
 		}
 	}
 	for _, e := range b.entries {
-		if e.Slot != slot || e.Phase == loadReady || e.Phase == loadFailed {
+		if e.Tenant != tenant || e.Phase == loadReady || e.Phase == loadFailed {
 			continue
 		}
 		if _, listed := models[e.Model]; !listed {
@@ -160,14 +160,14 @@ func (b *loadBoard) observe(slot string, models map[string]string) {
 			changed = append(changed, *e)
 		}
 	}
-	for model := range b.loaded[slot] {
+	for model := range b.loaded[tenant] {
 		if _, listed := models[model]; !listed {
-			delete(b.loaded[slot], model)
+			delete(b.loaded[tenant], model)
 		}
 	}
 }
 
-func (b *loadBoard) fromLog(slot string) ([]string, *float64, *string) {
+func (b *loadBoard) fromLog(tenant string) ([]string, *float64, *string) {
 	if b.logDir == "" {
 		return nil, nil, nil
 	}
@@ -181,7 +181,7 @@ func (b *loadBoard) fromLog(slot string) ([]string, *float64, *string) {
 	// (as this did) gave a line of 500s and no load marks at all.
 	var lines []string
 	var progress *float64
-	for _, name := range []string{slot + ".log", slot + ".err"} {
+	for _, name := range []string{tenant + ".log", tenant + ".err"} {
 		tail, err := tailFile(filepath.Join(dir, name), 24<<10)
 		if err != nil {
 			continue
@@ -200,7 +200,7 @@ func (b *loadBoard) fromLog(slot string) ([]string, *float64, *string) {
 	}
 
 	var failure *string
-	for _, name := range []string{slot + ".log", slot + ".err"} {
+	for _, name := range []string{tenant + ".log", tenant + ".err"} {
 		tail, err := tailFile(filepath.Join(dir, name), 24<<10)
 		if err != nil {
 			continue
@@ -222,7 +222,7 @@ func (b *loadBoard) fromLog(slot string) ([]string, *float64, *string) {
 // attachProgress measures the bytes the model's own child has read, against the files that load
 // must read. Only for a router that owns its children: an external engine's child is not ours to
 // inspect, and no measurement means no bar rather than a made-up one.
-func (d *demesne) attachProgress(s *slot) {
+func (d *demesne) attachProgress(s *tenant) {
 	pid := 0
 	s.mu.Lock()
 	if s.up {
@@ -236,7 +236,7 @@ func (d *demesne) attachProgress(s *slot) {
 	b.mu.Lock()
 	var active []*modelLoad
 	for _, e := range b.entries {
-		if e.Slot == s.specOf().name && e.Phase == loadLoading {
+		if e.Tenant == s.specOf().name && e.Phase == loadLoading {
 			active = append(active, e)
 		}
 	}
@@ -394,33 +394,33 @@ func (b *loadBoard) prune() {
 		case loadLoading:
 			// Never by age: a 27B on the network mount reads for thirteen minutes, and
 			// expiring it mid-load would make the row vanish exactly while it matters. It
-			// is cleared when the slot goes down, and a stuck engine is the engine's story
+			// is cleared when the tenant goes down, and a stuck engine is the engine's story
 			// to tell, not something to paper over.
 		}
 	}
 }
 
-func (b *loadBoard) forget(slot string) {
+func (b *loadBoard) forget(tenant string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for key, e := range b.entries {
-		if e.Slot == slot {
+		if e.Tenant == tenant {
 			delete(b.entries, key)
 		}
 	}
-	delete(b.loaded, slot)
+	delete(b.loaded, tenant)
 }
 
-func (b *loadBoard) refreshLogs(slots []string) {
-	for _, slot := range slots {
-		lines, progress, _ := b.fromLog(slot)
+func (b *loadBoard) refreshLogs(tenants []string) {
+	for _, tenant := range tenants {
+		lines, progress, _ := b.fromLog(tenant)
 		if len(lines) == 0 {
 			continue
 		}
 		var changed []modelLoad
 		b.mu.Lock()
 		for _, e := range b.entries {
-			if e.Slot != slot || e.Phase == loadReady {
+			if e.Tenant != tenant || e.Phase == loadReady {
 				continue
 			}
 			if pick := lineFor(lines, e.Model); pick != "" {
@@ -446,13 +446,13 @@ func (b *loadBoard) refreshLogs(slots []string) {
 	}
 }
 
-// resident reports the models the slot's engine last said were loaded, so a client does not
+// resident reports the models the tenant's engine last said were loaded, so a client does not
 // have to cache the model list to know whether an unresponsive router is holding anything.
-func (b *loadBoard) resident(slot string) []string {
+func (b *loadBoard) resident(tenant string) []string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	out := make([]string, 0, len(b.loaded[slot]))
-	for model, loaded := range b.loaded[slot] {
+	out := make([]string, 0, len(b.loaded[tenant]))
+	for model, loaded := range b.loaded[tenant] {
 		if loaded {
 			out = append(out, model)
 		}
@@ -469,8 +469,8 @@ func (b *loadBoard) snapshot() []modelLoad {
 		out = append(out, *e)
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if out[i].Slot != out[j].Slot {
-			return out[i].Slot < out[j].Slot
+		if out[i].Tenant != out[j].Tenant {
+			return out[i].Tenant < out[j].Tenant
 		}
 		return out[i].StartedMS < out[j].StartedMS
 	})
@@ -479,8 +479,8 @@ func (b *loadBoard) snapshot() []modelLoad {
 
 // observeFromLog keeps the load state honest while the router cannot be asked: the last
 // `load:   ./model.gguf` line names what is being loaded, and a failure after it is its own.
-func (b *loadBoard) observeFromLog(slot string) {
-	lines, _, _ := b.fromLog(slot)
+func (b *loadBoard) observeFromLog(tenant string) {
+	lines, _, _ := b.fromLog(tenant)
 	model := ""
 	at := -1
 	for i, l := range lines {
@@ -494,10 +494,10 @@ func (b *loadBoard) observeFromLog(slot string) {
 	now := time.Now().UnixMilli()
 	var changed *modelLoad
 	b.mu.Lock()
-	e, ok := b.entries[loadKey(slot, model)]
+	e, ok := b.entries[loadKey(tenant, model)]
 	if !ok {
-		e = &modelLoad{Slot: slot, Model: model, Phase: loadLoading, StartedMS: now}
-		b.entries[loadKey(slot, model)] = e
+		e = &modelLoad{Tenant: tenant, Model: model, Phase: loadLoading, StartedMS: now}
+		b.entries[loadKey(tenant, model)] = e
 		changed = e
 	}
 	for _, l := range lines[at+1:] {
@@ -562,13 +562,13 @@ func modelFromLoadLine(line string) string {
 
 func (d *demesne) loadChanged(l modelLoad) {
 	d.hub.publish(eventFrame{Type: "load", AtMS: time.Now().UnixMilli(), Load: &l})
-	d.history.record(transitionRecord{AtMS: time.Now().UnixMilli(), Slot: l.Slot, Kind: "load", To: l.Phase, Reason: l.Model})
+	d.history.record(transitionRecord{AtMS: time.Now().UnixMilli(), Tenant: l.Tenant, Kind: "load", To: l.Phase, Reason: l.Model})
 }
 
 // reloadPreset asks a router to re-read its models.ini. llama.cpp exposes no POST for this: the
 // refresh is a query string on the model list, and it is slow while a model is loading.
-func (d *demesne) reloadPreset(s *slot) (int, error) {
-	if !isRouterSlot(s.specOf().bin) {
+func (d *demesne) reloadPreset(s *tenant) (int, error) {
+	if !isRouterTenant(s.specOf().bin) {
 		return 0, errors.New(s.specOf().name + " is not a llama.cpp router, so it has no preset to reload")
 	}
 	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(s.specOf().url, "/")+"/models?reload=1", nil)
@@ -594,11 +594,11 @@ func (d *demesne) reloadPreset(s *slot) (int, error) {
 	return len(doc.Data), nil
 }
 
-func isRouterSlot(bin string) bool {
+func isRouterTenant(bin string) bool {
 	return filepath.Base(bin) == "llama-server"
 }
 
-func (d *demesne) routerModels(s *slot) (map[string]string, error) {
+func (d *demesne) routerModels(s *tenant) (map[string]string, error) {
 	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(s.specOf().url, "/")+"/v1/models", nil)
 	if err != nil {
 		return nil, err
@@ -638,7 +638,7 @@ func (d *demesne) routerModels(s *slot) (map[string]string, error) {
 
 func (d *demesne) pollLoads() {
 	var active []string
-	for _, s := range d.slots {
+	for _, s := range d.tenants {
 		if !s.specOf().router {
 			continue
 		}

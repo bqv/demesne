@@ -2,15 +2,15 @@ package main
 
 import "fmt"
 
-type slotKind int
+type tenantKind int
 
 const (
-	kindModel slotKind = iota
+	kindModel tenantKind = iota
 	kindMedia
 	kindAudio
 )
 
-func (k slotKind) String() string {
+func (k tenantKind) String() string {
 	switch k {
 	case kindModel:
 		return "model"
@@ -22,7 +22,7 @@ func (k slotKind) String() string {
 	return fmt.Sprintf("kind(%d)", int(k))
 }
 
-func parseSlotKind(s string) (slotKind, error) {
+func parseTenantKind(s string) (tenantKind, error) {
 	switch s {
 	case "", "model":
 		return kindModel, nil

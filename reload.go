@@ -93,8 +93,8 @@ func readConfFile(path string) (map[string]string, error) {
 func enginesFrom(get func(string) string) (map[string]engineConfig, time.Duration, time.Duration, string) {
 	// One shape per engine: the bare name is the URL, then _BIN, _DIR, _ARGS, _ENV,
 	// _MEMORY_HIGH/_MEMORY_MAX. llama's URL also answers to DEMESNE_LLM, stadi's spelling.
-	engine := func(urlKey, slot, defaultURL string) engineConfig {
-		key := strings.ToUpper(slot)
+	engine := func(urlKey, tenant, defaultURL string) engineConfig {
+		key := strings.ToUpper(tenant)
 		return engineConfig{
 			url:    firstNonEmpty(get(urlKey), defaultURL),
 			bin:    get(key + "_BIN"),
@@ -107,7 +107,7 @@ func enginesFrom(get func(string) string) (map[string]engineConfig, time.Duratio
 	cgroupRoot := firstNonEmpty(get("CGROUP_ROOT"), cgroupRootDefault)
 	return map[string]engineConfig{
 		// llama's URL has an old spelling as well as a new one; every other engine's URL key
-		// is its slot name and nothing else.
+		// is its tenant name and nothing else.
 		"llama": func() engineConfig {
 			e := engine("LLAMA", "llama", defaultLlamaURL)
 			e.url = firstNonEmpty(get("LLAMA"), firstNonEmpty(get("LLM"), defaultLlamaURL))
@@ -172,33 +172,33 @@ func (d *demesne) reload() (reloadReport, error) {
 	d.transition.Lock()
 	defer d.transition.Unlock()
 
-	names := make([]string, 0, len(d.slots))
-	for _, s := range d.slots {
+	names := make([]string, 0, len(d.tenants))
+	for _, s := range d.tenants {
 		names = append(names, s.specOf().name)
 	}
 	sort.Strings(names)
 
-	// A new engine in the conf cannot be adopted by a reload: the slot set, its proxies and
+	// A new engine in the conf cannot be adopted by a reload: the tenant set, its proxies and
 	// its supervisors are built once. Saying so beats ignoring it -- on 2026-11-07 a fifth
 	// engine was configured and the reload reported nothing at all.
 	for name := range engines {
-		if d.slotByName(name) != nil {
+		if d.tenantByName(name) != nil {
 			continue
 		}
 		key := envPrefix + strings.ToUpper(name)
 		if values[key] == "" && values[key+"_BIN"] == "" {
 			continue
 		}
-		rep.Refused = append(rep.Refused, name+" (a new engine needs a restart: its slot is built with the estate)")
+		rep.Refused = append(rep.Refused, name+" (a new engine needs a restart: its tenant is built with the estate)")
 	}
 
 	for _, name := range names {
-		s := d.slotByName(name)
+		s := d.tenantByName(name)
 		e := engines[name]
 		cur := s.specOf()
 
 		// An engine whose URL left the conf has no address to be moved to, and applying an
-		// empty one would leave the slot proxying into nothing. Removing an engine needs a
+		// empty one would leave the tenant proxying into nothing. Removing an engine needs a
 		// restart, exactly as adopting one does.
 		if e.url == "" {
 			rep.Refused = append(rep.Refused, name+" (its URL is gone from the conf; removing an engine needs a restart)")
@@ -263,7 +263,7 @@ func (d *demesne) reload() (reloadReport, error) {
 	return rep, nil
 }
 
-func specEqual(a, b slotSpec) bool {
+func specEqual(a, b tenantSpec) bool {
 	return a.url == b.url && a.bin == b.bin && sameStrings(a.args, b.args) &&
 		sameStrings(a.env, b.env) && a.dir == b.dir && a.policy == b.policy &&
 		a.idle == b.idle && a.cgroup == b.cgroup && sameStrings(a.models, b.models)

@@ -1,7 +1,7 @@
-// slot_test.go -- the lifecycle, without the engines.
+// tenant_test.go -- the lifecycle, without the engines.
 //
 // The children are this test binary re-exec'd: TestMain notices DEMESNE_TEST_CHILD and
-// becomes a one-endpoint HTTP server that a slot can spawn, kill and restart. That is
+// becomes a one-endpoint HTTP server that a tenant can spawn, kill and restart. That is
 // enough to test the parts that actually break -- spawn, readiness, idle eviction,
 // supervisor restart, foreign-port refusal -- with no GPU, no models and no network.
 package main
@@ -37,7 +37,7 @@ func TestMain(m *testing.M) {
 }
 
 // testChild is the stand-in engine: it binds the address it was given and stays up
-// until something kills it, which is all a slot needs to be correct.
+// until something kills it, which is all a tenant needs to be correct.
 func testChild(addr string) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -108,13 +108,13 @@ func waitFor(t *testing.T, limit time.Duration, what string, cond func() bool) {
 
 // ---------------------------------------------------------------------- tests
 
-// A lazy slot is spawned by a request, answers, and then gives the card back by itself.
+// A lazy tenant is spawned by a request, answers, and then gives the card back by itself.
 // This is sd's whole contract, and the idle timer must be armed from the END of the
 // request: a cold render takes minutes, so an early timer kills the child mid-load.
-func TestOnDemandSlotSpawnsAndEvicts(t *testing.T) {
+func TestOnDemandTenantSpawnsAndEvicts(t *testing.T) {
 	cfg := testConfig(t)
 	d := newTestDemesne(t, cfg)
-	sd := d.slotByName("sd")
+	sd := d.tenantByName("sd")
 
 	if up, _ := sd.isUp(); up {
 		t.Fatal("sd is up before any request")
@@ -145,16 +145,16 @@ func TestOnDemandSlotSpawnsAndEvicts(t *testing.T) {
 	}
 }
 
-// A resident slot is spawned at startup and restarted when it dies -- with ONE actor.
+// A resident tenant is spawned at startup and restarted when it dies -- with ONE actor.
 // The old model had supervise-daemon respawning llama every 5s while recoverLLM asked
 // rc-service for the same restart; here the supervisor is the only hand on the switch.
-func TestResidentSlotIsRestarted(t *testing.T) {
+func TestResidentTenantIsRestarted(t *testing.T) {
 	cfg := testConfig(t)
 	port := freePort(t)
 	cfg.llama = stub(fmt.Sprintf("http://%s", addr(port)), port)
 
 	d := newTestDemesne(t, cfg)
-	llama := d.slotByName("llama")
+	llama := d.tenantByName("llama")
 	if llama.spec.policy != policyResident {
 		t.Fatalf("llama should be resident when it has a command line, got %s", llama.spec.policy)
 	}
@@ -191,7 +191,7 @@ func TestResidentSlotIsRestarted(t *testing.T) {
 func TestForeignPortHolderIsRefused(t *testing.T) {
 	cfg := testConfig(t)
 	d := newTestDemesne(t, cfg)
-	sd := d.slotByName("sd")
+	sd := d.tenantByName("sd")
 
 	ln, err := net.Listen("tcp", uriHostPort(cfg.sd.url))
 	if err != nil {
@@ -206,12 +206,12 @@ func TestForeignPortHolderIsRefused(t *testing.T) {
 	if !strings.Contains(err.Error(), "does not own") {
 		t.Fatalf("the refusal should say what is wrong, got %q", err)
 	}
-	if st := slotStatusOf(sd); st.Foreign == "" {
+	if st := tenantStatusOf(sd); st.Foreign == "" {
 		t.Fatal("/status should report the foreign holder")
 	}
 }
 
-// The durable half of the port story: two slots may not claim one port, and it is
+// The durable half of the port story: two tenants may not claim one port, and it is
 // refused at startup rather than discovered when the second engine fails to bind.
 func TestValidateRejectsAClaimedPort(t *testing.T) {
 	cfg := testConfig(t)
@@ -220,9 +220,9 @@ func TestValidateRejectsAClaimedPort(t *testing.T) {
 	cfg.sd.args = []string{"--diffusion-model", "x"}
 	cfg.whisper.url = cfg.sd.url // whisper still on 55557, the old configuration
 	d := newTestDemesne(t, cfg)
-	err := cfg.validate(d.slots)
+	err := cfg.validate(d.tenants)
 	if err == nil {
-		t.Fatal("two slots on one port must be refused")
+		t.Fatal("two tenants on one port must be refused")
 	}
 	if !strings.Contains(err.Error(), "port") {
 		t.Fatalf("the message should explain the port, got %q", err)
@@ -231,7 +231,7 @@ func TestValidateRejectsAClaimedPort(t *testing.T) {
 	// The refusing half: no sd command line at all.
 	cfg2 := testConfig(t)
 	cfg2.sd.args = nil
-	if cfg2.validate(newTestDemesne(t, cfg2).slots) == nil {
+	if cfg2.validate(newTestDemesne(t, cfg2).tenants) == nil {
 		t.Fatal("a missing sd command line must be refused")
 	}
 }
@@ -240,9 +240,9 @@ func TestValidateRejectsAClaimedPort(t *testing.T) {
 // including whisper, which had no route at all and fell through to the llama router.
 func TestResolve(t *testing.T) {
 	cases := []struct {
-		path string
-		slot string
-		kind routeKind
+		path   string
+		tenant string
+		kind   routeKind
 	}{
 		{"/v1/chat/completions", "llama", kindChat},
 		{"/models/load", "llama", kindChat},
@@ -258,8 +258,8 @@ func TestResolve(t *testing.T) {
 	}
 	for _, c := range cases {
 		got := resolve(c.path)
-		if got.slot != c.slot || got.kind != c.kind {
-			t.Errorf("resolve(%q) = {%s %d}, want {%s %d}", c.path, got.slot, got.kind, c.slot, c.kind)
+		if got.tenant != c.tenant || got.kind != c.kind {
+			t.Errorf("resolve(%q) = {%s %d}, want {%s %d}", c.path, got.tenant, got.kind, c.tenant, c.kind)
 		}
 	}
 }
@@ -285,7 +285,7 @@ func TestUnconfiguredWhisperAnswersPlainly(t *testing.T) {
 func TestChatEvictsTheMediaChild(t *testing.T) {
 	cfg := testConfig(t)
 	d := newTestDemesne(t, cfg)
-	sd := d.slotByName("sd")
+	sd := d.tenantByName("sd")
 	if err := d.ensure(sd); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
@@ -306,7 +306,7 @@ func TestChatEvictsTheMediaChild(t *testing.T) {
 func TestStatusShape(t *testing.T) {
 	cfg := testConfig(t)
 	d := newTestDemesne(t, cfg)
-	if err := d.ensure(d.slotByName("sd")); err != nil {
+	if err := d.ensure(d.tenantByName("sd")); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
 	// An external engine (llama, still on OpenRC) has to be reported from its port: the
@@ -324,16 +324,16 @@ func TestStatusShape(t *testing.T) {
 	}
 	var got struct {
 		Version      string  `json:"version"`
-		Slot         string  `json:"slot"`
+		Tenant       string  `json:"tenant"`
 		SDChildUp    bool    `json:"sd_child_up"`
 		SDChildPID   int     `json:"sd_child_pid"`
 		IdleTimeout  float64 `json:"idle_timeout_s"`
 		MediaInFlght int64   `json:"media_in_flight"`
-		Slots        []struct {
+		Tenants      []struct {
 			Name   string `json:"name"`
 			Up     bool   `json:"up"`
 			Policy string `json:"policy"`
-		} `json:"slots"`
+		} `json:"tenants"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -341,18 +341,18 @@ func TestStatusShape(t *testing.T) {
 	if got.Version != version {
 		t.Errorf("version = %q, want %q", got.Version, version)
 	}
-	if got.Slot != "sd" || !got.SDChildUp || got.SDChildPID <= 0 {
+	if got.Tenant != "sd" || !got.SDChildUp || got.SDChildPID <= 0 {
 		t.Errorf("the compatible fields should describe the live child: %+v", got)
 	}
 	names := map[string]bool{}
 	upByName := map[string]bool{}
-	for _, s := range got.Slots {
+	for _, s := range got.Tenants {
 		names[s.Name] = true
 		upByName[s.Name] = s.Up
 	}
 	for _, want := range []string{"llama", "llamb", "sd", "whisper"} {
 		if !names[want] {
-			t.Errorf("/status should describe slot %q, got %v", want, names)
+			t.Errorf("/status should describe tenant %q, got %v", want, names)
 		}
 	}
 	if !upByName["llama"] {
@@ -363,11 +363,11 @@ func TestStatusShape(t *testing.T) {
 	}
 }
 
-// /release is stadi's GET, still honoured, and now takes a slot name.
+// /release is stadi's GET, still honoured, and now takes a tenant name.
 func TestRelease(t *testing.T) {
 	cfg := testConfig(t)
 	d := newTestDemesne(t, cfg)
-	sd := d.slotByName("sd")
+	sd := d.tenantByName("sd")
 	if err := d.ensure(sd); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
@@ -381,17 +381,17 @@ func TestRelease(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	d.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/slots/nope/load", nil))
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/tenants/nope/load", nil))
 	if rec.Code != http.StatusNotFound {
-		t.Fatalf("an unknown slot should 404, got %d", rec.Code)
+		t.Fatalf("an unknown tenant should 404, got %d", rec.Code)
 	}
 }
 
-// A slot that keeps dying is spaced out instead of paying a cold load per request.
+// A tenant that keeps dying is spaced out instead of paying a cold load per request.
 func TestCrashBackoff(t *testing.T) {
-	s := &slot{spec: slotSpec{name: "sd", url: "http://127.0.0.1:1"}}
+	s := &tenant{spec: tenantSpec{name: "sd", url: "http://127.0.0.1:1"}}
 	if wait, n := s.backoffLeft(); wait != 0 || n != 0 {
-		t.Fatalf("a slot that never failed has no backoff, got %s/%d", wait, n)
+		t.Fatalf("a tenant that never failed has no backoff, got %s/%d", wait, n)
 	}
 	for i := 1; i <= 6; i++ {
 		if got, want := backoff(i), []time.Duration{5, 10, 20, 40, 60, 60}[i-1]*time.Second; got != want {
@@ -422,13 +422,13 @@ func TestURIHelpers(t *testing.T) {
 	_ = strconv.Itoa(0)
 }
 
-// Every child gets its own "gone" channel. With one channel per slot, a token left
+// Every child gets its own "gone" channel. With one channel per tenant, a token left
 // behind by a spawn that failed during startup would be read by the supervisor as "the
 // child I just started has died" -- and it would start a second engine beside a live one.
 func TestEachSpawnGetsItsOwnGoneChannel(t *testing.T) {
 	cfg := testConfig(t)
 	d := newTestDemesne(t, cfg)
-	sd := d.slotByName("sd")
+	sd := d.tenantByName("sd")
 
 	if err := d.ensure(sd); err != nil {
 		t.Fatalf("first ensure: %v", err)
@@ -543,7 +543,7 @@ func TestUnixSocketServesTheSameAPI(t *testing.T) {
 	}
 }
 
-// The card answer is a contract, not a slice of /status: four fields, and per slot one
+// The card answer is a contract, not a slice of /status: four fields, and per tenant one
 // of three states. A field added here is a field a client comes to depend on, so the
 // test pins the key set and fails when it grows -- "small and typed" has to be enforced
 // by something other than good intentions.
@@ -566,7 +566,7 @@ func TestEstateCardIsTheSmallTypedAnswer(t *testing.T) {
 	}
 
 	doc := get("")
-	for _, k := range []string{"group", "holders", "since_ms", "slots"} {
+	for _, k := range []string{"group", "holders", "since_ms", "tenants"} {
 		if _, ok := doc[k]; !ok {
 			t.Fatalf("missing %q in %v", k, doc)
 		}
@@ -586,7 +586,7 @@ func TestEstateCardIsTheSmallTypedAnswer(t *testing.T) {
 		t.Fatalf("idle since_ms = %s, want 0", doc["since_ms"])
 	}
 
-	if err := d.ensure(d.slotByName("sd")); err != nil {
+	if err := d.ensure(d.tenantByName("sd")); err != nil {
 		t.Fatalf("ensure(sd): %v", err)
 	}
 	before := time.Now().Add(-time.Minute).UnixMilli()
@@ -614,7 +614,7 @@ func TestEstateCardIsTheSmallTypedAnswer(t *testing.T) {
 }
 
 // modelRouter is a stand-in engine that advertises one model and names itself when asked
-// to chat, so a test can tell which slot a request actually reached.
+// to chat, so a test can tell which tenant a request actually reached.
 func modelRouter(name, id string) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
@@ -642,14 +642,14 @@ func TestTheModelNameDecidesTheEngine(t *testing.T) {
 	d.models = newModelIndex()
 	d.refreshModels()
 
-	if got := d.slotForModel("small-model"); got != "llamb" {
+	if got := d.tenantForModel("small-model"); got != "llamb" {
 		t.Fatalf("small-model routes to %q, want llamb", got)
 	}
-	if got := d.slotForModel("big-model"); got != "llama" {
+	if got := d.tenantForModel("big-model"); got != "llama" {
 		t.Fatalf("big-model routes to %q, want llama", got)
 	}
 
-	if err := d.ensure(d.slotByName("sd")); err != nil {
+	if err := d.ensure(d.tenantByName("sd")); err != nil {
 		t.Fatalf("ensure(sd): %v", err)
 	}
 	rec := httptest.NewRecorder()
@@ -662,14 +662,14 @@ func TestTheModelNameDecidesTheEngine(t *testing.T) {
 	if !strings.Contains(body, `"model":"small-model"`) {
 		t.Fatalf("the request body did not survive the model peek: %q", body)
 	}
-	if up, _ := d.slotByName("sd").isUp(); !up {
+	if up, _ := d.tenantByName("sd").isUp(); !up {
 		t.Fatal("an aux-card request evicted the media child on the other card")
 	}
 
 	rec = httptest.NewRecorder()
 	d.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"big-model"}`)))
-	if up, _ := d.slotByName("sd").isUp(); up {
+	if up, _ := d.tenantByName("sd").isUp(); up {
 		t.Fatal("a big-card request left the media child holding the card")
 	}
 
@@ -721,7 +721,7 @@ func writeConf(t *testing.T, path string, kv map[string]string) {
 	}
 }
 
-// sdConf is the running test estate's own sd slot, expressed as a conf file: the reload
+// sdConf is the running test estate's own sd tenant, expressed as a conf file: the reload
 // should find nothing to do with it.
 func sdConf(cfg config) map[string]string {
 	return map[string]string{
@@ -737,7 +737,7 @@ func TestReloadLeavesAMatchingChildAlone(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "demesne.conf")
 	cfg.confFile = path
 	d := newTestDemesne(t, cfg)
-	if err := d.ensure(d.slotByName("sd")); err != nil {
+	if err := d.ensure(d.tenantByName("sd")); err != nil {
 		t.Fatalf("ensure(sd): %v", err)
 	}
 
@@ -752,10 +752,10 @@ func TestReloadLeavesAMatchingChildAlone(t *testing.T) {
 	if contains(rep.Restarted, "sd") {
 		t.Fatalf("reload restarted sd for a clock change: %+v", rep)
 	}
-	if up, _ := d.slotByName("sd").isUp(); !up {
+	if up, _ := d.tenantByName("sd").isUp(); !up {
 		t.Fatal("reload stopped a child it had no reason to touch")
 	}
-	if got := d.slotByName("sd").specOf().idle; got != 7*time.Second {
+	if got := d.tenantByName("sd").specOf().idle; got != 7*time.Second {
 		t.Fatalf("sd idle = %v, want 7s", got)
 	}
 }
@@ -765,7 +765,7 @@ func TestReloadRestartsAChildWhoseArgsMoved(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "demesne.conf")
 	cfg.confFile = path
 	d := newTestDemesne(t, cfg)
-	if err := d.ensure(d.slotByName("sd")); err != nil {
+	if err := d.ensure(d.tenantByName("sd")); err != nil {
 		t.Fatalf("ensure(sd): %v", err)
 	}
 
@@ -780,10 +780,10 @@ func TestReloadRestartsAChildWhoseArgsMoved(t *testing.T) {
 	if !contains(rep.Restarted, "sd") {
 		t.Fatalf("a new command line did not restart sd: %+v", rep)
 	}
-	if up, _ := d.slotByName("sd").isUp(); up {
+	if up, _ := d.tenantByName("sd").isUp(); up {
 		t.Fatal("the old child is still running with the old argv")
 	}
-	if got := d.slotByName("sd").specOf().args; len(got) != 1 || got[0] != "--a-different-command-line" {
+	if got := d.tenantByName("sd").specOf().args; len(got) != 1 || got[0] != "--a-different-command-line" {
 		t.Fatalf("sd args = %v", got)
 	}
 }
@@ -879,25 +879,25 @@ func TestAnIdleRouterDoesNotHoldTheCard(t *testing.T) {
 	}
 
 	if got := card("gpu"); len(got.Holders) != 0 {
-		t.Fatalf("an idle router holds the card: %v (state is still %q)", got.Holders, got.Slots[0].State)
+		t.Fatalf("an idle router holds the card: %v (state is still %q)", got.Holders, got.Tenants[0].State)
 	}
 	if got := card("aux"); len(got.Holders) != 1 || got.Holders[0] != "llamb" {
 		t.Fatalf("a router with a resident model does not hold its card: %v", got.Holders)
 	}
 }
 
-// A probe is not a claimant. The catch-all used to be chat, so GET /slots or /metrics on the
+// A probe is not a claimant. The catch-all used to be chat, so GET /tenants or /metrics on the
 // front door evicted a running render before answering -- a monitoring loop could kill a
 // render simply by looking at the estate.
 func TestAProbeDoesNotTakeTheCard(t *testing.T) {
 	cfg := testConfig(t)
 	d := newTestDemesne(t, cfg)
-	sd := d.slotByName("sd")
+	sd := d.tenantByName("sd")
 	if err := d.ensure(sd); err != nil {
 		t.Fatalf("ensure(sd): %v", err)
 	}
 
-	for _, path := range []string{"/slots", "/metrics", "/tokenize", "/detokenize", "/apply-template"} {
+	for _, path := range []string{"/tenants", "/metrics", "/tokenize", "/detokenize", "/apply-template"} {
 		if got := resolve(path); got.kind != kindProxy {
 			t.Errorf("resolve(%q) = kind %d, want kindProxy", path, got.kind)
 		}
@@ -921,19 +921,19 @@ func TestAProbeDoesNotTakeTheCard(t *testing.T) {
 	}
 }
 
-// last_transition says WHY a slot is not running, in a closed vocabulary, and says nothing
+// last_transition says WHY a tenant is not running, in a closed vocabulary, and says nothing
 // while it is running. "chat-claims-card" is the one a reader most wants explained: an idle
 // eviction and a divested render look identical in `last_error`, which is empty for both.
 func TestLastTransitionSaysWhyTheChildStopped(t *testing.T) {
 	cfg := testConfig(t)
 	d := newTestDemesne(t, cfg)
-	sd := d.slotByName("sd")
+	sd := d.tenantByName("sd")
 
 	transition := func() string {
 		t.Helper()
 		rec := httptest.NewRecorder()
-		d.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/slots/sd", nil))
-		var st slotStatus
+		d.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/tenants/sd", nil))
+		var st tenantStatus
 		if err := json.Unmarshal(rec.Body.Bytes(), &st); err != nil {
 			t.Fatalf("decode: %v", err)
 		}
@@ -944,11 +944,11 @@ func TestLastTransitionSaysWhyTheChildStopped(t *testing.T) {
 		t.Fatalf("ensure(sd): %v", err)
 	}
 	if got := transition(); got != "" {
-		t.Fatalf("a running slot reports last_transition %q, want empty", got)
+		t.Fatalf("a running tenant reports last_transition %q, want empty", got)
 	}
 
 	rec := httptest.NewRecorder()
-	d.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/slots/sd/stop", nil))
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/tenants/sd/stop", nil))
 	if got := transition(); got != string(stopOperator) {
 		t.Fatalf("after an operator stop: %q, want %q", got, stopOperator)
 	}
@@ -967,18 +967,18 @@ func TestLastTransitionSaysWhyTheChildStopped(t *testing.T) {
 	}
 }
 
-// A slot that is down is down for one of four reasons, and "never asked since boot" is the
-// same situation the idle timer produces -- so the field is total for a down slot rather than
+// A tenant that is down is down for one of four reasons, and "never asked since boot" is the
+// same situation the idle timer produces -- so the field is total for a down tenant rather than
 // leaving a client to guess at an absent one.
-func TestADownSlotAlwaysSaysWhy(t *testing.T) {
+func TestADownTenantAlwaysSaysWhy(t *testing.T) {
 	cfg := testConfig(t)
 	d := newTestDemesne(t, cfg)
 
 	transition := func() string {
 		t.Helper()
 		rec := httptest.NewRecorder()
-		d.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/slots/sd", nil))
-		var st slotStatus
+		d.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/tenants/sd", nil))
+		var st tenantStatus
 		if err := json.Unmarshal(rec.Body.Bytes(), &st); err != nil {
 			t.Fatalf("decode: %v", err)
 		}
@@ -986,12 +986,12 @@ func TestADownSlotAlwaysSaysWhy(t *testing.T) {
 	}
 
 	if got := transition(); got != string(stopIdle) {
-		t.Fatalf("a slot that has never run reports %q, want %q", got, stopIdle)
+		t.Fatalf("a tenant that has never run reports %q, want %q", got, stopIdle)
 	}
 
-	// A failure, then an operator stop of the already-down slot: the failure is the last real
+	// A failure, then an operator stop of the already-down tenant: the failure is the last real
 	// event and must not be papered over.
-	sd := d.slotByName("sd")
+	sd := d.tenantByName("sd")
 	sd.mu.Lock()
 	sd.stopped, sd.lastErr = stopFailed, "exited unexpectedly: boom"
 	sd.mu.Unlock()
@@ -1181,7 +1181,7 @@ func TestFIMClaimsTheCard(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.llama = engineConfig{url: up.URL}
 	d := newTestDemesne(t, cfg)
-	sd := d.slotByName("sd")
+	sd := d.tenantByName("sd")
 	if err := d.ensure(sd); err != nil {
 		t.Fatalf("ensure(sd): %v", err)
 	}
@@ -1373,27 +1373,27 @@ func TestRPCAnswersTheTypedMethods(t *testing.T) {
 	if status["version"] != version {
 		t.Fatalf("estate.status version = %v", status["version"])
 	}
-	if slots, ok := status["slots"].([]any); !ok || len(slots) != 4 {
-		t.Fatalf("estate.status slots = %v", status["slots"])
+	if tenants, ok := status["tenants"].([]any); !ok || len(tenants) != 4 {
+		t.Fatalf("estate.status tenants = %v", status["tenants"])
 	}
 
 	// The method that stops an engine must reach the same code path as the HTTP verb, so the
-	// slot's own account of itself agrees.
-	if err := d.ensure(d.slotByName("sd")); err != nil {
+	// tenant's own account of itself agrees.
+	if err := d.ensure(d.tenantByName("sd")); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
-	code, out = callRPC(t, d, `{"jsonrpc":"2.0","id":3,"method":"slots.stop","params":{"slot":"sd"}}`)
+	code, out = callRPC(t, d, `{"jsonrpc":"2.0","id":3,"method":"tenants.stop","params":{"tenant":"sd"}}`)
 	if code != http.StatusOK || out["error"] != nil {
-		t.Fatalf("slots.stop: %d %v", code, out)
+		t.Fatalf("tenants.stop: %d %v", code, out)
 	}
-	if up, _ := d.slotByName("sd").isUp(); up {
-		t.Fatal("slots.stop left the child running")
+	if up, _ := d.tenantByName("sd").isUp(); up {
+		t.Fatal("tenants.stop left the child running")
 	}
-	if got := d.slotByName("sd").specOf().name; got != "sd" {
-		t.Fatalf("wrong slot: %s", got)
+	if got := d.tenantByName("sd").specOf().name; got != "sd" {
+		t.Fatalf("wrong tenant: %s", got)
 	}
 
-	_, out = callRPC(t, d, `{"jsonrpc":"2.0","id":4,"method":"slots.status","params":{"slot":"sd"}}`)
+	_, out = callRPC(t, d, `{"jsonrpc":"2.0","id":4,"method":"tenants.status","params":{"tenant":"sd"}}`)
 	st := out["result"].(map[string]any)
 	if st["last_transition"] != string(stopOperator) {
 		t.Fatalf("last_transition after an RPC stop = %v", st["last_transition"])
@@ -1410,8 +1410,8 @@ func TestRPCErrorsAreJSONRPC(t *testing.T) {
 		code float64
 	}{
 		{"no method", `{"jsonrpc":"2.0","id":1,"method":"nope"}`, rpcNoMethod},
-		{"unknown slot", `{"jsonrpc":"2.0","id":2,"method":"slots.status","params":{"slot":"zzz"}}`, rpcBadParams},
-		{"missing slot", `{"jsonrpc":"2.0","id":3,"method":"slots.load","params":{}}`, rpcBadParams},
+		{"unknown tenant", `{"jsonrpc":"2.0","id":2,"method":"tenants.status","params":{"tenant":"zzz"}}`, rpcBadParams},
+		{"missing tenant", `{"jsonrpc":"2.0","id":3,"method":"tenants.load","params":{}}`, rpcBadParams},
 	}
 	for _, c := range cases {
 		_, out := callRPC(t, d, c.body)
@@ -1456,7 +1456,7 @@ func TestRPCBatchAndNotification(t *testing.T) {
 func TestAForeignPortRefusesTheSpawn(t *testing.T) {
 	cfg := testConfig(t)
 	d := newTestDemesne(t, cfg)
-	s := d.slotByName("sd")
+	s := d.tenantByName("sd")
 
 	holder, err := net.Listen("tcp", s.hostPort())
 	if err != nil {
@@ -1474,7 +1474,7 @@ func TestAForeignPortRefusesTheSpawn(t *testing.T) {
 	if up, _ := s.isUp(); up {
 		t.Fatal("a child was started anyway")
 	}
-	if st := slotStatusOf(s); st.Foreign == "" {
+	if st := tenantStatusOf(s); st.Foreign == "" {
 		t.Fatal("/status does not report the foreign holder")
 	}
 }
@@ -1485,7 +1485,7 @@ func TestAForeignPortRefusesTheSpawn(t *testing.T) {
 func TestReadinessNeedsOurOwnChild(t *testing.T) {
 	cfg := testConfig(t)
 	d := newTestDemesne(t, cfg)
-	s := d.slotByName("sd")
+	s := d.tenantByName("sd")
 
 	holder, err := net.Listen("tcp", s.hostPort())
 	if err != nil {
@@ -1521,12 +1521,12 @@ func TestProcPortPIDFindsTheHolder(t *testing.T) {
 	}
 }
 
-// Killing is allowed only on evidence. A listener that is not in the slot's own cgroup is a
-// stranger, and a refusal is the correct answer -- even though it leaves the slot stuck.
+// Killing is allowed only on evidence. A listener that is not in the tenant's own cgroup is a
+// stranger, and a refusal is the correct answer -- even though it leaves the tenant stuck.
 func TestReclaimRefusesAStranger(t *testing.T) {
 	cfg := testConfig(t)
 	d := newTestDemesne(t, cfg)
-	s := d.slotByName("sd")
+	s := d.tenantByName("sd")
 
 	ln, err := net.Listen("tcp", s.hostPort())
 	if err != nil {
@@ -1534,7 +1534,7 @@ func TestReclaimRefusesAStranger(t *testing.T) {
 	}
 	defer ln.Close()
 
-	killed, err := d.reclaimSlot(s)
+	killed, err := d.reclaimTenant(s)
 	if killed {
 		t.Fatal("reclaim killed a process it could not prove was ours")
 	}
@@ -1554,7 +1554,7 @@ func TestReclaimRefusesAStranger(t *testing.T) {
 func TestSpawnRefusalNamesTheReason(t *testing.T) {
 	cfg := testConfig(t)
 	d := newTestDemesne(t, cfg)
-	s := d.slotByName("sd")
+	s := d.tenantByName("sd")
 
 	ln, err := net.Listen("tcp", s.hostPort())
 	if err != nil {
@@ -1571,17 +1571,17 @@ func TestSpawnRefusalNamesTheReason(t *testing.T) {
 	}
 }
 
-func findLoad(t *testing.T, loads []modelLoad, slot, model string) *modelLoad {
+func findLoad(t *testing.T, loads []modelLoad, tenant, model string) *modelLoad {
 	t.Helper()
 	for i := range loads {
-		if loads[i].Slot == slot && loads[i].Model == model {
+		if loads[i].Tenant == tenant && loads[i].Model == model {
 			return &loads[i]
 		}
 	}
 	return nil
 }
 
-// The Android card needs one entry per model load, not just a slot that happens to be busy.
+// The Android card needs one entry per model load, not just a tenant that happens to be busy.
 func TestLoadsFollowAModelFromLoadingToReady(t *testing.T) {
 	b := newLoadBoard("")
 	b.observe("llama", map[string]string{"M1": "loading"})
@@ -1649,13 +1649,13 @@ func TestLoadsCarryTheChildLog(t *testing.T) {
 }
 
 // Two routers, two loads, independently: llamb can hold several models at once.
-func TestLoadsArePerSlot(t *testing.T) {
+func TestLoadsArePerTenant(t *testing.T) {
 	b := newLoadBoard("")
 	b.observe("llama", map[string]string{"Big": "loading"})
 	b.observe("llamb", map[string]string{"Small": "loading"})
 	got := b.snapshot()
 	if len(got) != 2 || findLoad(t, got, "llama", "Big") == nil || findLoad(t, got, "llamb", "Small") == nil {
-		t.Fatalf("loads not per slot: %+v", got)
+		t.Fatalf("loads not per tenant: %+v", got)
 	}
 }
 
@@ -1678,7 +1678,7 @@ func TestStatusCarriesLoads(t *testing.T) {
 	}
 }
 
-func TestMetricsAnswersEverySlot(t *testing.T) {
+func TestMetricsAnswersEveryTenant(t *testing.T) {
 	cfg := testConfig(t)
 	d := newTestDemesne(t, cfg)
 	rec := httptest.NewRecorder()
@@ -1693,12 +1693,12 @@ func TestMetricsAnswersEverySlot(t *testing.T) {
 	if doc.Version != metricsVersion || doc.SinceMS == 0 {
 		t.Fatalf("version/since wrong: %+v", doc)
 	}
-	if len(doc.Slots) != len(d.slots) {
-		t.Fatalf("%d slots in metrics, %d configured", len(doc.Slots), len(d.slots))
+	if len(doc.Tenants) != len(d.tenants) {
+		t.Fatalf("%d tenants in metrics, %d configured", len(doc.Tenants), len(d.tenants))
 	}
-	for _, s := range doc.Slots {
+	for _, s := range doc.Tenants {
 		if s.Runtime.SinceMS == 0 {
-			t.Fatalf("slot %s has no runtime since", s.Name)
+			t.Fatalf("tenant %s has no runtime since", s.Name)
 		}
 	}
 	if doc.Loads == nil || doc.History == nil {
@@ -1725,7 +1725,7 @@ func TestMetricsCountRequests(t *testing.T) {
 	rec = httptest.NewRecorder()
 	d.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/estate/metrics", nil))
 	_ = json.Unmarshal(rec.Body.Bytes(), &doc)
-	for _, s := range doc.Slots {
+	for _, s := range doc.Tenants {
 		if s.Name != "llama" {
 			continue
 		}
@@ -1767,8 +1767,8 @@ func TestEventsStartWithASnapshot(t *testing.T) {
 
 func TestEventsResumeFromACursor(t *testing.T) {
 	d := newEventHub()
-	d.publish(eventFrame{Type: "transition", Transition: &transitionRecord{Slot: "llama", To: "stop"}})
-	d.publish(eventFrame{Type: "load", Load: &modelLoad{Slot: "llama", Model: "M1", Phase: "loading"}})
+	d.publish(eventFrame{Type: "transition", Transition: &transitionRecord{Tenant: "llama", To: "stop"}})
+	d.publish(eventFrame{Type: "load", Load: &modelLoad{Tenant: "llama", Model: "M1", Phase: "loading"}})
 	frames, ok := d.since(1)
 	if !ok || len(frames) != 1 || frames[0].Type != "load" {
 		t.Fatalf("resume after 1 gave %v (%v)", frames, ok)
@@ -1785,7 +1785,7 @@ func TestEventsDropRatherThanBlock(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		for i := 0; i < 200; i++ {
-			d.publish(eventFrame{Type: "load", Load: &modelLoad{Slot: "llama"}})
+			d.publish(eventFrame{Type: "load", Load: &modelLoad{Tenant: "llama"}})
 		}
 		close(done)
 	}()
@@ -1797,7 +1797,7 @@ func TestEventsDropRatherThanBlock(t *testing.T) {
 }
 
 // A failure line belongs to the model it names. On 2026-11-07 a missing Thinklite gguf made the
-// router exit, and the 27B that was loading on the same slot was marked failed with it.
+// router exit, and the 27B that was loading on the same tenant was marked failed with it.
 func TestALoadFailureIsAttributedToItsOwnModel(t *testing.T) {
 	dir := t.TempDir()
 	log := "srv  load:   ./Qwen3.8-27B-abliterated-120k.gguf\n" +
@@ -1833,15 +1833,15 @@ func TestALoadFailureIsAttributedToItsOwnModel(t *testing.T) {
 // stream restarts with a snapshot instead.
 func TestEventsRestartOnACursorFromAPreviousProcess(t *testing.T) {
 	d := newEventHub()
-	d.publish(eventFrame{Type: "load", Load: &modelLoad{Slot: "llama", Model: "M1"}})
-	d.publish(eventFrame{Type: "load", Load: &modelLoad{Slot: "llama", Model: "M2"}})
+	d.publish(eventFrame{Type: "load", Load: &modelLoad{Tenant: "llama", Model: "M1"}})
+	d.publish(eventFrame{Type: "load", Load: &modelLoad{Tenant: "llama", Model: "M2"}})
 	if _, ok := d.since(200); ok {
 		t.Fatal("a cursor from the future was accepted; the stream would go silent")
 	}
 }
 
 // The live reload is llama.cpp's own: GET <router>/models?reload=1. There is no POST for it.
-func TestSlotReloadAsksTheRouterToReload(t *testing.T) {
+func TestTenantReloadAsksTheRouterToReload(t *testing.T) {
 	seen := make(chan string, 1)
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen <- r.URL.RequestURI()
@@ -1852,7 +1852,7 @@ func TestSlotReloadAsksTheRouterToReload(t *testing.T) {
 	cfg.llama = engineConfig{url: up.URL, bin: "/usr/bin/llama-server"}
 	d := newTestDemesne(t, cfg)
 
-	n, err := d.reloadPreset(d.slotByName("llama"))
+	n, err := d.reloadPreset(d.tenantByName("llama"))
 	if err != nil {
 		t.Fatalf("reloadPreset: %v", err)
 	}
@@ -1864,12 +1864,12 @@ func TestSlotReloadAsksTheRouterToReload(t *testing.T) {
 	}
 }
 
-// A slot that is not a router has no preset, and saying so beats dialling it.
-func TestSlotReloadRefusesANonRouter(t *testing.T) {
+// A tenant that is not a router has no preset, and saying so beats dialling it.
+func TestTenantReloadRefusesANonRouter(t *testing.T) {
 	cfg := testConfig(t)
 	d := newTestDemesne(t, cfg)
-	if _, err := d.reloadPreset(d.slotByName("sd")); err == nil {
-		t.Fatal("reloadPreset accepted a non-router slot")
+	if _, err := d.reloadPreset(d.tenantByName("sd")); err == nil {
+		t.Fatal("reloadPreset accepted a non-router tenant")
 	}
 }
 
@@ -1896,7 +1896,7 @@ func TestLoadsFallBackToTheChildLog(t *testing.T) {
 	}
 }
 
-// A reload cannot adopt a new engine -- the slot set, its proxies and its supervisors are built
+// A reload cannot adopt a new engine -- the tenant set, its proxies and its supervisors are built
 // once -- and on 2026-11-07 a fifth engine was configured and the reload said nothing at all.
 func TestReloadSaysANewEngineNeedsARestart(t *testing.T) {
 	cfg := testConfig(t)
@@ -1916,13 +1916,13 @@ func TestReloadSaysANewEngineNeedsARestart(t *testing.T) {
 		}
 	}
 	if !said {
-		t.Fatalf("reload ignored a configured engine it has no slot for: %+v", rep)
+		t.Fatalf("reload ignored a configured engine it has no tenant for: %+v", rep)
 	}
 }
 
-// The load board follows the slot's own router flag, not the name of its binary: an external
+// The load board follows the tenant's own router flag, not the name of its binary: an external
 // engine that answers /v1/models is a router even with no command line (strata is exactly that).
-func TestLoadsPollAnySlotMarkedRouter(t *testing.T) {
+func TestLoadsPollAnyTenantMarkedRouter(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/models" {
 			http.NotFound(w, r)
@@ -1934,10 +1934,10 @@ func TestLoadsPollAnySlotMarkedRouter(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.llama = engineConfig{url: up.URL}
 	d := newTestDemesne(t, cfg)
-	for _, s := range d.slots {
+	for _, s := range d.tenants {
 		if s.specOf().name == "llama" {
 			if !s.specOf().router {
-				t.Fatal("the llama slot is not marked as a router")
+				t.Fatal("the llama tenant is not marked as a router")
 			}
 			if s.specOf().bin != "" {
 				t.Fatal("this test means to have no binary configured")
@@ -1951,28 +1951,28 @@ func TestLoadsPollAnySlotMarkedRouter(t *testing.T) {
 	}
 }
 
-// The Strata slot is opt-in: 55560 is not reserved on an estate that never configured it, and
-// an external slot's "up" is portAlive rather than ownership, so a default URL would have let
+// The Strata tenant is opt-in: 55560 is not reserved on an estate that never configured it, and
+// an external tenant's "up" is portAlive rather than ownership, so a default URL would have let
 // anything binding that port be adopted silently.
-func TestTheStrataSlotIsOptIn(t *testing.T) {
+func TestTheStrataTenantIsOptIn(t *testing.T) {
 	cfg := testConfig(t)
-	if n := len(buildSlots(cfg)); n != 4 {
-		t.Fatalf("an estate that never configured strata has %d slots, want 4", n)
+	if n := len(buildTenants(cfg)); n != 4 {
+		t.Fatalf("an estate that never configured strata has %d tenants, want 4", n)
 	}
 	cfg.strata = engineConfig{url: "http://127.0.0.1:55560"}
-	specs := buildSlots(cfg)
+	specs := buildTenants(cfg)
 	if len(specs) != 5 {
-		t.Fatalf("%d slots with strata configured, want 5", len(specs))
+		t.Fatalf("%d tenants with strata configured, want 5", len(specs))
 	}
 	last := specs[len(specs)-1]
 	if last.name != "strata" || last.policy != policyExternal || last.group != "gpu" || !last.router {
-		t.Fatalf("the fifth slot is not the external router described: %+v", last)
+		t.Fatalf("the fifth tenant is not the external router described: %+v", last)
 	}
 }
 
-// Dropping an engine's URL from the conf must not move a live slot to "" -- the reload would
+// Dropping an engine's URL from the conf must not move a live tenant to "" -- the reload would
 // leave it proxying into nothing. Removing an engine needs a restart, like adopting one.
-func TestReloadRefusesToEmptyASlotsURL(t *testing.T) {
+func TestReloadRefusesToEmptyATenantsURL(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.strata = engineConfig{url: "http://127.0.0.1:55560"}
 	cfg.confFile = filepath.Join(t.TempDir(), "conf")
@@ -1980,17 +1980,17 @@ func TestReloadRefusesToEmptyASlotsURL(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := newTestDemesne(t, cfg)
-	before := d.slotByName("strata").specOf().url
+	before := d.tenantByName("strata").specOf().url
 	if before == "" {
-		t.Fatal("the strata slot was not built")
+		t.Fatal("the strata tenant was not built")
 	}
 	rep, err := d.reload()
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
-	after := d.slotByName("strata").specOf().url
+	after := d.tenantByName("strata").specOf().url
 	if after != before {
-		t.Fatalf("reload moved the slot's URL from %q to %q", before, after)
+		t.Fatalf("reload moved the tenant's URL from %q to %q", before, after)
 	}
 	said := false
 	for _, r := range rep.Refused {
@@ -2048,12 +2048,12 @@ func TestALongLoadStaysVisible(t *testing.T) {
 func TestHistoryDoesNotDoubleCountATransition(t *testing.T) {
 	h := &history{}
 	now := time.Now().UnixMilli()
-	h.record(transitionRecord{AtMS: now, Slot: "llama", Kind: "load", To: "loading", Reason: "M1"})
-	h.record(transitionRecord{AtMS: now, Slot: "llama", Kind: "load", To: "loading", Reason: "M1"})
+	h.record(transitionRecord{AtMS: now, Tenant: "llama", Kind: "load", To: "loading", Reason: "M1"})
+	h.record(transitionRecord{AtMS: now, Tenant: "llama", Kind: "load", To: "loading", Reason: "M1"})
 	if got := len(h.snapshot()); got != 1 {
 		t.Fatalf("%d history entries for one transition", got)
 	}
-	h.record(transitionRecord{AtMS: now + 10_000, Slot: "llama", Kind: "load", To: "loading", Reason: "M1"})
+	h.record(transitionRecord{AtMS: now + 10_000, Tenant: "llama", Kind: "load", To: "loading", Reason: "M1"})
 	if got := len(h.snapshot()); got != 2 {
 		t.Fatalf("a later transition was swallowed: %d entries", got)
 	}
@@ -2069,7 +2069,7 @@ func TestResidentModelsAreCached(t *testing.T) {
 		t.Fatalf("resident = %v, want [M1]", got)
 	}
 	if other := b.resident("llamb"); len(other) != 0 {
-		t.Fatalf("another slot inherited the set: %v", other)
+		t.Fatalf("another tenant inherited the set: %v", other)
 	}
 }
 
@@ -2254,7 +2254,7 @@ func TestAFreshLoadResetsTheBaseline(t *testing.T) {
 	}
 }
 
-// A slot's configured models are routable even when the engine cannot answer -- which is the
+// A tenant's configured models are routable even when the engine cannot answer -- which is the
 // only way a stopped on-demand engine can be addressed by name at all.
 func TestAConfiguredModelRoutesWithoutTheEngine(t *testing.T) {
 	cfg := testConfig(t)
@@ -2262,7 +2262,7 @@ func TestAConfiguredModelRoutesWithoutTheEngine(t *testing.T) {
 		models: []string{"strata-only-model"}}
 	d := newTestDemesne(t, cfg)
 	d.refreshModels()
-	if got := d.slotForModel("strata-only-model"); got != "llama" {
+	if got := d.tenantForModel("strata-only-model"); got != "llama" {
 		t.Fatalf("a configured model routed to %q", got)
 	}
 }
@@ -2283,7 +2283,7 @@ func TestModelListFromAFile(t *testing.T) {
 	}
 }
 
-// And a slot that answers again replaces its list, so a model it no longer serves stops routing.
+// And a tenant that answers again replaces its list, so a model it no longer serves stops routing.
 func TestAReansweredListDropsRemovedModels(t *testing.T) {
 	list := `{"data":[{"id":"M1","status":{"value":"loaded"}},{"id":"M2","status":{"value":"loaded"}}]}`
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2294,7 +2294,7 @@ func TestAReansweredListDropsRemovedModels(t *testing.T) {
 	cfg.llama = engineConfig{url: up.URL, bin: "/usr/bin/llama-server"}
 	d := newTestDemesne(t, cfg)
 	d.refreshModels()
-	if d.slotForModel("M2") != "llama" {
+	if d.tenantForModel("M2") != "llama" {
 		t.Fatal("M2 did not route while listed")
 	}
 	list = `{"data":[{"id":"M1","status":{"value":"loaded"}}]}`
@@ -2307,14 +2307,14 @@ func TestAReansweredListDropsRemovedModels(t *testing.T) {
 	}
 }
 
-// A request may take the card from a sibling model slot in the same group -- least recently
-// used first -- but never from itself, and never from a resident slot.
+// A request may take the card from a sibling model tenant in the same group -- least recently
+// used first -- but never from itself, and never from a resident tenant.
 func TestARequestTakesTheCardFromASibling(t *testing.T) {
 	cfg := testConfig(t)
 	d := newTestDemesne(t, cfg)
-	llama := d.slotByName("llama")
-	sd := d.slotByName("sd")
-	for _, s := range []*slot{llama, sd} {
+	llama := d.tenantByName("llama")
+	sd := d.tenantByName("sd")
+	for _, s := range []*tenant{llama, sd} {
 		s.mu.Lock()
 		s.up, s.readyAt, s.used = true, time.Now(), time.Now()
 		s.mu.Unlock()
@@ -2328,14 +2328,14 @@ func TestARequestTakesTheCardFromASibling(t *testing.T) {
 	}
 }
 
-// A resident slot is never an LRU candidate: resident is the operator's decision.
+// A resident tenant is never an LRU candidate: resident is the operator's decision.
 func TestAResidentSiblingIsNotEvicted(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.llama = engineConfig{url: cfg.llama.url, bin: "/usr/bin/llama-server"}
 	d := newTestDemesne(t, cfg)
-	llama := d.slotByName("llama")
-	sd := d.slotByName("sd")
-	for _, s := range []*slot{llama, sd} {
+	llama := d.tenantByName("llama")
+	sd := d.tenantByName("sd")
+	for _, s := range []*tenant{llama, sd} {
 		s.mu.Lock()
 		s.up, s.readyAt = true, time.Now()
 		s.mu.Unlock()
@@ -2345,7 +2345,7 @@ func TestAResidentSiblingIsNotEvicted(t *testing.T) {
 	}
 	for _, s := range d.cardSiblings(sd) {
 		if s == llama {
-			t.Fatal("a resident slot was offered as an eviction candidate")
+			t.Fatal("a resident tenant was offered as an eviction candidate")
 		}
 	}
 }
@@ -2354,15 +2354,15 @@ func TestAResidentSiblingIsNotEvicted(t *testing.T) {
 func TestTheBreakerIsKeyedOnTheRouterFlag(t *testing.T) {
 	cfg := testConfig(t)
 	d := newTestDemesne(t, cfg)
-	if !d.slotByName("llama").specOf().router {
+	if !d.tenantByName("llama").specOf().router {
 		t.Fatal("llama is not marked as a router")
 	}
-	if d.slotByName("sd").specOf().router {
+	if d.tenantByName("sd").specOf().router {
 		t.Fatal("sd is marked as a router")
 	}
 }
 
-// A model that no slot declares or advertises is a 404, not a silent fall through to the default
+// A model that no tenant declares or advertises is a 404, not a silent fall through to the default
 // engine -- that fallback is what put an unrelated d1 on the card on 2026-11-09.
 func TestAnUnknownModelIsA404(t *testing.T) {
 	cfg := testConfig(t)
@@ -2420,7 +2420,7 @@ func TestAUnixEndpointIsLivenessByDial(t *testing.T) {
 	}
 }
 
-// And a chat request for a unix slot reaches the engine through the socket.
+// And a chat request for a unix tenant reaches the engine through the socket.
 func TestTheProxyDialsTheSocket(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "m.sock")
@@ -2451,7 +2451,7 @@ func TestTheProxyDialsTheSocket(t *testing.T) {
 }
 
 // One engine's breaker must not refuse another engine's requests.
-func TestABreakerIsPerSlot(t *testing.T) {
+func TestABreakerIsPerTenant(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.llama = engineConfig{url: "http://127.0.0.1:1", bin: "/usr/bin/llama-server"}
 	cfg.llamb = engineConfig{url: "http://127.0.0.1:2", bin: "/usr/bin/llama-server"}
@@ -2474,7 +2474,7 @@ func TestABreakerIsPerSlot(t *testing.T) {
 func TestSocketEndpointsAreNamedAsSockets(t *testing.T) {
 	cfg := testConfig(t)
 	d := newTestDemesne(t, cfg)
-	s := d.slotByName("llama")
+	s := d.tenantByName("llama")
 	if got := endpointName("unix:/run/user/1000/models/x.sock", 0); got != "socket /run/user/1000/models/x.sock" {
 		t.Fatalf("endpointName = %q", got)
 	}
@@ -2484,29 +2484,29 @@ func TestSocketEndpointsAreNamedAsSockets(t *testing.T) {
 	_ = s
 }
 
-// A unix slot has no port to read, claim or collide, and validation must not demand one: it did,
+// A unix tenant has no port to read, claim or collide, and validation must not demand one: it did,
 // and on 2026-11-10 that crash-looped the whole estate until the check was taught the difference.
-func TestAUnixSlotNeedsNoPort(t *testing.T) {
+func TestAUnixTenantNeedsNoPort(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.sd.args = []string{"--stub"}
 	cfg.whisper = engineConfig{url: "unix:/run/user/1000/models/d1.sock",
 		bin: "/usr/bin/llama-server", args: []string{"--host", "/run/user/1000/models/d1.sock"}}
-	var slots []*slot
-	for _, sp := range buildSlots(cfg) {
-		slots = append(slots, &slot{spec: sp})
+	var tenants []*tenant
+	for _, sp := range buildTenants(cfg) {
+		tenants = append(tenants, &tenant{spec: sp})
 	}
-	if err := cfg.validate(slots); err != nil {
-		t.Fatalf("a unix slot was rejected: %v", err)
+	if err := cfg.validate(tenants); err != nil {
+		t.Fatalf("a unix tenant was rejected: %v", err)
 	}
 
 	cfg.whisper = engineConfig{url: cfg.llama.url, bin: "/usr/bin/llama-server",
 		args: []string{"--port", "1"}}
-	slots = nil
-	for _, sp := range buildSlots(cfg) {
-		slots = append(slots, &slot{spec: sp})
+	tenants = nil
+	for _, sp := range buildTenants(cfg) {
+		tenants = append(tenants, &tenant{spec: sp})
 	}
-	if err := cfg.validate(slots); err == nil {
-		t.Fatal("two slots on one TCP port were accepted")
+	if err := cfg.validate(tenants); err == nil {
+		t.Fatal("two tenants on one TCP port were accepted")
 	}
 }
 

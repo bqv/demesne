@@ -41,11 +41,11 @@ const (
 )
 
 // modelIndex is the union of the routers' advertised models. It is written only by
-// refreshModels and read only by slotForModel, both under the mutex, so a refresh cannot
+// refreshModels and read only by tenantForModel, both under the mutex, so a refresh cannot
 // tear a lookup.
 type modelIndex struct {
 	mu      sync.Mutex
-	byModel map[string]string // model id -> slot name
+	byModel map[string]string // model id -> tenant name
 	// loaded counts, per router, how many models it says are resident. It is what makes
 	// "who holds the card" an answer about memory rather than about a process: a router
 	// that is up with nothing loaded holds the port and about 28 MiB, not the card.
@@ -61,11 +61,11 @@ func newModelIndex() modelIndex {
 	return modelIndex{byModel: map[string]string{}, loaded: map[string]int{}, known: map[string]bool{}}
 }
 
-// seedModels puts each slot's declared models into the index before anything is asked. It is
+// seedModels puts each tenant's declared models into the index before anything is asked. It is
 // what makes a declared model routable on the first request rather than after a refresh.
 func (d *demesne) seedModels() {
 	byModel := make(map[string]string)
-	for _, s := range d.slots {
+	for _, s := range d.tenants {
 		if !s.specOf().router || !s.specOf().routed {
 			continue
 		}
@@ -76,9 +76,9 @@ func (d *demesne) seedModels() {
 		}
 	}
 	d.models.mu.Lock()
-	for id, slot := range byModel {
+	for id, tenant := range byModel {
 		if _, taken := d.models.byModel[id]; !taken {
-			d.models.byModel[id] = slot
+			d.models.byModel[id] = tenant
 		}
 	}
 	d.models.mu.Unlock()
@@ -89,7 +89,7 @@ func (d *demesne) refreshModels() {
 	next := make(map[string]string)
 	loaded := make(map[string]int)
 	known := make(map[string]bool)
-	for _, s := range d.slots {
+	for _, s := range d.tenants {
 		if !s.specOf().router || !s.specOf().routed {
 			continue
 		}
@@ -100,18 +100,18 @@ func (d *demesne) refreshModels() {
 		}
 		for _, id := range modelIDs(items) {
 			// First router wins a clash. Two routers advertising one id is a
-			// configuration mistake, and picking the earlier slot is at least stable.
+			// configuration mistake, and picking the earlier tenant is at least stable.
 			if _, taken := next[id]; !taken {
 				next[id] = s.specOf().name
 			}
 		}
 	}
-	// A slot's configured models are routable even when the engine cannot answer: an on-demand
+	// A tenant's configured models are routable even when the engine cannot answer: an on-demand
 	// or external engine that is down has no /v1/models to read, so without this its names are
 	// unknown after every restart and a request for one falls through to the router instead of
-	// reaching the slot (or refusing). A live answer wins a clash, because it is the engine's
+	// reaching the tenant (or refusing). A live answer wins a clash, because it is the engine's
 	// own word; the configured list is what the engine is known to serve.
-	for _, s := range d.slots {
+	for _, s := range d.tenants {
 		if !s.specOf().router || !s.specOf().routed {
 			continue
 		}
@@ -133,15 +133,15 @@ func (d *demesne) refreshModels() {
 
 func (d *demesne) logModelIndex(byModel map[string]string) {
 	if len(byModel) == 0 {
-		log.Printf("routing by model: no router is advertising models; unknown models go to the default slot")
+		log.Printf("routing by model: no router is advertising models; unknown models go to the default tenant")
 		return
 	}
 	per := map[string][]string{}
-	for id, slot := range byModel {
-		per[slot] = append(per[slot], id)
+	for id, tenant := range byModel {
+		per[tenant] = append(per[tenant], id)
 	}
-	parts := make([]string, 0, len(d.slots))
-	for _, s := range d.slots {
+	parts := make([]string, 0, len(d.tenants))
+	for _, s := range d.tenants {
 		if ids := per[s.specOf().name]; len(ids) > 0 {
 			parts = append(parts, s.specOf().name+"("+strings.Join(ids, " ")+")")
 		}
@@ -149,10 +149,10 @@ func (d *demesne) logModelIndex(byModel map[string]string) {
 	log.Printf("routing by model: %s", strings.Join(parts, " "))
 }
 
-// slotForModel answers "which engine has this model", and "" when nobody does -- in which
-// case the caller keeps the slot the path chose, i.e. the router, which is where an unknown
+// tenantForModel answers "which engine has this model", and "" when nobody does -- in which
+// case the caller keeps the tenant the path chose, i.e. the router, which is where an unknown
 // model went before any of this existed.
-func (d *demesne) slotForModel(model string) string {
+func (d *demesne) tenantForModel(model string) string {
 	if model == "" {
 		return ""
 	}
@@ -238,10 +238,10 @@ func countLoaded(items []json.RawMessage) (int, bool) {
 }
 
 // loadedCount is how many models a router has resident, and whether that is known.
-func (d *demesne) loadedCount(slot string) (int, bool) {
+func (d *demesne) loadedCount(tenant string) (int, bool) {
 	d.models.mu.Lock()
 	defer d.models.mu.Unlock()
-	n, known := d.models.loaded[slot], d.models.known[slot]
+	n, known := d.models.loaded[tenant], d.models.known[tenant]
 	return n, known
 }
 
@@ -297,7 +297,7 @@ func writeModelNotFound(w http.ResponseWriter, model string, known []string) {
 	w.WriteHeader(http.StatusNotFound)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"error": map[string]any{
-			"message": "no slot serves model " + model + "; declared and advertised models: " +
+			"message": "no tenant serves model " + model + "; declared and advertised models: " +
 				strings.Join(known, ", "),
 			"type": "invalid_request_error",
 			"code": "model_not_found",
@@ -308,7 +308,7 @@ func writeModelNotFound(w http.ResponseWriter, model string, known []string) {
 func (d *demesne) modelsHandler(w http.ResponseWriter, r *http.Request) {
 	data := []json.RawMessage{}
 	answered := 0
-	for _, s := range d.slots {
+	for _, s := range d.tenants {
 		if !s.specOf().router || !s.specOf().routed {
 			continue
 		}
@@ -323,7 +323,7 @@ func (d *demesne) modelsHandler(w http.ResponseWriter, r *http.Request) {
 		// Nobody answered. Let the default engine produce its own error instead of
 		// inventing an empty list: "no models" and "the router is down" are not the same
 		// answer, and the second one is the true one.
-		if s := d.defaultSlot(); s != nil {
+		if s := d.defaultTenant(); s != nil {
 			d.proxies[s.specOf().name].ServeHTTP(w, r)
 			return
 		}

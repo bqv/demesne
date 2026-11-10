@@ -29,8 +29,8 @@ func goldenConfig() config {
 
 func TestTheFiveDefaultsAreUnchanged(t *testing.T) {
 	cfg := goldenConfig()
-	got := sortedSpecs(buildSlots(cfg))
-	want := []slotSpec{
+	got := sortedTenants(buildTenants(cfg))
+	want := []tenantSpec{
 		{
 			name: "llama", url: "http://127.0.0.1:55556", bin: "/bin/llama", args: []string{"--llama"},
 			dir: "/srv/llm", models: []string{"m1"}, kind: kindModel, group: "gpu", vram: true,
@@ -57,30 +57,30 @@ func TestTheFiveDefaultsAreUnchanged(t *testing.T) {
 		},
 	}
 	if len(got) != len(want) {
-		t.Fatalf("slots = %d, want %d (strata is absent without a url)", len(got), len(want))
+		t.Fatalf("tenants = %d, want %d (strata is absent without a url)", len(got), len(want))
 	}
 	for i := range want {
 		if got[i].name != want[i].name {
-			t.Fatalf("slot %d = %q, want %q", i, got[i].name, want[i].name)
+			t.Fatalf("tenant %d = %q, want %q", i, got[i].name, want[i].name)
 		}
 		if !reflect.DeepEqual(got[i], want[i]) {
-			t.Fatalf("slot %s:\n got %+v\nwant %+v", want[i].name, got[i], want[i])
+			t.Fatalf("tenant %s:\n got %+v\nwant %+v", want[i].name, got[i], want[i])
 		}
 	}
 }
 
-func writeSlots(t *testing.T, body string) string {
+func writeTenants(t *testing.T, body string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "slots.ini")
+	path := filepath.Join(t.TempDir(), "tenants.ini")
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return path
 }
 
-func TestASlotFileDefinesAndOverrides(t *testing.T) {
+func TestATenantFileDefinesAndOverrides(t *testing.T) {
 	cfg := goldenConfig()
-	path := writeSlots(t, `
+	cfg.tenantsFile = writeTenants(t, `
 [llama]
 url = http://127.0.0.1:55556
 models = m1, m2
@@ -97,14 +97,14 @@ group = gpu
 vram_mb = 3200
 idle = 5m
 `)
-	specs, notes, err := slotsFromFile(cfg, path)
+	specs, notes, err := tenantsFromConfig(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(notes) != 1 || !strings.Contains(notes[0], "llama") || !strings.Contains(notes[0], "replacing the built-in default") {
 		t.Fatalf("override note = %v", notes)
 	}
-	byName := map[string]slotSpec{}
+	byName := map[string]tenantSpec{}
 	for _, sp := range specs {
 		byName[sp.name] = sp
 	}
@@ -113,7 +113,7 @@ idle = 5m
 	}
 	spark, ok := byName["spark"]
 	if !ok {
-		t.Fatal("the new slot was not added")
+		t.Fatal("the new tenant was not added")
 	}
 	if spark.kind != kindModel || !spark.router || spark.policy != policyOnDemand ||
 		spark.idle != 5*time.Minute || spark.vramMB != 3200 || len(spark.aliases) != 1 {
@@ -124,12 +124,12 @@ idle = 5m
 	}
 	for i := 1; i < len(specs); i++ {
 		if specs[i-1].name > specs[i].name {
-			t.Fatalf("slots are not in name order: %v then %v", specs[i-1].name, specs[i].name)
+			t.Fatalf("tenants are not in name order: %v then %v", specs[i-1].name, specs[i].name)
 		}
 	}
 }
 
-func TestASlotsFileRefusesWhatWouldLie(t *testing.T) {
+func TestATenantsFileRefusesWhatWouldLie(t *testing.T) {
 	cases := map[string]string{
 		"warm policy": `[a]
 url = http://127.0.0.1:1
@@ -150,35 +150,36 @@ models = a
 url = unix:/run/a.socket
 models = a
 `,
-		"duplicate slot": `[a]
+		"duplicate tenant": `[a]
 url = http://127.0.0.1:1
 models = a
 [a]
 url = http://127.0.0.1:2
 models = b
 `,
-		"key outside a slot": `url = http://127.0.0.1:1
+		"key outside a tenant": `url = http://127.0.0.1:1
 `,
 	}
 	for name, body := range cases {
 		cfg := goldenConfig()
-		if _, _, err := slotsFromFile(cfg, writeSlots(t, body)); err == nil {
+		cfg.tenantsFile = writeTenants(t, body)
+		if _, _, err := tenantsFromConfig(cfg); err == nil {
 			t.Fatalf("%s was accepted", name)
 		}
 	}
 }
 
-func TestTheSlotLogIsInNameOrder(t *testing.T) {
-	sp := []slotSpec{
+func TestTheTenantLogIsInNameOrder(t *testing.T) {
+	sp := []tenantSpec{
 		{name: "whisper", url: "http://127.0.0.1:3", policy: policyExternal},
 		{name: "llama", url: "http://127.0.0.1:1", policy: policyExternal},
 	}
-	sorted := sortedSpecs(sp)
-	lines := []string{slotLogLine(sorted[0]), slotLogLine(sorted[1])}
-	if !strings.HasPrefix(lines[0], "slot llama ") || !strings.HasPrefix(lines[1], "slot whisper ") {
+	sorted := sortedTenants(sp)
+	lines := []string{tenantLogLine(sorted[0]), tenantLogLine(sorted[1])}
+	if !strings.HasPrefix(lines[0], "tenant llama ") || !strings.HasPrefix(lines[1], "tenant whisper ") {
 		t.Fatalf("log order = %q then %q", lines[0], lines[1])
 	}
-	if !strings.Contains(lines[0], "vram=undeclared") || !strings.Contains(lines[0], "reload=unknown") {
-		t.Fatalf("an undeclared slot should say so: %q", lines[0])
+	if !strings.Contains(lines[0], "vram_mb=?") || !strings.Contains(lines[0], "reload_s=?") {
+		t.Fatalf("an undeclared tenant should say so: %q", lines[0])
 	}
 }

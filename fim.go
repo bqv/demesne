@@ -76,15 +76,15 @@ func (d *demesne) handleFIM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	slot := d.slotByName("llama")
-	if name := d.slotForModel(in.Model); name != "" {
-		slot = d.slotByName(name)
+	tenant := d.tenantByName("llama")
+	if name := d.tenantForModel(in.Model); name != "" {
+		tenant = d.tenantByName(name)
 	}
-	if slot == nil {
-		writeMistralError(w, http.StatusNotFound, "no such slot", "invalid_request_error")
+	if tenant == nil {
+		writeMistralError(w, http.StatusNotFound, "no such tenant", "invalid_request_error")
 		return
 	}
-	if !d.claimCard(w, r, slot) {
+	if !d.claimCard(w, r, tenant) {
 		return
 	}
 
@@ -105,18 +105,18 @@ func (d *demesne) handleFIM(w http.ResponseWriter, r *http.Request) {
 	id := newCompletionID()
 	model := in.Model
 	if model == "" {
-		model = slot.specOf().name
+		model = tenant.specOf().name
 	}
 
 	// Streaming goes first: it answers the client before dialling, so a cold load cannot sit
 	// behind a header deadline. The non-streaming path below can afford to wait for a status.
 	if in.Stream {
-		d.streamFIM(w, r, slot, payload, id, model)
+		d.streamFIM(w, r, tenant, payload, id, model)
 		return
 	}
 
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost,
-		strings.TrimRight(slot.specOf().url, "/")+"/infill", strings.NewReader(string(payload)))
+		strings.TrimRight(tenant.specOf().url, "/")+"/infill", strings.NewReader(string(payload)))
 	if err != nil {
 		writeMistralError(w, http.StatusInternalServerError, err.Error(), "internal_error")
 		return
@@ -127,7 +127,7 @@ func (d *demesne) handleFIM(w http.ResponseWriter, r *http.Request) {
 	// cancellation is the only thing that should end it early.
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		writeMistralError(w, http.StatusBadGateway, "the "+slot.specOf().name+" engine did not answer: "+err.Error(), "server_error")
+		writeMistralError(w, http.StatusBadGateway, "the "+tenant.specOf().name+" engine did not answer: "+err.Error(), "server_error")
 		return
 	}
 	defer resp.Body.Close()
@@ -145,7 +145,7 @@ func (d *demesne) handleFIM(w http.ResponseWriter, r *http.Request) {
 // documents for a streaming FIM request: data-only events terminated by [DONE]. It answers the
 // client first, for the same reason chat does: a cold load must not sit behind a header
 // deadline.
-func (d *demesne) streamFIM(w http.ResponseWriter, r *http.Request, s *slot, payload []byte, id, model string) {
+func (d *demesne) streamFIM(w http.ResponseWriter, r *http.Request, s *tenant, payload []byte, id, model string) {
 	url := strings.TrimRight(s.specOf().url, "/") + "/infill"
 	out, resp, done, err := d.streamUpstream(w, r, url, payload)
 	defer done()

@@ -10,17 +10,17 @@ one port. It `fork/exec`s every engine it owns, decides who may hold a card and 
 each request to the engine that actually has the model, and answers for all of it on
 `127.0.0.1:55555`.
 
-It is a fork of `stadi` at `ad49321`, which was a slot broker in front of *two* engines.
+It is a fork of `stadi` at `ad49321`, which was a tenant broker in front of *two* engines.
 That repository, its checkout, its unit, its conf and its binary were all deleted once demesne
-had taken the estate over; its commits live on in this history, and nowhere else. The slot broker is the hard part and it is unchanged in spirit;
+had taken the estate over; its commits live on in this history, and nowhere else. The tenant broker is the hard part and it is unchanged in spirit;
 what grew is ownership — demesne no longer asks `rc-service` to start an engine, so there is
 one owner and one actor per restart.
 
 This file is both the manual and the design record: the decisions are written next to the
 things they decide, because the reasons are only useful where someone is about to change the
-behaviour. The work is in `main.go` (config, routing, HTTP), `slot.go` (the lifecycle, the
+behaviour. The work is in `main.go` (config, routing, HTTP), `tenant.go` (the lifecycle, the
 fence), `watch.go` (the router's health policy), `models.go` (which engine has which model),
-`reload.go` (applying a changed conf) and `cli.go`, and `slot_test.go` pins the parts that
+`reload.go` (applying a changed conf) and `cli.go`, and `tenant_test.go` pins the parts that
 break.
 
 ## The estate
@@ -38,10 +38,10 @@ All four are demesne's children. `llama`, `llamb` and `whisper` are out of the O
 gone too, archived with their last config in `~/var/archive/old-engine-services-*.tar.gz`.
 Nothing but demesne can claim an engine's port now, and nothing starts one but demesne.
 
-Two invariants are enforced at startup, not discovered at runtime: **one slot per port**, and
+Two invariants are enforced at startup, not discovered at runtime: **one tenant per port**, and
 **one resident holder of a group**.
 
-### Why a slot table and not "one GPU slot plus one media port"
+### Why a tenant table and not "one GPU tenant plus one media port"
 
 Because that shape cannot express llamb (a second, smaller card) or whisper (CPU-only), and
 it re-invents itself per engine anyway. One struct with one lifecycle, four rows of data:
@@ -115,7 +115,7 @@ routers' `/v1/models`, refreshed on a 30 s ticker and built once before the list
 
 - a model only one router advertises goes there;
 - an unknown model keeps the path's answer, which is the router;
-- **the arbitration follows the slot the request reaches**, so a model on the small card never
+- **the arbitration follows the tenant the request reaches**, so a model on the small card never
   evicts a render from the big one — that is what makes an aux-card client safe to route here;
 - **the llama breaker is scoped to llama.** It is built from that engine's failures; applying
   it to the other card would refuse requests over somebody else's fault. (The first version of
@@ -177,7 +177,7 @@ disappear, they changed subject: `rc-service --user demesne start|stop|restart` 
 estate, and per-engine control is demesne's.
 
 It keeps stadi's field names (`slot`, `sd_child_up`, `sd_child_pid`, `llm_health`,
-`media_in_flight`, `idle_timeout_s`) and adds `slots[]` with, per engine: policy, owned, up,
+`media_in_flight`, `idle_timeout_s`) and adds `tenants[]` with, per engine: policy, owned, up,
 booting, pid, uptime, in-flight, restarts, last error, its cgroup, and `port_held_elsewhere`
 when something else owns the port.
 
@@ -186,16 +186,16 @@ and is **cleared when it becomes ready**, so a value is never a stale success; `
 is the same idea as a closed vocabulary — `idle`, `chat-claims-card`, `operator`, `failed` —
 because "stopped" and "stopped because a chat took the card" are different sentences to a
 reader, and only the second one explains a render that vanished. Absent while running, for the
-same reason as the error; and **total for a slot that is down**, so a slot that has never been
+same reason as the error; and **total for a tenant that is down**, so a tenant that has never been
 asked says `idle` rather than leaving the client to interpret an absent field. An operator stop
-of a slot that is already down does not overwrite `failed` — the failure is the last thing that
+of a tenant that is already down does not overwrite `failed` — the failure is the last thing that
 actually happened.
 
 A status poll never takes the transition lock, so a cold load cannot wedge the surface that
-explains the cold load. State lives behind per-slot mutexes; the transition lock is only for
+explains the cold load. State lives behind per-tenant mutexes; the transition lock is only for
 transitions.
 
-The HTTP side: `GET /status`, `GET /estate/card`, `GET|POST /release[?slot=]`,
+The HTTP side: `GET /status`, `GET /estate/card`, `GET|POST /release[?tenant=]`,
 `GET /slots/<name>`, `POST /slots/<name>/load|stop`, `POST /reload`, plus the proxied
 `/v1/*`, `/sdapi/*` and `/inference`.
 
@@ -212,18 +212,18 @@ Three additive surfaces, none of which touch `/status`'s existing keys or `/esta
 
 | surface | for | shape |
 | :-- | :-- | :-- |
-| `loads[]` in `/status` | the cold start of a card app | one entry per model load, per slot |
+| `loads[]` in `/status` | the cold start of a card app | one entry per model load, per tenant |
 | `GET /estate/metrics` | a first paint and a fallback poll | a versioned snapshot, `"version": 1` |
 | `GET /estate/events` | the live feed | SSE, a snapshot frame then typed deltas |
 
 ### `loads[]`
 
-`slots[].booting` is about a *child process*: a router that is up and loading a model into
+`tenants[].booting` is about a *child process*: a router that is up and loading a model into
 VRAM is not booting, and for two hours on 2026-11-07 nothing in `/status` said so. `loads[]` is
 the model-level answer, and it is an array because llamb can hold four models at once:
 
 ```json
-{"slot":"llama","model":"Qwen3.8-27B-abliterated-120k","phase":"loading",
+{"tenant":"llama","model":"Qwen3.8-27B-abliterated-120k","phase":"loading",
  "started_ms":1794051974420,"finished_ms":null,"error":null,
  "progress":null,"line":"llama_model_loader: loaded meta data (45%)"}
 ```
@@ -232,7 +232,7 @@ the model-level answer, and it is an array because llamb can hold four models at
   (lingering for 60 s), `failed` (lingering for 10 min, with `error`).
 - `started_ms`/`finished_ms`: epoch ms. `started_ms` for a polled load is when demesne first
   saw it, which is within one 2 s tick of the truth.
-- `line` and `progress` come from the child's own log (`<logDir>/<slot>.err`) — the last
+- `line` and `progress` come from the child's own log (`<logDir>/<tenant>.err`) — the last
   `load_tensors`/`llama_model_loader`/`request cancelled while waiting` line, and a percentage
   when the engine prints one.
 - The phase comes from the router's own `/v1/models` `status.value`, not from guessing at
@@ -244,7 +244,7 @@ the model-level answer, and it is an array because llamb can hold four models at
 `estate.reload` re-reads **demesne's** own conf (`~/etc/conf.d/demesne`), which is why a
 restart is not needed for a port change, a fence change or an env change.
 
-`POST /slots/llama/reload` (or `slots.reload` over RPC) asks **the router** to re-read
+`POST /tenants/llama/reload` (or `tenants.reload` over RPC) asks **the router** to re-read
 `~/var/model/llm/models.ini`, so adding, editing or deleting a rung needs no restart either.
 llama.cpp has no POST for this: the refresh is a query string on the model list,
 `GET <router>/models?reload=1`, and it is slow — ten seconds or more — while a model is loading.
@@ -259,11 +259,11 @@ needs it most.
 ### `GET /estate/metrics`
 
 One document, `"version": 1`, with `since_ms` naming the moment every counter is counted from
-(the daemon's start). Per slot: `runtime` (`requests_total`, `active`, `errors_total`,
+(the daemon's start). Per tenant: `runtime` (`requests_total`, `active`, `errors_total`,
 `last_latency_ms`), `cgroup` (`current_bytes`, `high_bytes`, `max_bytes`, `oom_kills`), `load`,
 `restarts`, `uptime_s`, `foreign`, `last_transition`. Estate-wide: VRAM used/total/free, the
-models each router advertises (`models`), which slot owns each model (`owner`), `history` (the
-last 32 transitions, with the reason a slot stopped), and an `unavailable` list — currently
+models each router advertises (`models`), which tenant owns each model (`owner`), `history` (the
+last 32 transitions, with the reason a tenant stopped), and an `unavailable` list — currently
 `tokens_in`, `tokens_out`, `prefill_tps`, `decode_tps`, `queue_depth`, `wait_ms`, because
 reading those means parsing response bodies, which this daemon deliberately does not do. They
 are named rather than silently zero.
@@ -301,16 +301,16 @@ curl --unix-socket /run/user/1000/demesne.sock http://demesne/rpc \
 
 | method | params | answer |
 | :-- | :-- | :-- |
-| `estate.status` | — | `{version, slots[]}` — the estate's own account of itself |
+| `estate.status` | — | `{version, tenants[]}` — the estate's own account of itself |
 | `estate.card` | `{group?}` | the small card document (default `gpu`) |
 | `estate.reload` | — | the reload report |
-| `slots.status` | `{slot}` | one slot |
-| `slots.load` | `{slot}` | `{slot, state:"running"}` — may block for a cold load |
-| `slots.stop` | `{slot}` | `{slot, state:"stopped"}` |
-| `slots.reclaim` | `{slot}` | `{slot, reclaimed:bool}` — see the evidence rules below |
-| `slots.reload` | `{slot}` | `{slot, reloaded:true, models:N}` — re-reads a router's `models.ini` |
+| `tenants.status` | `{tenant}` | one tenant |
+| `tenants.load` | `{tenant}` | `{tenant, state:"running"}` — may block for a cold load |
+| `tenants.stop` | `{tenant}` | `{tenant, state:"stopped"}` |
+| `tenants.reclaim` | `{tenant}` | `{tenant, reclaimed:bool}` — see the evidence rules below |
+| `tenants.reload` | `{tenant}` | `{tenant, reloaded:true, models:N}` — re-reads a router's `models.ini` |
 
-Errors are JSON-RPC's own: `-32601` no such method, `-32602` bad params (an unknown slot comes
+Errors are JSON-RPC's own: `-32601` no such method, `-32602` bad params (an unknown tenant comes
 with the valid names in `data`), `-32603` internal. Batches are answered in order, and a
 notification — a request with no `id` — is executed and not answered.
 
@@ -329,7 +329,7 @@ whether a card is busy gets a separate, deliberately tiny one:
 ```sh
 curl --unix-socket /run/user/1000/demesne.sock 'http://demesne/estate/card?group=gpu'
 {"group":"gpu","holders":[],"since_ms":0,
- "slots":[{"name":"llama","state":"running"},{"name":"sd","state":"stopped"}]}
+ "tenants":[{"name":"llama","state":"running"},{"name":"sd","state":"stopped"}]}
 ```
 
 A client that reacts to the card needs two booleans and a timestamp, and every field it parses
@@ -353,7 +353,7 @@ not, and `TestEstateCardIsTheSmallTypedAnswer` fails when it does.
   here would be a string from nowhere, and naming the wrong one is worse than naming none. A
   caller that wants a label maps `gpu`/`aux` itself, where it knows which card it means.
 
-A slot appears with one of three states: `running`, `loading` (started, not yet answering — a
+A tenant appears with one of three states: `running`, `loading` (started, not yet answering — a
 cold sd load spends eight minutes there) or `stopped`. `loading` is in the vocabulary because
 it is the only state in which the card is about to be taken but is not yet, and a client that
 treats it as `stopped` will be evicted a minute later.
@@ -412,8 +412,8 @@ notice nothing.
 | giving up | how it is covered |
 | :-- | :-- |
 | `supervise-daemon`'s respawn policy | `supervise()`: restart on exit, 5 s doubling to a 60 s cap, reset after a minute of health |
-| cgroup pinning in `init.d/*` (`start_post`) | per-slot `memLimit`: build the leaf, write the limits, join each child (`slot.go`) |
-| `rc-service --user llama restart` | `POST /slots/llama/load` / `stop`, or `demesne load llama` |
+| cgroup pinning in `init.d/*` (`start_post`) | per-tenant `memLimit`: build the leaf, write the limits, join each child (`tenant.go`) |
+| `rc-service --user llama restart` | `POST /tenants/llama/load` / `stop`, or `demesne load llama` |
 | pidfiles, `rc-status` | `/status` (`demesne status`) |
 
 Per-engine shutdown is still by SIGTERM, and demesne takes every child down with it — the
@@ -434,29 +434,29 @@ Two smaller consequences of the same lesson, now enforced in the spawn path:
 - **readiness is our child answering**, not just a port answering: the child is checked alive
   *before* the port is believed, so an orphan cannot be adopted as a successful start.
 
-**And one chance to take a port back — on evidence, never on a guess.** A slot whose port is
-answered while the slot is down tries `reclaim` (also `POST /slots/<name>/reclaim`, and
-`slots.reclaim` over the RPC). It kills the holder only if both of these hold:
+**And one chance to take a port back — on evidence, never on a guess.** A tenant whose port is
+answered while the tenant is down tries `reclaim` (also `POST /tenants/<name>/reclaim`, and
+`tenants.reclaim` over the RPC). It kills the holder only if both of these hold:
 
-1. the process is in **the slot's own cgroup leaf** — only demesne ever moves a process there;
-2. its **executable is the binary the slot is configured to run**, matched by basename.
+1. the process is in **the tenant's own cgroup leaf** — only demesne ever moves a process there;
+2. its **executable is the binary the tenant is configured to run**, matched by basename.
 
-Anything else is refused with the pid and the reason, and left alone: a slot stuck behind
+Anything else is refused with the pid and the reason, and left alone: a tenant stuck behind
 somebody else's listener is a loud, recoverable state, while killing the wrong process is not
-recoverable at all. A slot with no fence configured has no test 1, so it refuses too. The
+recoverable at all. A tenant with no fence configured has no test 1, so it refuses too. The
 holder is found the way `ss` finds it — the socket inode from `/proc/net/tcp{,6}`, then the
 process in `/proc/<pid>/fd` — because a daemon may not shell out to `ss`.
 
 ### Restart policy — resident is eager, media is lazy, both bounded
 
-The policy is a property of the slot, and the two answers differ because the costs differ.
+The policy is a property of the tenant, and the two answers differ because the costs differ.
 
 - **resident** (llama, llamb): eager. Spawn at boot, restart on exit, 5 s doubling to a 60 s
   cap, forever, reset after a minute of health. Never evicted. The watch no longer restarts
   them — it *kills* a wedged child and lets the supervisor start it, so there is one actor.
 - **on demand** (sd, whisper): lazy, with the crash backoff the sd child never had. It used to
   be logged, marked down, and retried immediately by the next request — each attempt able to
-  pay a 15-minute cold load. Now a slot that keeps dying is spaced out and the request is
+  pay a 15-minute cold load. Now a tenant that keeps dying is spaced out and the request is
   refused with the reason and the wait.
 - `waitReady()` watches the child while it waits for the port, so a child that dies during
   startup is reported in 500 ms rather than after the full 15-minute load bound.
@@ -487,7 +487,7 @@ so a reload cannot tear a lookup.
 
 ## The fence
 
-Every slot has a memory fence under `/sys/fs/cgroup/estate`, and the child is joined to it
+Every tenant has a memory fence under `/sys/fs/cgroup/estate`, and the child is joined to it
 after **every** spawn — including respawns, because a supervisor that restarts an engine must
 not quietly restart it outside its limit. A one-minute timer re-asserts both the limits and the
 membership, so "bounded" is a running claim and not a startup one. `/status` publishes the
@@ -546,7 +546,7 @@ export DEMESNE_LLAMA_SWAP_HIGH="1G"
 ```
 
 One file because the per-engine `conf.d/*` were only ever a transport for `rc-service`'s
-environment; the environment each *child* needs is a slot property (`-<slot>-env`), which is
+environment; the environment each *child* needs is a tenant property (`-<tenant>-env`), which is
 also the only way to give the two routers different Vulkan pins from one parent process.
 
 **Flags first, environment as the fallback.** Every setting is a command-line argument; each
@@ -569,21 +569,21 @@ them: `DEMESNE_<SLOT>` is the URL, then `_BIN`, `_DIR`, `_ARGS`, `_ENV`, `_MEMOR
 | `-vram-wait` | `DEMESNE_VRAM_WAIT` | `45s` — bound on waiting for the card to come back |
 | `-load-wait` | `DEMESNE_LOAD_WAIT` | `15m` — bound on a child's port appearing |
 | `-conf` | `DEMESNE_CONF` | none — the file `SIGHUP` / `POST /reload` re-reads |
-| `-log-dir` | `DEMESNE_LOG_DIR` | `$XDG_CACHE_HOME/demesne` — one `<slot>.{log,err}` pair per engine |
+| `-log-dir` | `DEMESNE_LOG_DIR` | `$XDG_CACHE_HOME/demesne` — one `<tenant>.{log,err}` pair per engine |
 | `-restart-delay` | `DEMESNE_RESTART_DELAY` | `5s` — doubling to a `60s` cap, reset after a minute of health |
 | `-restart-window` / `-restart-max` | `DEMESNE_RESTART_*` | `30m` / `2` |
 | `-breaker` / `-fail-threshold` | `DEMESNE_BREAKER` / `DEMESNE_FAIL_THRESHOLD` | `20s` / `2` — the router's breaker |
-| `-<slot>-bin` | `DEMESNE_<SLOT>_BIN` | found on `PATH`; **empty leaves that engine to OpenRC** |
-| `-<slot>-args` | `DEMESNE_<SLOT>_ARGS` | **required when adopting** — the child's whole command line |
-| `-<slot>-env` | `DEMESNE_<SLOT>_ENV` | extra `KEY=VALUE` for that child, e.g. its Vulkan pin |
-| `-<slot>-dir` | `DEMESNE_<SLOT>_DIR` | the child's working directory — a router's `models.ini` is relative to it |
+| `-<tenant>-bin` | `DEMESNE_<SLOT>_BIN` | found on `PATH`; **empty leaves that engine to OpenRC** |
+| `-<tenant>-args` | `DEMESNE_<SLOT>_ARGS` | **required when adopting** — the child's whole command line |
+| `-<tenant>-env` | `DEMESNE_<SLOT>_ENV` | extra `KEY=VALUE` for that child, e.g. its Vulkan pin |
+| `-<tenant>-dir` | `DEMESNE_<SLOT>_DIR` | the child's working directory — a router's `models.ini` is relative to it |
 | `-cgroup-root` | `DEMESNE_CGROUP_ROOT` | `/sys/fs/cgroup/estate` |
 | `-cgroup-prepare` / `-cgroup-join` | `DEMESNE_CGROUP_*` | on `PATH`, then `~/bin` — the *privileged fallback* only |
 | `-free-gib` | — | `2` — treat the card as free below this many GiB used |
 | `-llm-service` / `-llm-restart-wait` | `DEMESNE_LLM_*` | `llama` / `3m` — legacy: the restarter for an external router |
 | `-version` | — | print the version and exit |
 
-Memory fences are environment-only, three per slot, because they are set once and there would
+Memory fences are environment-only, three per tenant, because they are set once and there would
 be twelve flags: `DEMESNE_{LLAMA,LLAMB,SD,WHISPER}_{MEMORY_HIGH,MEMORY_MAX,SWAP_HIGH}`.
 
 Two notes on the list-valued settings. They are space-separated — the environment is the
@@ -632,15 +632,61 @@ the right program.
 | # | problem | disposition |
 | --: | :-- | :-- |
 | 1 | the 55557 collision, nothing enforcing exclusivity | whisper moved; duplicate ports are a startup error; a foreign holder is refused and named |
-| 2 | whisper unroutable: `/inference` fell through to llama | whisper is a routed slot; unconfigured it answers 503 naming itself |
+| 2 | whisper unroutable: `/inference` fell through to llama | whisper is a routed tenant; unconfigured it answers 503 naming itself |
 | 3 | double restart: the watch and `supervise-daemon` on one event | one actor — the supervisor restarts, the watch only kills a wedged child |
-| 4 | the sd child had no backoff | crash backoff on every on-demand slot, and `waitReady` notices a startup death in 500 ms |
-| 5 | no syslog; unrotated logs | not solved, only narrowed: one `<slot>.{log,err}` pair per engine, still unrotated |
+| 4 | the sd child had no backoff | crash backoff on every on-demand tenant, and `waitReady` notices a startup death in 500 ms |
+| 5 | no syslog; unrotated logs | not solved, only narrowed: one `<tenant>.{log,err}` pair per engine, still unrotated |
 | 6 | orphaned VRAM freezes the LLM side for 24 h | unchanged on purpose: a restart cannot free an orphaned context, and a loop would only hide the fault. `/status` shows the three reasons separately (`orphaned`, `degraded`, `last_error`) |
 
-### A slot that listens on a socket instead of a port
+### Tenants from a file
 
-Set the slot's URL to `unix:/abs/path.sock` and the engine to bind the same path — llama.cpp
+By default the five built-in tenants are what runs. `DEMESNE_TENANTS=/home/user/etc/tenants.ini`
+(or `-tenants`) replaces that with a file, one section per tenant; a section named after a built-in
+replaces it, and a new name adds a tenant. The built-ins stay as the defaults, so an estate that
+configures nothing behaves as it did.
+
+```ini
+[spark]
+url         = unix:/home/user/run/models/spark.sock
+bin         = /usr/bin/llama-server
+args        = -m /home/user/var/model/llm/Spark-X2.5-4B-Q4_K_M.gguf --alias spark --host /home/user/run/models/spark.sock -c 32768 -ngl 99
+models      = Spark-X2.5-4B-Q4_K_M
+aliases     = spark, spark-4b
+kind        = model
+group       = gpu
+policy      = on-demand
+vram_mb     = 3200
+idle        = 5m
+memory_high = 2G
+memory_max  = 3G
+```
+
+`kind` is `model` (chosen by model name), `media` (`/sdapi/*`) or `audio` (`/v1/audio/*`). `policy`
+is `on-demand` or `external`; **`warm` and `resident` are refused** — nothing in this estate is warm,
+and the idle timer is the knob instead. `vram_mb` is the declared peak card footprint, `read_mb_s`
+overrides the direct-read rate a reload is priced at, and `idle` falls back to `DEMESNE_IDLE`.
+A tenant's cgroup leaf is `estate/<name>`; the five built-ins keep `estate/llama/{llm,aux}` and the
+others exactly as they are, because moving a live cgroup moves its accounting history.
+
+Check a file before restarting into it:
+
+```
+demesne check -tenants /home/user/etc/tenants.ini
+```
+
+It prints one line per tenant in name order — `kind`, `policy`, `group`, `url`, models, then the
+three eviction inputs `vram_mb`, `reload_s` and `idle` — and refuses what would lie: an unknown key,
+`kind=model` with nothing to address it, a relative or non-`.sock` unix path, a duplicate section, a
+key outside a section. It notes every tenant that replaces a built-in. A malformed file is fatal at
+startup; `reload` deliberately does not re-read it, because a tenant's identity, kind and cgroup
+cannot change under a running child — restart to apply it.
+
+The word **slot** is reserved for llama-server's own parallel lanes (`n_parallel`, `GET /slots`):
+that path is proxied to the engine untouched. demesne's operator interface is `/tenants/<name>`.
+
+### A tenant that listens on a socket instead of a port
+
+Set the tenant's URL to `unix:/abs/path.sock` and the engine to bind the same path — llama.cpp
 treats a `--host` ending in `.sock` as AF_UNIX and ignores the port:
 
 ```sh
@@ -657,7 +703,7 @@ path that exists as anything but a directory it owns and that no group or other 
 A socket directory anything else can write to is a squatting race, the same class as a squatted port.
 
 **The fence must exceed the model, not the VRAM figure.** A CPU-only load (`-ngl 0`) holds the whole
-file in host RAM, so an on-demand slot carrying a 1.7 GiB model needs a cgroup limit above ~1.7 GiB;
+file in host RAM, so an on-demand tenant carrying a 1.7 GiB model needs a cgroup limit above ~1.7 GiB;
 the VRAM number that matters for a GPU load says nothing here. A 2 GiB `memory.max` silently
 OOM-kills such a load and the failure reads exactly like a broken unix path.
 
@@ -676,7 +722,7 @@ Routing learns a model name from the engine that advertises it on `/v1/models`. 
 through to the router — and on 2026-11-09 that meant llama tried to load a model absent from its own
 `models.ini`, failed, and restored its previous model, putting an unrelated `d1` back on the 7900 XT.
 
-So a slot may declare its set:
+So a tenant may declare its set:
 
 ```sh
 export DEMESNE_STRATA_MODELS="qwen3.8-flash-next-coder-iq1_m"     # inline
@@ -730,16 +776,16 @@ which is exactly why a future reader staring at a 0644 node would not connect th
   2026-11-02 17:34 until the next afternoon and nothing said so, because liveness was only ever
   asked at request time. `/estate/card` reports it, but the operator's `/status` still reports
   the *watch's* opinion of the router rather than the router's existence. A ticker with
-  `up/down/booting` per slot is the fix, and it is the difference between `/status` being a
+  `up/down/booting` per tenant is the fix, and it is the difference between `/status` being a
   fact and being a memory.
 - **the control vocabulary is the operator's, and one typed answer exists.** `/estate/card` is
-  the document a client reacts to; `/status`, `/release` and `/slots/<name>/load|stop` remain
+  the document a client reacts to; `/status`, `/release` and `/tenants/<name>/load|stop` remain
   shaped for a human. Anything further should be asked for by a client that needs it.
-- **no `restart` verb, only a restart by consequence.** `POST /slots/<name>/stop` on a resident
+- **no `restart` verb, only a restart by consequence.** `POST /tenants/<name>/stop` on a resident
   engine restarts it after `restartDelay`, which is right for an operator and wrong for a
   caller that wants it *now* (after dropping a new GGUF in the scan dir, say). The shape it
-  would take: `POST /slots/<name>/restart`, on-demand = stop then start, resident = stop and
-  nudge the supervisor past its delay. The nudge is a buffered channel per slot that
+  would take: `POST /tenants/<name>/restart`, on-demand = stop then start, resident = stop and
+  nudge the supervisor past its delay. The nudge is a buffered channel per tenant that
   `supervise()` selects on beside its pause — without it the caller and the supervisor race,
   and two engines fight for one port. Not built because it needs a demesne restart to exist,
   and nobody has needed "now" yet.
@@ -792,11 +838,11 @@ Bugs found while building this, kept because the next reader will otherwise find
    afternoon.
 5. **An env key built from a name must uppercase it.** The fence asked for
    `DEMESNE_sd_MEMORY_HIGH`, which nobody sets, so every limit in the estate was silently
-   unlimited for as long as the slot model existed. `/status` now publishes the fence it
+   unlimited for as long as the tenant model existed. `/status` now publishes the fence it
    actually applied, which is the only reason this class of bug stays fixed.
 6. **A helper looked up on `PATH` is a fence that may not exist.** A `supervise-daemon` service
    has a `PATH` without `~/bin`; the first real start ran the whole estate unlimited, with one
-   log line per slot that nobody reads.
+   log line per tenant that nobody reads.
 7. **"Up" is not "holding the card".** A router with nothing loaded holds a port and about
    28 MiB. The first card document said `holders:["llama"]` for exactly that, and a client
    trusting it would refuse to render on a free card.

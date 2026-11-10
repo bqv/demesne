@@ -1,10 +1,10 @@
-// slot.go -- the estate: one entry per engine, and the rules about who may hold
+// tenant.go -- the estate: one entry per engine, and the rules about who may hold
 // what.
 //
-// A slot is one struct with one lifecycle, because the four engines differ only in
+// A tenant is one struct with one lifecycle, because the four engines differ only in
 // data:
 //
-//	slot     port   group  policy     routed  router  why
+//	tenant     port   group  policy     routed  router  why
 //	llama    55556  gpu    resident   yes     yes     the router; keeps a resident rung
 //	sd       55558  gpu    on demand  yes     no      cannot unload, so it must be evicted
 //	whisper  55559  --     on demand  yes     no      CPU-only: never contends for the card
@@ -20,11 +20,11 @@
 //	the card   one holder per exclusivity GROUP. A resident holder (the router) is
 //	           displaced by asking it to unload its models; an on-demand holder (sd)
 //	           is displaced by stopping it, because that is its only way to give the
-//	           weights back. A slot that holds neither (whisper) has no group and is
-//	           never evicted by another slot's request. The rule is applied to the group
-//	           of the slot the request actually goes to, so a model served by the small
+//	           weights back. A tenant that holds neither (whisper) has no group and is
+//	           never evicted by another tenant's request. The rule is applied to the group
+//	           of the tenant the request actually goes to, so a model served by the small
 //	           card does not evict a render from the big one.
-//	a port     a slot may only spawn when its own port is free, and a port already
+//	a port     a tenant may only spawn when its own port is free, and a port already
 //	           answered by a process demesne does not own is a REFUSAL, not a race.
 //	           That is the durable half of the old 55557 collision: sd and whisper both
 //	           claimed it, and nothing enforced exclusivity.
@@ -75,14 +75,14 @@ func (p policy) String() string {
 	}
 }
 
-// memLimit is one slot's memory fence. A cgroup v2 leaf under a delegated subtree;
+// memLimit is one tenant's memory fence. A cgroup v2 leaf under a delegated subtree;
 // empty fields are left alone. The zero value means "no fence".
 //
-// These live in the slot spec rather than in an init script because the engines are
+// These live in the tenant spec rather than in an init script because the engines are
 // demesne's children now: `rc_cgroup_settings` never worked for a --user service
 // anyway (openrc-run.sh:60 does not source rc-cgroup.sh under RC_USER_SERVICES), which
 // is why every init script carried forty lines of start_post() to do it by hand.
-// stopReason is why a slot's child is not running. A closed vocabulary because a client
+// stopReason is why a tenant's child is not running. A closed vocabulary because a client
 // renders it: "idle" and "operator" are ordinary, "chat-claims-card" is the one a reader wants
 // explained, and "failed" is the only one that is a fault. Empty means "running", or "never
 // stopped since it last became ready" -- the field is cleared on readiness for the same reason
@@ -96,21 +96,21 @@ const (
 	stopFailed   stopReason = "failed"
 )
 
-// cgroupLeaf is where a slot's fence sits under the estate's cgroup root. The two routers
+// cgroupLeaf is where a tenant's fence sits under the estate's cgroup root. The two routers
 // share a parent -- they are the two halves of one job -- and a parent that holds no
 // processes is also the obvious place for a limit that would cover both. Everything else
 // is flat.
-func cgroupLeaf(slot string) string {
-	switch slot {
+func cgroupLeaf(tenant string) string {
+	switch tenant {
 	case "llama":
 		return "llama/llm"
 	case "llamb":
 		return "llama/aux"
 	}
-	return slot
+	return tenant
 }
 
-// makeLeaf builds one slot's leaf inside the estate's subtree, without privilege.
+// makeLeaf builds one tenant's leaf inside the estate's subtree, without privilege.
 //
 // This works because the subtree is delegated to this user: cgroup-prepare chowns the
 // directories it makes, and files cgroupfs creates for a cgroup we make are owned by us, so
@@ -146,7 +146,7 @@ type cgroupStatus struct {
 }
 
 type memLimit struct {
-	leaf     string // /sys/fs/cgroup/demesne/<slot>
+	leaf     string // /sys/fs/cgroup/demesne/<tenant>
 	high     string
 	max      string
 	swapHigh string
@@ -156,16 +156,16 @@ func (m memLimit) set() bool {
 	return m.leaf != "" && (m.high != "" || m.max != "" || m.swapHigh != "")
 }
 
-// slotSpec is the whole of a slot's configuration. Deliberately plain data: the
-// lifecycle below is generic, and a new engine is a new literal in buildSlots.
-type slotSpec struct {
+// tenantSpec is the whole of a tenant's configuration. Deliberately plain data: the
+// lifecycle below is generic, and a new engine is a new literal in buildTenants.
+type tenantSpec struct {
 	name string
 	url  string // base URL; also the port the child must bind
 
-	bin  string   // empty: the slot owns no child (policyExternal)
+	bin  string   // empty: the tenant owns no child (policyExternal)
 	args []string // the child's whole command line
 	env  []string // extra KEY=VALUE for the child, appended to demesne's own
-	// models seeds the routing index for a slot that cannot answer yet: an on-demand or
+	// models seeds the routing index for a tenant that cannot answer yet: an on-demand or
 	// external engine that is down has no /v1/models to read, so without a seed its names are
 	// unknown after every demesne restart and a request for them falls through to the router.
 	// It is a seed, not a source of truth: the first answer from the engine replaces it.
@@ -174,20 +174,20 @@ type slotSpec struct {
 	// relative to it, so this is load-bearing, not tidiness.
 	dir string
 
-	kind         slotKind
+	kind         tenantKind
 	aliases      []string
 	vramMB       int
 	readMBs      float64
 	weightsBytes int64
 
 	group  string // exclusivity group ("" = contends for nothing)
-	vram   bool   // the slot's processes hold part of the card
+	vram   bool   // the tenant's processes hold part of the card
 	policy policy
 	idle   time.Duration // evict an on-demand child after this long with no request
 
 	routed bool // demesne may route a request to it
 	// router: an engine that advertises models on /v1/models, and whose answer decides
-	// which slot serves a request that names a model. sd and whisper are routed but are
+	// which tenant serves a request that names a model. sd and whisper are routed but are
 	// not routers: what they serve is chosen by the path, not by a model name.
 	router bool
 	// fallback: proxy to it even when demesne does not own it. True for an engine
@@ -199,15 +199,15 @@ type slotSpec struct {
 	cgroup memLimit
 }
 
-// slot is the spec plus the live state. mu guards the state and is held only for
+// tenant is the spec plus the live state. mu guards the state and is held only for
 // short reads and writes; a transition (which may take minutes: a cold sd load is
 // ~8 min) holds demesne.transition instead, so /status is never blocked by a load.
-type slot struct {
+type tenant struct {
 	// spec is written once at construction and by a reload, and read through specOf().
 	// The lock is separate from mu on purpose: specOf() is called from inside mu-held
 	// regions, and one lock for both would either deadlock or force every reader to
 	// know which region it is in.
-	spec   slotSpec
+	spec   tenantSpec
 	specMu sync.RWMutex
 
 	mu       sync.Mutex
@@ -216,7 +216,7 @@ type slot struct {
 	pid      int
 	started  time.Time
 	readyAt  time.Time
-	used     time.Time // last request routed to this slot; drives LRU eviction
+	used     time.Time // last request routed to this tenant; drives LRU eviction
 	stopping bool      // the exit was ordered, so do not count it as a crash
 	foreign  bool      // the port answers but the process is not ours
 	lastErr  string
@@ -234,13 +234,13 @@ type slot struct {
 	active      atomic.Int64
 	lastLatency atomic.Int64
 
-	supervised bool      // a supervisor goroutine is responsible for this slot
+	supervised bool      // a supervisor goroutine is responsible for this tenant
 	cgJoined   bool      // the current child was moved into its leaf
 	cgAt       time.Time // when the fence (or the join) last succeeded
 	cgErr      string
 
-	// gone is closed when the child this slot last started has exited. One channel per
-	// child, not one per slot: with a single slot-wide channel a token left behind by a
+	// gone is closed when the child this tenant last started has exited. One channel per
+	// child, not one per tenant: with a single tenant-wide channel a token left behind by a
 	// failed spawn would make the supervisor believe the NEXT child had died, and it
 	// would start a duplicate beside a live engine.
 	gone chan struct{}
@@ -248,12 +248,12 @@ type slot struct {
 
 // ----------------------------------------------------------------- lifecycle
 
-func (s *slot) hostPort() string { return uriHostPort(s.specOf().url) }
+func (s *tenant) hostPort() string { return uriHostPort(s.specOf().url) }
 
 // port is the numeric port, for messages and duplicate-port checks.
-func (s *slot) port() int { return uriPort(s.specOf().url) }
+func (s *tenant) port() int { return uriPort(s.specOf().url) }
 
-func (s *slot) isUp() (bool, int) {
+func (s *tenant) isUp() (bool, int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.up, s.pid
@@ -262,42 +262,42 @@ func (s *slot) isUp() (bool, int) {
 // booting is "started, not yet answering". A resident router spends a cold load in
 // this state, and a chat request that arrives then should wait rather than take a
 // 502 from the proxy.
-func (s *slot) booting() bool {
+func (s *tenant) booting() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.up && s.readyAt.IsZero()
 }
 
-func (s *slot) isSupervised() bool {
+func (s *tenant) isSupervised() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.supervised
 }
 
-func (s *slot) setSupervised(v bool) {
+func (s *tenant) setSupervised(v bool) {
 	s.mu.Lock()
 	s.supervised = v
 	s.mu.Unlock()
 }
 
-// specOf is the slot's configuration as one consistent value. A reload replaces the whole
+// specOf is the tenant's configuration as one consistent value. A reload replaces the whole
 // struct, so a copy is a snapshot and a reader never sees half an apply.
-func (s *slot) specOf() slotSpec {
+func (s *tenant) specOf() tenantSpec {
 	s.specMu.RLock()
 	defer s.specMu.RUnlock()
 	return s.spec
 }
 
-func (s *slot) setSpec(spec slotSpec) {
+func (s *tenant) setSpec(spec tenantSpec) {
 	s.specMu.Lock()
 	s.spec = spec
 	s.specMu.Unlock()
 }
 
-// readySince is when this slot last became ready, or the zero time for an engine we
+// readySince is when this tenant last became ready, or the zero time for an engine we
 // never started: an external engine's readiness is someone else's event, and the only
 // thing we can honestly report about it is that its port answers now.
-func (s *slot) readySince() time.Time {
+func (s *tenant) readySince() time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.readyAt
@@ -305,9 +305,9 @@ func (s *slot) readySince() time.Time {
 
 // backoffLeft implements the crash backoff, which the old sd lifecycle did not have:
 // a crash was logged, marked down, and the very next request retried immediately --
-// each attempt able to pay a 15-minute cold load. Now a slot that keeps dying is
+// each attempt able to pay a 15-minute cold load. Now a tenant that keeps dying is
 // spaced out, and the message says so instead of hanging.
-func (s *slot) backoffLeft() (time.Duration, int) {
+func (s *tenant) backoffLeft() (time.Duration, int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.crash == 0 || s.diedAt.IsZero() {
@@ -320,7 +320,7 @@ func (s *slot) backoffLeft() (time.Duration, int) {
 	return 0, 0
 }
 
-func (s *slot) noteFailure(err error) {
+func (s *tenant) noteFailure(err error) {
 	s.mu.Lock()
 	s.crash++
 	s.diedAt = time.Now()
@@ -328,7 +328,7 @@ func (s *slot) noteFailure(err error) {
 	s.mu.Unlock()
 }
 
-func (s *slot) noteReady() {
+func (s *tenant) noteReady() {
 	d := s.owner
 	if d != nil {
 		d.recordTransition(s.specOf().name, "start", "ready", "")
@@ -342,25 +342,25 @@ func (s *slot) noteReady() {
 // start: a cold render takes ~8-10 minutes, so a five-minute timer armed before it
 // would kill the child mid-load. The in-flight count is what tells the timer a
 // request is still running.
-func (s *slot) lastUsed() time.Time {
+func (s *tenant) lastUsed() time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.used
 }
 
-func (s *slot) noteUse() {
+func (s *tenant) noteUse() {
 	s.mu.Lock()
 	s.used = time.Now()
 	s.mu.Unlock()
 }
 
-func (s *slot) armIdle(d *demesne) {
+func (s *tenant) armIdle(d *demesne) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.armIdleLocked(d)
 }
 
-func (s *slot) armIdleLocked(d *demesne) {
+func (s *tenant) armIdleLocked(d *demesne) {
 	if s.timer != nil {
 		s.timer.Stop()
 		s.timer = nil
@@ -380,30 +380,30 @@ func (s *slot) armIdleLocked(d *demesne) {
 
 // -------------------------------------------------------------- transitions
 //
-// demesne.transition serialises every state change on the estate: only one slot may
+// demesne.transition serialises every state change on the estate: only one tenant may
 // cross the card at a time. It is never held across a proxy, and /status never takes
-// it (it reads each slot's mu), so an eight-minute cold load cannot wedge the status
+// it (it reads each tenant's mu), so an eight-minute cold load cannot wedge the status
 // surface that exists to explain the eight-minute cold load.
 
-func (d *demesne) ensure(s *slot) error {
+func (d *demesne) ensure(s *tenant) error {
 	// Before taking the transition lock, give a held port one chance to be taken back -- see
 	// reclaim.go. It can wait for a process to die, and no other transition should queue
 	// behind that.
 	if up, _ := s.isUp(); !up && portAlive(s.specOf().url) {
-		_, _ = d.reclaimSlot(s)
+		_, _ = d.reclaimTenant(s)
 	}
 	d.transition.Lock()
 	defer d.transition.Unlock()
 	return d.ensureLocked(s)
 }
 
-func (d *demesne) evict(s *slot, reason stopReason, detail string) {
+func (d *demesne) evict(s *tenant, reason stopReason, detail string) {
 	d.transition.Lock()
 	defer d.transition.Unlock()
 	d.evictLocked(s, reason, detail)
 }
 
-func (d *demesne) ensureLocked(s *slot) error {
+func (d *demesne) ensureLocked(s *tenant) error {
 	if up, _ := s.isUp(); up && portAlive(s.specOf().url) {
 		s.armIdle(d)
 		return nil
@@ -429,18 +429,18 @@ func (d *demesne) ensureLocked(s *slot) error {
 	return d.spawnLocked(s)
 }
 
-func (s slotSpec) own() bool { return s.bin != "" && s.policy != policyExternal }
+func (s tenantSpec) own() bool { return s.bin != "" && s.policy != policyExternal }
 
 // clearGroupLocked makes room for s: every on-demand peer in the same group is
 // stopped, and if s wants the card the router is asked to unload. The order matters --
 // stop the peer, wait for the VRAM to actually return, and only then start loading --
 // because "the process exited" and "the driver freed the memory" are different
 // moments and only the second one makes a load succeed.
-func (d *demesne) clearGroupLocked(s *slot) error {
+func (d *demesne) clearGroupLocked(s *tenant) error {
 	if s.specOf().group == "" {
 		return nil
 	}
-	for _, other := range d.slots {
+	for _, other := range d.tenants {
 		if other == s || other.specOf().group != s.specOf().group {
 			continue
 		}
@@ -462,7 +462,7 @@ func (d *demesne) clearGroupLocked(s *slot) error {
 	return nil
 }
 
-func (d *demesne) spawnLocked(s *slot) error {
+func (d *demesne) spawnLocked(s *tenant) error {
 	if d.closing.Load() {
 		return errors.New("demesne is shutting down")
 	}
@@ -473,7 +473,7 @@ func (d *demesne) spawnLocked(s *slot) error {
 	if up, _ := s.isUp(); !up && portAliveWithin(s.specOf().url, 250*time.Millisecond) {
 		// One chance to take it back, and only on evidence: see reclaim.go. A holder that
 		// cannot be proven ours is left alone, loudly.
-		killed, rerr := d.reclaimSlot(s)
+		killed, rerr := d.reclaimTenant(s)
 		if !killed {
 			reason := "its port is held by a process demesne cannot prove it owns"
 			if rerr != nil {
@@ -562,7 +562,8 @@ func (d *demesne) spawnLocked(s *slot) error {
 	s.readyAt = time.Now()
 	s.mu.Unlock()
 	s.noteReady()
-	log.Printf("%s ready on %s (pid %d), vram %s", s.specOf().name, s.specOf().url, cmd.Process.Pid, vramString())
+	log.Printf("tenant %s ready on %s (pid %d), vram %s, reload %s, idle %s",
+		s.specOf().name, s.specOf().url, cmd.Process.Pid, vramString(), reloadSeconds(s.specOf()), idleString(s.specOf()))
 	s.armIdle(d)
 	return nil
 }
@@ -572,7 +573,7 @@ func (d *demesne) spawnLocked(s *slot) error {
 // the way", so a startup crash would block for the whole load bound (15 minutes for sd)
 // before anyone heard about it, and it cannot be interrupted, so a SIGTERM during a cold
 // load would leave demesne hanging. Both are checked here.
-func (d *demesne) waitReady(s *slot, limit time.Duration) error {
+func (d *demesne) waitReady(s *tenant, limit time.Duration) error {
 	deadline := time.Now().Add(limit)
 	for time.Now().Before(deadline) {
 		// Our child first: a port that answers while the child is already dead is somebody
@@ -594,7 +595,7 @@ func (d *demesne) waitReady(s *slot, limit time.Duration) error {
 }
 
 // reap notices an exit without waiting for a request to fail.
-func (d *demesne) reap(s *slot, cmd *exec.Cmd, out, errf io.Closer, gone chan struct{}) {
+func (d *demesne) reap(s *tenant, cmd *exec.Cmd, out, errf io.Closer, gone chan struct{}) {
 	err := cmd.Wait()
 	out.Close()
 	errf.Close()
@@ -606,7 +607,7 @@ func (d *demesne) reap(s *slot, cmd *exec.Cmd, out, errf io.Closer, gone chan st
 		s.child, s.pid, s.up = nil, 0, false
 		s.readyAt = time.Time{}
 		// The fence described a child that no longer exists. /status said "joined" for a
-		// slot with nothing running, which is the same class of lie as a fence that was
+		// tenant with nothing running, which is the same class of lie as a fence that was
 		// never applied.
 		s.cgJoined = false
 		if !ordered {
@@ -618,7 +619,7 @@ func (d *demesne) reap(s *slot, cmd *exec.Cmd, out, errf io.Closer, gone chan st
 		s.stopping = false
 	}
 	s.mu.Unlock()
-	// Always this child's own channel, whether or not the slot has moved on: the
+	// Always this child's own channel, whether or not the tenant has moved on: the
 	// waiter for this process is the only thing on the other end.
 	close(gone)
 	log.Printf("%s (pid %d) exited: %v", s.specOf().name, cmd.Process.Pid, err)
@@ -627,7 +628,7 @@ func (d *demesne) reap(s *slot, cmd *exec.Cmd, out, errf io.Closer, gone chan st
 // evictLocked stops the child and waits for the card to come back. SIGTERM the whole
 // group, then SIGKILL if it will not go: sd-server frees its weights on exit
 // (measured 12.5 GiB -> 0.03 GiB), which is the entire point of stopping it.
-func (d *demesne) evictLocked(s *slot, reason stopReason, why string) {
+func (d *demesne) evictLocked(s *tenant, reason stopReason, why string) {
 	s.mu.Lock()
 	if s.timer != nil {
 		s.timer.Stop()
@@ -639,7 +640,7 @@ func (d *demesne) evictLocked(s *slot, reason stopReason, why string) {
 		s.mu.Unlock()
 		return
 	}
-	// Recorded only when there was something to stop: an operator calling stop on a slot
+	// Recorded only when there was something to stop: an operator calling stop on a tenant
 	// that is already down must not erase the failure that put it down.
 	s.stopped = reason
 	if s.owner != nil {
@@ -684,7 +685,7 @@ func (d *demesne) evictLocked(s *slot, reason stopReason, why string) {
 // delay between attempts. There is exactly ONE actor per restart now, which is the
 // fix for the double restart: supervise-daemon used to respawn llama every 5 s while
 // recoverLLM() asked rc-service for the same restart after two proxy failures.
-func (d *demesne) supervise(s *slot) {
+func (d *demesne) supervise(s *tenant) {
 	delay := d.cfg.restartDelay
 	attempt := 0
 	for {
@@ -745,7 +746,7 @@ func (d *demesne) supervise(s *slot) {
 }
 
 // pause sleeps unless demesne is shutting down, in which case it reports false.
-func (d *demesne) pause(s *slot, howLong time.Duration) bool {
+func (d *demesne) pause(s *tenant, howLong time.Duration) bool {
 	t := time.NewTimer(howLong)
 	defer t.Stop()
 	select {
@@ -784,7 +785,7 @@ func backoff(crashes int) time.Duration {
 func (d *demesne) stopAll(why string) {
 	d.transition.Lock()
 	defer d.transition.Unlock()
-	for _, s := range d.slots {
+	for _, s := range d.tenants {
 		if up, _ := s.isUp(); up {
 			d.evictLocked(s, stopOperator, why)
 		}
@@ -796,7 +797,7 @@ func (d *demesne) stopAll(why string) {
 // prepareCgroup delegates a leaf and writes the limits. Through `sudo -n`, and a
 // failure must never abort: warn and carry on unlimited, exactly as the init scripts
 // did.
-func (d *demesne) prepareCgroup(s *slot) {
+func (d *demesne) prepareCgroup(s *tenant) {
 	m := s.specOf().cgroup
 	if !m.set() {
 		return
@@ -845,7 +846,7 @@ func (d *demesne) prepareCgroup(s *slot) {
 // joinCgroup moves a freshly forked child into its leaf. Root is needed because a
 // process cannot move itself without write access to the common ancestor's
 // cgroup.procs. Called per child now (there is no supervisor daemon to inherit from).
-func (d *demesne) joinCgroup(s *slot, pid int) {
+func (d *demesne) joinCgroup(s *tenant, pid int) {
 	m := s.specOf().cgroup
 	if !m.set() || d.cfg.cgroupJoin == "" {
 		return
@@ -878,13 +879,13 @@ func (d *demesne) joinCgroup(s *slot, pid int) {
 // Why it exists at all: a fence that is applied once at startup and never checked is a
 // fence you believe in for exactly one boot. The estate's whole point is that the card and
 // the host RAM are bounded, so "bounded" has to be a running claim.
-func (d *demesne) maintainCgroup(s *slot) {
+func (d *demesne) maintainCgroup(s *tenant) {
 	m := s.specOf().cgroup
 	if !m.set() {
 		return
 	}
 	if d.cfg.cgroupPrepare == "" || d.cfg.cgroupJoin == "" {
-		// Nothing can be done about it. prepareCgroup has already said so once, per slot.
+		// Nothing can be done about it. prepareCgroup has already said so once, per tenant.
 		return
 	}
 	if _, err := os.Stat(m.leaf); err != nil {
@@ -927,7 +928,7 @@ func (d *demesne) maintainCgroups() {
 		case <-d.done:
 			return
 		case <-t.C:
-			for _, s := range d.slots {
+			for _, s := range d.tenants {
 				d.maintainCgroup(s)
 			}
 		}
@@ -1007,7 +1008,7 @@ func portAliveWithin(base string, timeout time.Duration) bool {
 	return true
 }
 
-// unixDialer is the transport a unix slot's proxy needs: the request URL is a placeholder,
+// unixDialer is the transport a unix tenant's proxy needs: the request URL is a placeholder,
 // and every connection goes to the socket path.
 func unixDialer(path string) *http.Transport {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
@@ -1035,11 +1036,11 @@ func waitPort(base string, limit time.Duration, done <-chan struct{}) error {
 	return fmt.Errorf("timed out after %s", limit)
 }
 
-// unixPath is a slot's AF_UNIX endpoint, or "" for a TCP one. The scheme is the only marker:
+// unixPath is a tenant's AF_UNIX endpoint, or "" for a TCP one. The scheme is the only marker:
 // an http URL with no port would otherwise look like a path.
-// endpointName is how a slot's address is described to an operator: a port for TCP, a socket
+// endpointName is how a tenant's address is described to an operator: a port for TCP, a socket
 // path for AF_UNIX. Messages that say "port" about a socket send people to the wrong tool.
-// ensureSocketDir makes the directory a unix slot's socket lives in, and refuses one it does not
+// ensureSocketDir makes the directory a unix tenant's socket lives in, and refuses one it does not
 // own: /run/user/<uid> is created by pam and its children are not, so something has to own the
 // directory -- and a socket directory anything else can write to is a squatting race.
 func ensureSocketDir(path string) error {
@@ -1063,7 +1064,7 @@ func ensureSocketDir(path string) error {
 	return os.MkdirAll(dir, 0o700)
 }
 
-func (s *slot) endpointHint() string {
+func (s *tenant) endpointHint() string {
 	if path := unixPath(s.specOf().url); path != "" {
 		return "ss -xlp | grep " + path
 	}
