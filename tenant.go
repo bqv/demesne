@@ -431,6 +431,13 @@ func (d *demesne) ensureLocked(s *tenant) error {
 		d.loads.noteLoading(s.specOf().name, model)
 	}
 	err := d.spawnLocked(s)
+	if err != nil {
+		if used, uerr := vramUsed(); uerr == nil {
+			log.Printf("%s: spawn failed (%v); vram used %.2f GiB at the failure "+
+				"(the child's own error is in its .err log)", s.specOf().name, err,
+				float64(used)/(1<<30))
+		}
+	}
 	if model != "" {
 		if err != nil {
 			d.loads.notePhase(s.specOf().name, model, loadFailed, err)
