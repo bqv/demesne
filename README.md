@@ -638,6 +638,24 @@ the right program.
 | 5 | no syslog; unrotated logs | not solved, only narrowed: one `<slot>.{log,err}` pair per engine, still unrotated |
 | 6 | orphaned VRAM freezes the LLM side for 24 h | unchanged on purpose: a restart cannot free an orphaned context, and a loop would only hide the fault. `/status` shows the three reasons separately (`orphaned`, `degraded`, `last_error`) |
 
+### A slot that listens on a socket instead of a port
+
+Set the slot's URL to `unix:/abs/path.sock` and the engine to bind the same path — llama.cpp
+treats a `--host` ending in `.sock` as AF_UNIX and ignores the port:
+
+```sh
+export DEMESNE_STRATA="unix:/run/user/1000/models/strata.sock"
+export DEMESNE_STRATA_ARGS="--host /run/user/1000/models/strata.sock ..."
+```
+
+Liveness is a **dial**, never a `stat`: `ENOENT` and `ECONNREFUSED` both mean dead, and a socket
+file left behind by a `SIGKILL` is not an engine. Because the installed engine does not unlink on
+bind or on exit, **demesne's launcher owns the file**: before spawning it removes a file that
+nothing answers on (and only if it is a socket — a regular file is refused, not clobbered), and
+`ENOENT` during that removal is success so a concurrent cleanup cannot fail a spawn. Reclaim finds
+the holder in `/proc/net/unix` by path, readiness and the "is anything there" checks dial, and the
+operator-facing messages say *socket path*, not port.
+
 ### Models an engine serves but cannot advertise
 
 Routing learns a model name from the engine that advertises it on `/v1/models`. An engine that is

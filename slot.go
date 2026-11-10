@@ -407,8 +407,8 @@ func (d *demesne) ensureLocked(s *slot) error {
 		s.foreign = true
 		s.mu.Unlock()
 		return fmt.Errorf("%s is already served by a process demesne does not own "+
-			"(find it with: fuser -n tcp %d; stop it, then retry; see /status: port_held_elsewhere)",
-			s.specOf().url, s.port())
+			"(find it with: %s; stop it, then retry; see /status: port_held_elsewhere)",
+			s.specOf().url, s.endpointHint())
 	}
 	if !s.specOf().own() {
 		return fmt.Errorf("%s is not configured: give it a command line", s.specOf().name)
@@ -499,8 +499,9 @@ func (d *demesne) spawnLocked(s *slot) error {
 				return fmt.Errorf("%s exists and is not a socket; refusing to clobber it", path)
 			}
 			if !portAliveWithin(s.specOf().url, 150*time.Millisecond) {
-				// A socket file left by a SIGKILL: nothing answers, and nothing will remove
-				// it for us, so the launcher does.
+				// A file left by a SIGKILL or by a clean stop: the installed llama-server does
+				// not unlink on bind or on exit, so the launcher is the single owner of this
+				// file. ENOENT is success -- a concurrent cleanup must not fail a spawn.
 				_ = os.Remove(path)
 			} else {
 				return fmt.Errorf("%s is already served by another process", path)
@@ -1027,6 +1028,22 @@ func waitPort(base string, limit time.Duration, done <-chan struct{}) error {
 
 // unixPath is a slot's AF_UNIX endpoint, or "" for a TCP one. The scheme is the only marker:
 // an http URL with no port would otherwise look like a path.
+// endpointName is how a slot's address is described to an operator: a port for TCP, a socket
+// path for AF_UNIX. Messages that say "port" about a socket send people to the wrong tool.
+func (s *slot) endpointHint() string {
+	if path := unixPath(s.specOf().url); path != "" {
+		return "ss -xlp | grep " + path
+	}
+	return "fuser -n tcp " + strconv.Itoa(s.port())
+}
+
+func endpointName(base string, port int) string {
+	if path := unixPath(base); path != "" {
+		return "socket " + path
+	}
+	return "port " + strconv.Itoa(port)
+}
+
 func unixPath(base string) string {
 	u, err := url.Parse(base)
 	if err != nil || u.Scheme != "unix" {

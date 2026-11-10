@@ -103,25 +103,25 @@ func (d *demesne) reclaimSlot(s *slot) (bool, error) {
 	}
 	m := s.specOf().cgroup
 	if !m.set() {
-		return false, fmt.Errorf("port %d is held by pid %d, and this slot has no cgroup fence "+
-			"to prove the holder is ours; refusing to kill it", s.port(), pid)
+		return false, fmt.Errorf("%s is held by pid %d, and this slot has no cgroup fence "+
+			"to prove the holder is ours; refusing to kill it", endpointName(s.specOf().url, s.port()), pid)
 	}
 	if joined, err := inCgroup(pid, m.leaf); err != nil || !joined {
-		return false, fmt.Errorf("port %d is held by pid %d, which is not in %s; refusing to kill it",
-			s.port(), pid, m.leaf)
+		return false, fmt.Errorf("%s is held by pid %d, which is not in %s; refusing to kill it",
+			endpointName(s.specOf().url, s.port()), pid, m.leaf)
 	}
 	exe, err := os.Readlink("/proc/" + strconv.Itoa(pid) + "/exe")
 	if err != nil {
-		return false, fmt.Errorf("port %d is held by pid %d, whose executable cannot be read: %v",
-			s.port(), pid, err)
+		return false, fmt.Errorf("%s is held by pid %d, whose executable cannot be read: %v",
+			endpointName(s.specOf().url, s.port()), pid, err)
 	}
 	if filepath.Base(exe) != filepath.Base(s.specOf().bin) {
-		return false, fmt.Errorf("port %d is held by pid %d, which is running %s, not %s; refusing to kill it",
-			s.port(), pid, filepath.Base(exe), filepath.Base(s.specOf().bin))
+		return false, fmt.Errorf("%s is held by pid %d, which is running %s, not %s; refusing to kill it",
+			endpointName(s.specOf().url, s.port()), pid, filepath.Base(exe), filepath.Base(s.specOf().bin))
 	}
 
-	log.Printf("%s: pid %d is holding port %d and is provably ours (in %s, running %s); reclaiming it",
-		s.specOf().name, pid, s.port(), m.leaf, filepath.Base(exe))
+	log.Printf("%s: pid %d is holding %s and is provably ours (in %s, running %s); reclaiming it",
+		s.specOf().name, pid, endpointName(s.specOf().url, s.port()), m.leaf, filepath.Base(exe))
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
 	_ = syscall.Kill(pid, syscall.SIGTERM)
 	if waitEndpointFree(s.specOf().url, 5*time.Second) {
@@ -132,7 +132,7 @@ func (d *demesne) reclaimSlot(s *slot) (bool, error) {
 	if waitEndpointFree(s.specOf().url, 5*time.Second) {
 		return true, nil
 	}
-	return false, errors.New("port " + strconv.Itoa(s.port()) + " is still held after SIGKILL")
+	return false, errors.New(endpointName(s.specOf().url, s.port()) + " is still held after SIGKILL")
 }
 
 // procEndpointPID is procPortPID for either kind of endpoint: a unix socket is found in

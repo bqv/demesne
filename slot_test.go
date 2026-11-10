@@ -2468,3 +2468,18 @@ func TestABreakerIsPerSlot(t *testing.T) {
 		t.Fatal("a healthy engine inherited its neighbour's breaker")
 	}
 }
+
+// An operator told "port" about a socket looks in the wrong place: the words have to match the
+// address, including the command that would find the holder.
+func TestSocketEndpointsAreNamedAsSockets(t *testing.T) {
+	cfg := testConfig(t)
+	d := newTestDemesne(t, cfg)
+	s := d.slotByName("llama")
+	if got := endpointName("unix:/run/user/1000/models/x.sock", 0); got != "socket /run/user/1000/models/x.sock" {
+		t.Fatalf("endpointName = %q", got)
+	}
+	if got := endpointName("http://127.0.0.1:55556", 55556); got != "port 55556" {
+		t.Fatalf("endpointName = %q", got)
+	}
+	_ = s
+}
