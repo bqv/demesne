@@ -1074,6 +1074,7 @@ type tenantStatus struct {
 	Name       string  `json:"name"`
 	Model      string  `json:"model,omitempty"`
 	Kind       string  `json:"kind"`
+	Device     string  `json:"device"`
 	State      string  `json:"state"`
 	Listen     string  `json:"listen"`
 	ListenPort int     `json:"port"`
@@ -1141,7 +1142,7 @@ func tenantStatusOf(s *tenant) tenantStatus {
 	s.mu.Lock()
 	spec := s.specOf()
 	st := tenantStatus{
-		Name: spec.name, Model: firstModel(spec), Kind: spec.kind.String(),
+		Name: spec.name, Model: firstModel(spec), Kind: spec.kind.String(), Device: cardLabel(spec),
 		State: tenantState(spec, s), Listen: spec.url, ListenPort: s.port(),
 		Group: spec.group, Policy: spec.policy.String(), Owned: spec.own(),
 		VRAMMB: spec.vramMB, ReloadS: reloadCostSeconds(spec), Idle: idleString(spec),

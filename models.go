@@ -276,6 +276,43 @@ func (d *demesne) followModels() {
 // modelsHandler answers /v1/models for the whole estate. A client that dials the one port
 // should see every model it can ask for, not only the ones the engine behind that path
 // happens to know about.
+// cardLabel is the name a person uses for the card a tenant runs on, in the order the
+// estate already does: the 7900 XT is "gpu", the GT 1030 is "aux".
+func cardLabel(spec tenantSpec) string {
+	switch spec.group {
+	case "gpu":
+		return "RX7900"
+	case "aux":
+		return "GT1030"
+	}
+	return spec.name
+}
+
+// labelModels rewrites owned_by so a client shows the card rather than the engine family:
+// "llamacpp" says nothing about which of the two cards a model lives on.
+func labelModels(items []json.RawMessage, label string) []json.RawMessage {
+	out := make([]json.RawMessage, 0, len(items))
+	for _, raw := range items {
+		var obj map[string]json.RawMessage
+		if json.Unmarshal(raw, &obj) != nil {
+			out = append(out, raw)
+			continue
+		}
+		if _, ok := obj["owned_by"]; ok {
+			b, err := json.Marshal(label)
+			if err == nil {
+				obj["owned_by"] = b
+			}
+		}
+		if enc, err := json.Marshal(obj); err == nil {
+			out = append(out, enc)
+			continue
+		}
+		out = append(out, raw)
+	}
+	return out
+}
+
 // knownModels is the routing index's names, sorted, for an error message that helps.
 func (d *demesne) knownModels() []string {
 	d.models.mu.Lock()
@@ -317,7 +354,7 @@ func (d *demesne) modelsHandler(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		answered++
-		data = append(data, items...)
+		data = append(data, labelModels(items, cardLabel(s.specOf()))...)
 	}
 	if answered == 0 {
 		// Nobody answered. Let the default engine produce its own error instead of
