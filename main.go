@@ -842,6 +842,8 @@ func (d *demesne) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.handleEvents(w, r)
 	case p == "/release":
 		d.handleRelease(w, r)
+	case p == "/slots", strings.HasPrefix(p, "/slots/"):
+		d.handleSlotsPath(w, r)
 	case strings.HasPrefix(p, "/tenants/"):
 		d.handleTenantControl(w, r)
 	default:
@@ -1056,10 +1058,16 @@ func (d *demesne) cardSiblings(s *tenant) []*tenant {
 
 type tenantStatus struct {
 	Name       string  `json:"name"`
+	Model      string  `json:"model,omitempty"`
+	Kind       string  `json:"kind"`
+	State      string  `json:"state"`
 	Listen     string  `json:"listen"`
 	ListenPort int     `json:"port"`
 	Group      string  `json:"group,omitempty"`
 	Policy     string  `json:"policy"`
+	VRAMMB     int     `json:"vram_mb,omitempty"`
+	ReloadS    float64 `json:"reload_s,omitempty"`
+	Idle       string  `json:"idle,omitempty"`
 	Owned      bool    `json:"owned"`
 	Up         bool    `json:"up"`
 	Booting    bool    `json:"booting"`
@@ -1087,11 +1095,42 @@ func (d *demesne) tenantStatuses() []tenantStatus {
 
 // tenantStatusOf reads one tenant without the transition lock, so a status poll is never
 // stuck behind an eight-minute cold load.
+func firstModel(spec tenantSpec) string {
+	if len(spec.models) > 0 {
+		return spec.models[0]
+	}
+	return ""
+}
+
+func tenantState(spec tenantSpec, t *tenant) string {
+	if t.up {
+		if t.readyAt.IsZero() {
+			return "loading"
+		}
+		return "ready"
+	}
+	if downReason(t.stopped, t.up) == stopFailed {
+		return "failed"
+	}
+	return "idle"
+}
+
+func reloadCostSeconds(spec tenantSpec) float64 {
+	n := weightsBytes(spec)
+	if n == 0 {
+		return 0
+	}
+	return float64(n) / (defaultReadMBs * 1e6)
+}
+
 func tenantStatusOf(s *tenant) tenantStatus {
 	s.mu.Lock()
+	spec := s.specOf()
 	st := tenantStatus{
-		Name: s.specOf().name, Listen: s.specOf().url, ListenPort: s.port(),
-		Group: s.specOf().group, Policy: s.specOf().policy.String(), Owned: s.specOf().own(),
+		Name: spec.name, Model: firstModel(spec), Kind: spec.kind.String(),
+		State: tenantState(spec, s), Listen: spec.url, ListenPort: s.port(),
+		Group: spec.group, Policy: spec.policy.String(), Owned: spec.own(),
+		VRAMMB: spec.vramMB, ReloadS: reloadCostSeconds(spec), Idle: idleString(spec),
 		Up: s.up, Booting: s.up && s.readyAt.IsZero(), PID: s.pid,
 		InFlight: atomic.LoadInt64(&s.inflight), Restarts: s.restarts,
 		LastError: s.lastErr, LastTransition: downReason(s.stopped, s.up),
@@ -1156,6 +1195,7 @@ func (d *demesne) status(w http.ResponseWriter) {
 		"media_in_flight": inflight,
 		"llm_health":      d.llm.snapshot(),
 		"tenants":         statuses,
+		"slots":           statuses,
 		"loads":           d.loads.snapshot(),
 
 		// stadi's field names, kept because DSH and the habit of a year read them.
@@ -1170,6 +1210,19 @@ func (d *demesne) status(w http.ResponseWriter) {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(out)
+}
+
+func (d *demesne) handleSlotsPath(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/slots" {
+		http.Error(w, "demesne: /slots is llama's own, and demesne no longer proxies it: "+
+			"use /tenants/<name>/status (per engine) or /status (the estate)", http.StatusNotFound)
+		return
+	}
+	slotsDeprecation.Do(func() {
+		log.Printf("deprecated: /slots/<name> is demesne's operator path and now answers as /tenants/<name>; " +
+			"/slots alone is llama's and is not proxied")
+	})
+	d.handleTenantControl(w, r)
 }
 
 // tenantName is stadi's one-bit answer to "who holds the card", kept as-is: it is what
@@ -1310,8 +1363,13 @@ func (d *demesne) handleRelease(w http.ResponseWriter, r *http.Request) {
 // handleTenantControl is the per-engine operator interface: /tenants/<name>{,/status,
 // /load,/stop}. It replaces "rc-service --user llama restart" as the way to touch one
 // engine, because rc-service can no longer see a child demesne forked.
+var slotsDeprecation sync.Once
+
 func (d *demesne) handleTenantControl(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/tenants/")
+	if rest == r.URL.Path {
+		rest = strings.TrimPrefix(r.URL.Path, "/slots/")
+	}
 	name, action := rest, ""
 	if i := strings.IndexByte(rest, '/'); i >= 0 {
 		name, action = rest[:i], rest[i+1:]

@@ -638,6 +638,22 @@ the right program.
 | 5 | no syslog; unrotated logs | not solved, only narrowed: one `<tenant>.{log,err}` pair per engine, still unrotated |
 | 6 | orphaned VRAM freezes the LLM side for 24 h | unchanged on purpose: a restart cannot free an orphaned context, and a loop would only hide the fault. `/status` shows the three reasons separately (`orphaned`, `degraded`, `last_error`) |
 
+### The word slot
+
+**Slot means llama-server's parallel lanes** (`--parallel`, `n_parallel`, `GET /slots`), and nothing
+else. demesne's own operator surface is a **tenant**: `/tenants/<name>`, `/tenants/<name>/load|stop`,
+`/status`'s `tenants[]`, and `demesne check -tenants`.
+
+Two concessions while consumers catch up, both to be deleted after one release:
+
+- `GET /slots` is **no longer proxied**. demesne answers it with a 404 that names `/tenants/<name>/status`,
+  because a client could not tell whose `/slots` it was reaching. llama's own `/slots` is still
+  reachable on its own port (55556) for anything that dials it directly.
+- `GET /slots/<name>/status` and `POST /slots/<name>/load|stop` still answer, as deprecated aliases of
+  the `/tenants/` paths, and log `deprecated: use /tenants/<name>` once per process.
+- `/status` publishes `tenants[]` (real) and `slots[]` (the same rows serialised again) for the same
+  window. The mirror is a serialisation, not a second source of truth.
+
 ### Tenants from a file
 
 By default the five built-in tenants are what runs. `DEMESNE_TENANTS=/home/user/etc/tenants.ini`

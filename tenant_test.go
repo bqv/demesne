@@ -19,6 +19,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -2546,5 +2547,64 @@ func TestTheSocketDirectoryIsOursOrRefused(t *testing.T) {
 	}
 	if err := ensureSocketDir(filepath.Join(afile, "x.sock")); err == nil {
 		t.Fatal("a regular file standing in for the directory was accepted")
+	}
+}
+
+// /status carries tenants[] as the estate's own account, and a slots[] mirror of the SAME rows for
+// one release, so hgtop and old cards keep reading while they are updated. The mirror is a
+// serialisation, never a second source: both keys must be the same slice.
+func TestStatusCarriesTenantsAndADeprecatedMirror(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.llama = engineConfig{url: "http://127.0.0.1:1", bin: "/usr/bin/llama-server",
+		models: []string{"m1"}, cgroup: memLimit{leaf: "/sys/fs/cgroup/estate/llama/llm"}}
+	d := newTestDemesne(t, cfg)
+
+	rec := httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	var tenants, slots []tenantStatus
+	if err := json.Unmarshal(body["tenants"], &tenants); err != nil {
+		t.Fatalf("tenants: %v", err)
+	}
+	if err := json.Unmarshal(body["slots"], &slots); err != nil {
+		t.Fatalf("slots mirror: %v", err)
+	}
+	if len(tenants) == 0 || !reflect.DeepEqual(tenants, slots) {
+		t.Fatalf("the mirror is not the same rows: %d tenants, %d slots", len(tenants), len(slots))
+	}
+	row := tenants[0]
+	if row.Name == "" || row.Kind == "" || row.State == "" {
+		t.Fatalf("the row lacks the per-model fields: %+v", row)
+	}
+}
+
+// /slots is llama's own endpoint and demesne must not proxy it: a client could not tell whose it
+// was. The deprecated control alias still answers, and says so once.
+func TestSlotsIsNotProxiedButTheAliasAnswers(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.llama = engineConfig{url: "http://127.0.0.1:1", bin: "/usr/bin/llama-server"}
+	d := newTestDemesne(t, cfg)
+
+	rec := httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/slots", nil))
+	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "/tenants/") {
+		t.Fatalf("bare /slots answered %d: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/slots/llama/status", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("the deprecated alias answered %d: %s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/tenants/llama/status", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("the new path answered %d: %s", rec.Code, rec.Body.String())
 	}
 }
