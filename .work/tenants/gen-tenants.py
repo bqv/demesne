@@ -69,12 +69,12 @@ def vram(path, base, overhead=900):
         return 4000
 
 
-def emit(out, path, base, sockdir, group, fence, resident, overhead=900):
+def emit(out, path, base, sockdir, group, fence, resident, overhead=900, keep_all=False, boot_keep=()):
     rungs, glob = parse(path)
     for name, kv in rungs.items():
         args = args_for(kv, glob, base, name) + [
             "--host", os.path.join(sockdir, name + ".sock"), "--alias", name]
-        policy = resident.get(name, "on-demand")
+        policy = resident.get(name, "keep" if keep_all else "on-demand")
         if policy in ("resident", "keep"):
             idle = "0"
         else:
@@ -86,6 +86,8 @@ def emit(out, path, base, sockdir, group, fence, resident, overhead=900):
         out.write("models = %s\n" % name)
         out.write("group = %s\n" % group)
         out.write("policy = %s\n" % policy)
+        want_boot = policy == "resident" or name in boot_keep
+        out.write("start = %s\n" % ("boot" if want_boot else "demand"))
         out.write("vram_mb = %d\n" % vram(kv.get("model", ""), base, overhead))
         out.write("idle = %s\n" % idle)
         out.write("memory_high = %s\n" % fence[0])
@@ -95,9 +97,10 @@ def emit(out, path, base, sockdir, group, fence, resident, overhead=900):
 
 def main():
     with open(sys.argv[1], "w") as out:
-        emit(out, LLM_INI, LLM_DIR, LLM_SOCK, "gpu", ("6G", "8G"), {})
+        emit(out, LLM_INI, LLM_DIR, LLM_SOCK, "gpu", ("6G", "8G"), {}, 900, keep_all=True)
         emit(out, AUX_INI, AUX_DIR, AUX_SOCK, "aux", ("2G", "3G"),
-             {"Qwen3-Embedding-0.6B-Q8_0": "resident", "Kev-0.8B-Q8_0": "keep"}, 400)
+             {"Qwen3-Embedding-0.6B-Q8_0": "resident", "Kev-0.8B-Q8_0": "keep"}, 400,
+             boot_keep={"Kev-0.8B-Q8_0"})
         out.write("[llama]\nenabled = false\n\n[llamb]\nenabled = false\n")
 
 

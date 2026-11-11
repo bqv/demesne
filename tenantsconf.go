@@ -31,6 +31,7 @@ const (
 	keyMemSwap   = "memory_swap_high"
 	keyReadMBs   = "read_mb_s"
 	keyFallback  = "fallback"
+	keyStart     = "start"
 	keyModelsBad = "model"
 )
 
@@ -38,7 +39,7 @@ var tenantKeys = map[string]bool{
 	keyKind: true, keyModels: true, keyAliases: true, keyURL: true, keyBin: true,
 	keyArgs: true, keyEnv: true, keyDir: true, keyPolicy: true, keyGroup: true,
 	keyVRAM: true, keyIdle: true, keyMemHigh: true, keyMemMax: true, keyMemSwap: true,
-	keyReadMBs: true, keyFallback: true, keyModelsBad: true, keyEnabled: true,
+	keyReadMBs: true, keyFallback: true, keyModelsBad: true, keyEnabled: true, keyStart: true,
 }
 
 type tenantSection struct {
@@ -120,6 +121,7 @@ func specFromSection(sec tenantSection, c config) (tenantSpec, error) {
 		name: sec.name, url: url, bin: kv[keyBin], args: fields(kv[keyArgs]),
 		env: fields(kv[keyEnv]), dir: kv[keyDir], models: models, aliases: aliases,
 		group: kv[keyGroup], policy: pol, kind: kind, cgroup: c.memLimits(sec.name, kv),
+		boot: pol == policyResident || strings.EqualFold(kv[keyStart], "boot"),
 	}
 	if s := kv[keyIdle]; s != "" {
 		d, err := time.ParseDuration(s)

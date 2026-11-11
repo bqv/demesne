@@ -180,6 +180,7 @@ type tenantSpec struct {
 
 	kind         tenantKind
 	aliases      []string
+	boot         bool
 	vramMB       int
 	readMBs      float64
 	weightsBytes int64

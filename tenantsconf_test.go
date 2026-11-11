@@ -312,3 +312,43 @@ vram_mb = 700
 		t.Fatalf("dropping a built-in was not noted: %v", notes)
 	}
 }
+
+// start separates "is up from boot" from "how eviction treats it": the big card's rungs are keep
+// (never idle-evicted) but must not all boot at once, so they start on demand.
+func TestStartIsNotTheSameAsPolicy(t *testing.T) {
+	cfg := goldenConfig()
+	cfg.tenantsFile = writeTenants(t, `
+[a]
+url = http://127.0.0.1:1
+models = a
+group = gpu
+policy = keep
+start = demand
+
+[b]
+url = http://127.0.0.1:2
+models = b
+group = aux
+policy = keep
+start = boot
+
+[c]
+url = http://127.0.0.1:3
+models = c
+policy = resident
+`)
+	specs, _, err := tenantsFromConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, sp := range specs {
+		switch sp.name {
+		case "a", "b", "c":
+			got[sp.name] = sp.boot
+		}
+	}
+	if got["a"] || !got["b"] || !got["c"] {
+		t.Fatalf("boot flags = %v (a must be demand, b demand->boot, c resident->boot)", got)
+	}
+}
