@@ -1117,6 +1117,13 @@ func (d *demesne) tenantStatuses() []tenantStatus {
 // stuck behind an eight-minute cold load.
 // firstAlias is the name a caller is meant to use when it differs from the model id the engine
 // reports: an alias is what a person types, the model id is what llama-server calls itself.
+func firstModelOrAlias(spec tenantSpec) string {
+	if a := firstAlias(spec); a != "" {
+		return a
+	}
+	return firstModel(spec)
+}
+
 func firstAlias(spec tenantSpec) string {
 	if len(spec.aliases) > 0 {
 		return spec.aliases[0]

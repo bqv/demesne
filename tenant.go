@@ -558,6 +558,12 @@ func (d *demesne) spawnLocked(s *tenant) error {
 		}
 	}
 	cmd := exec.Command(s.specOf().bin, s.specOf().args...)
+	// argv[0] is the label a person reads in `ps` and in a top's command column; the executable
+	// Go runs is cmd.Path and is untouched, so nothing that finds a child by its file name
+	// changes. comm (the NAME column) is a separate thing and stays llama-server.
+	if label := firstModelOrAlias(s.specOf()); label != "" {
+		cmd.Args[0] = label
+	}
 	cmd.Dir = s.specOf().dir
 	cmd.Stdout, cmd.Stderr = out, errf
 	cmd.Env = append(os.Environ(), s.specOf().env...)
