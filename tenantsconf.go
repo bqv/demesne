@@ -173,6 +173,8 @@ func parsePolicy(s string) (policy, error) {
 		return policyExternal, nil
 	case "resident":
 		return policyResident, nil
+	case "keep", "sticky":
+		return policyKeep, nil
 	case "warm":
 		return 0, fmt.Errorf("policy %q is retired: a tenant that must stay up is %q, and the big card keeps nothing resident", s, "resident")
 	}

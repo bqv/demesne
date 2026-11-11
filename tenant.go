@@ -61,7 +61,9 @@ type policy int
 const (
 	policyExternal policy = iota // supervised elsewhere (OpenRC); route only
 	policyOnDemand               // spawn for a request, evict when idle
-	policyResident               // spawn at startup, restart with backoff
+	policyResident               // spawn at startup, restart with backoff, never evicted
+	policyKeep                   // spawn at startup like a resident, but give the card back when
+	// another tenant needs it: no idle timer, eviction only for fitting
 )
 
 func (p policy) String() string {
@@ -70,6 +72,8 @@ func (p policy) String() string {
 		return "on-demand"
 	case policyResident:
 		return "resident"
+	case policyKeep:
+		return "keep"
 	default:
 		return "external"
 	}
@@ -367,7 +371,7 @@ func (s *tenant) armIdleLocked(d *demesne) {
 	}
 	// A resident tenant is the operator saying "keep this up": it is not idle-evicted, and a
 	// timer here was evicting the aux embedder every five minutes.
-	if s.specOf().policy == policyResident || s.specOf().idle <= 0 {
+	if s.specOf().policy == policyResident || s.specOf().policy == policyKeep || s.specOf().idle <= 0 {
 		return
 	}
 	s.timer = time.AfterFunc(s.specOf().idle, func() {
@@ -465,7 +469,7 @@ func (d *demesne) clearGroupLocked(s *tenant) error {
 		if other == s || other.specOf().group != s.specOf().group {
 			continue
 		}
-		if other.specOf().policy != policyOnDemand {
+		if other.specOf().policy == policyResident {
 			continue
 		}
 		if up, _ := other.isUp(); up {

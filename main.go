@@ -626,7 +626,7 @@ func newDemesne(cfg config) *demesne {
 		// A resident tenant is somebody's responsibility from the start. A reload can hand
 		// an engine back to OpenRC and take it again, so the flag is a real one and not a
 		// property of the spec.
-		if s.specOf().policy == policyResident {
+		if s.specOf().policy == policyResident || s.specOf().policy == policyKeep {
 			s.setSupervised(true)
 		}
 	}
@@ -1571,7 +1571,7 @@ func main() {
 	}()
 
 	for _, s := range d.tenants {
-		if s.specOf().policy == policyResident {
+		if s.specOf().policy == policyResident || s.specOf().policy == policyKeep {
 			go d.supervise(s)
 		}
 	}

@@ -61,21 +61,21 @@ def args_for(kv, glob, base, alias):
     return out
 
 
-def vram(path, base):
+def vram(path, base, overhead=900):
     p = rescope(path, base)
     try:
-        return int(os.path.getsize(p) / 1048576) + 900
+        return int(os.path.getsize(p) / 1048576) + overhead
     except OSError:
         return 4000
 
 
-def emit(out, path, base, sockdir, group, fence, resident):
+def emit(out, path, base, sockdir, group, fence, resident, overhead=900):
     rungs, glob = parse(path)
     for name, kv in rungs.items():
         args = args_for(kv, glob, base, name) + [
             "--host", os.path.join(sockdir, name + ".sock"), "--alias", name]
-        policy = "resident" if name in resident else "on-demand"
-        if policy == "resident":
+        policy = resident.get(name, "on-demand")
+        if policy in ("resident", "keep"):
             idle = "0"
         else:
             idle = "45m" if name == "Qwen3.8-27B-abliterated-180k" else ("30m" if name == "Kev-0.8B-Q8_0" else "5m")
@@ -86,7 +86,7 @@ def emit(out, path, base, sockdir, group, fence, resident):
         out.write("models = %s\n" % name)
         out.write("group = %s\n" % group)
         out.write("policy = %s\n" % policy)
-        out.write("vram_mb = %d\n" % vram(kv.get("model", ""), base))
+        out.write("vram_mb = %d\n" % vram(kv.get("model", ""), base, overhead))
         out.write("idle = %s\n" % idle)
         out.write("memory_high = %s\n" % fence[0])
         out.write("memory_max = %s\n" % fence[1])
@@ -95,8 +95,9 @@ def emit(out, path, base, sockdir, group, fence, resident):
 
 def main():
     with open(sys.argv[1], "w") as out:
-        emit(out, LLM_INI, LLM_DIR, LLM_SOCK, "gpu", ("6G", "8G"), set())
-        emit(out, AUX_INI, AUX_DIR, AUX_SOCK, "aux", ("2G", "3G"), {"Qwen3-Embedding-0.6B-Q8_0"})
+        emit(out, LLM_INI, LLM_DIR, LLM_SOCK, "gpu", ("6G", "8G"), {})
+        emit(out, AUX_INI, AUX_DIR, AUX_SOCK, "aux", ("2G", "3G"),
+             {"Qwen3-Embedding-0.6B-Q8_0": "resident", "Kev-0.8B-Q8_0": "keep"}, 400)
         out.write("[llama]\nenabled = false\n\n[llamb]\nenabled = false\n")
 
 
