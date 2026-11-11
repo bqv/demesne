@@ -671,7 +671,7 @@ Two concessions while consumers catch up, both to be deleted after one release:
 
 ### Tenants from a file
 
-By default the five built-in tenants are what runs. `DEMESNE_TENANTS=/home/user/etc/tenants.ini`
+By default the five built-in tenants are what runs. `DEMESNE_TENANTS=/home/user/etc/demesne/tenants.ini`
 (or `-tenants`) replaces that with a file, one section per tenant; a section named after a built-in
 replaces it, and a new name adds a tenant. The built-ins stay as the defaults, so an estate that
 configures nothing behaves as it did.
@@ -702,7 +702,7 @@ others exactly as they are, because moving a live cgroup moves its accounting hi
 Check a file before restarting into it:
 
 ```
-demesne check -tenants /home/user/etc/tenants.ini
+demesne check -tenants /home/user/etc/demesne/tenants.ini
 ```
 
 It prints one line per tenant in name order — `kind`, `policy`, `group`, `url`, models, then the
