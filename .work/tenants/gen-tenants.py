@@ -42,9 +42,9 @@ def rescope(v, base):
 def args_for(kv, glob, base, alias):
     merged = dict(glob)
     merged.update(kv)
-    out = ["--alias", alias, "-m", rescope(merged["model"], base)]
+    out = ["--device", merged["device"], "-m", rescope(merged["model"], base)] if "device" in merged else ["-m", rescope(merged["model"], base)]
     for k in sorted(merged):
-        if k in SKIP:
+        if k in SKIP or k == "device":
             continue
         v = merged[k]
         if k == "model":
@@ -72,9 +72,13 @@ def vram(path, base):
 def emit(out, path, base, sockdir, group, fence, resident):
     rungs, glob = parse(path)
     for name, kv in rungs.items():
-        args = args_for(kv, glob, base, name) + ["--host", os.path.join(sockdir, name + ".sock")]
+        args = args_for(kv, glob, base, name) + [
+            "--host", os.path.join(sockdir, name + ".sock"), "--alias", name]
         policy = "resident" if name in resident else "on-demand"
-        idle = "45m" if name == "Qwen3.8-27B-abliterated-180k" else ("30m" if name == "Kev-0.8B-Q8_0" else "5m")
+        if policy == "resident":
+            idle = "0"
+        else:
+            idle = "45m" if name == "Qwen3.8-27B-abliterated-180k" else ("30m" if name == "Kev-0.8B-Q8_0" else "5m")
         out.write("[%s]\n" % name)
         out.write("url = unix:%s\n" % os.path.join(sockdir, name + ".sock"))
         out.write("bin = /usr/bin/llama-server\n")

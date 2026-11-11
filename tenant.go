@@ -365,7 +365,9 @@ func (s *tenant) armIdleLocked(d *demesne) {
 		s.timer.Stop()
 		s.timer = nil
 	}
-	if s.specOf().idle <= 0 {
+	// A resident tenant is the operator saying "keep this up": it is not idle-evicted, and a
+	// timer here was evicting the aux embedder every five minutes.
+	if s.specOf().policy == policyResident || s.specOf().idle <= 0 {
 		return
 	}
 	s.timer = time.AfterFunc(s.specOf().idle, func() {
