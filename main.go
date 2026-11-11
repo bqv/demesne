@@ -1121,7 +1121,10 @@ func firstModelOrAlias(spec tenantSpec) string {
 	if a := firstAlias(spec); a != "" {
 		return a
 	}
-	return firstModel(spec)
+	if m := firstModel(spec); m != "" {
+		return m
+	}
+	return spec.name
 }
 
 func firstAlias(spec tenantSpec) string {
