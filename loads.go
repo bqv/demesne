@@ -278,11 +278,21 @@ func (d *demesne) attachProgress(s *tenant) {
 	}
 	b.mu.Unlock()
 
+	direct := len(s.specOf().models) > 0
 	for _, e := range active {
-		child, modelPath, extra := childForModel("/proc", pid, e.Model)
+		var child int
+		var path string
+		var extra []string
+		if direct {
+			// A per-model tenant IS the child: the tenant's pid is the process to measure.
+			child, path = pid, modelPathFor(s.specOf())
+		} else {
+			child, path, extra = childForModel("/proc", pid, e.Model)
+		}
 		if child == 0 {
 			continue
 		}
+		modelPath := path
 		read, ok := procIO("/proc", child)
 		if !ok {
 			continue
@@ -311,6 +321,17 @@ func (d *demesne) attachProgress(s *tenant) {
 		}
 		b.mu.Unlock()
 	}
+}
+
+func (b *loadBoard) loadingRow(tenant string) (string, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, e := range b.entries {
+		if e.Tenant == tenant && e.Phase == loadLoading {
+			return e.Model, true
+		}
+	}
+	return "", false
 }
 
 func lineFor(lines []string, model string) string {
@@ -679,7 +700,12 @@ func (d *demesne) pollLoads() {
 			continue
 		}
 		if !portAlive(s.specOf().url) {
-			d.loads.forget(s.specOf().name)
+			// A tenant that is starting has not bound its socket yet; forgetting its row here
+			// is what made a cold load invisible for the first seconds.
+			if _, loading := d.loads.loadingRow(s.specOf().name); !loading {
+				d.loads.forget(s.specOf().name)
+			}
+			d.attachProgress(s)
 			continue
 		}
 		models, err := d.routerModels(s)

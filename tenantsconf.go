@@ -312,6 +312,8 @@ func weightsBytes(sp tenantSpec) int64 {
 	return fi.Size()
 }
 
+func modelPathFor(sp tenantSpec) string { return modelPath(sp) }
+
 func modelPath(sp tenantSpec) string {
 	args := sp.args
 	for i := 0; i < len(args); i++ {
