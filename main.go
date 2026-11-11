@@ -1257,7 +1257,6 @@ func (d *demesne) status(w http.ResponseWriter) {
 		"media_in_flight": inflight,
 		"llm_health":      d.llm.snapshot(),
 		"tenants":         statuses,
-		"slots":           statuses,
 		"loads":           d.loads.snapshot(),
 
 		// stadi's field names, kept because DSH and the habit of a year read them.

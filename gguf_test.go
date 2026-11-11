@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 )
@@ -53,5 +56,24 @@ func TestAliasIsPreferredOverTheModelID(t *testing.T) {
 	}
 	if got := firstAlias(tenantSpec{models: []string{"x"}}); got != "" {
 		t.Fatalf("a tenant without aliases must not invent one: %q", got)
+	}
+}
+
+// slots[] is gone: tenants[] is the only account of the estate, and a mirror that outlives its
+// migration becomes a second source of truth nobody dares delete.
+func TestStatusHasNoSlotsKey(t *testing.T) {
+	cfg := testConfig(t)
+	d := newTestDemesne(t, cfg)
+	rec := httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := body["slots"]; ok {
+		t.Fatal("slots[] is published again")
+	}
+	if _, ok := body["tenants"]; !ok {
+		t.Fatal("tenants[] is missing")
 	}
 }

@@ -19,7 +19,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -2550,10 +2549,9 @@ func TestTheSocketDirectoryIsOursOrRefused(t *testing.T) {
 	}
 }
 
-// /status carries tenants[] as the estate's own account, and a slots[] mirror of the SAME rows for
-// one release, so hgtop and old cards keep reading while they are updated. The mirror is a
-// serialisation, never a second source: both keys must be the same slice.
-func TestStatusCarriesTenantsAndADeprecatedMirror(t *testing.T) {
+// /status carries tenants[] as the estate's only account of itself: the rows include the
+// per-model fields a meter needs, and no slots[] mirror survives the migration.
+func TestStatusCarriesTenants(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.llama = engineConfig{url: "http://127.0.0.1:1", bin: "/usr/bin/llama-server",
 		models: []string{"m1"}, cgroup: memLimit{leaf: "/sys/fs/cgroup/estate/llama/llm"}}
@@ -2568,18 +2566,18 @@ func TestStatusCarriesTenantsAndADeprecatedMirror(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	var tenants, slots []tenantStatus
+	if _, ok := body["slots"]; ok {
+		t.Fatal("the deprecated slots mirror is back")
+	}
+	var tenants []tenantStatus
 	if err := json.Unmarshal(body["tenants"], &tenants); err != nil {
 		t.Fatalf("tenants: %v", err)
 	}
-	if err := json.Unmarshal(body["slots"], &slots); err != nil {
-		t.Fatalf("slots mirror: %v", err)
-	}
-	if len(tenants) == 0 || !reflect.DeepEqual(tenants, slots) {
-		t.Fatalf("the mirror is not the same rows: %d tenants, %d slots", len(tenants), len(slots))
+	if len(tenants) == 0 {
+		t.Fatal("no tenant rows")
 	}
 	row := tenants[0]
-	if row.Name == "" || row.Kind == "" || row.State == "" {
+	if row.Name == "" || row.Kind == "" || row.State == "" || row.Device == "" {
 		t.Fatalf("the row lacks the per-model fields: %+v", row)
 	}
 }
