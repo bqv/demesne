@@ -19,7 +19,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
+	"os/signal"
+	"path"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -83,6 +87,9 @@ func runSubcommand(sub string, cfg config) {
 		return
 	case "check":
 		runCheck(cfg)
+		return
+	case "supervise":
+		supervise(cfg)
 		return
 	case "status", "release", "load", "start", "stop", "reload":
 	default:
@@ -158,4 +165,57 @@ func call(cfg config, method, path string) (string, []string) {
 func fail(what string, errs []string) {
 	fmt.Fprintf(os.Stderr, "demesne: %s failed: %s\n", what, strings.Join(errs, "; "))
 	os.Exit(1)
+}
+
+// supervise is demesne's own supervisor, and it exists because OpenRC's was not ours to keep in
+// the right cgroup: a DSH restart killed the supervisor while demesne and its children survived,
+// leaving a live estate with nobody to restart it. This one moves itself into the estate's ctl leaf
+// before it starts anything, so it is not a member of whatever session happened to launch it, and
+// then it restarts the daemon with backoff -- only the daemon, because the children are the
+// daemon's own.
+func supervise(cfg config) {
+	if leaf := path.Join(cfg.cgroupRoot, "ctl"); leaf != "" {
+		if err := os.WriteFile(path.Join(leaf, "cgroup.procs"), []byte(fmt.Sprint(os.Getpid())), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "demesne: supervise: could not join %s: %v (continuing)\n", leaf, err)
+		}
+	}
+	self, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "demesne: supervise: %v\n", err)
+		os.Exit(1)
+	}
+	stop := make(chan os.Signal, 2)
+	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
+	delay := 2 * time.Second
+	for {
+		cmd := exec.Command(self)
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		cmd.Env = os.Environ()
+		if err := cmd.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "demesne: supervise: %v (retrying in %s)\n", err, delay)
+		} else {
+			done := make(chan error, 1)
+			go func() { done <- cmd.Wait() }()
+			select {
+			case sig := <-stop:
+				_ = cmd.Process.Signal(sig)
+				select {
+				case <-done:
+				case <-time.After(30 * time.Second):
+					_ = cmd.Process.Kill()
+				}
+				return
+			case err := <-done:
+				fmt.Fprintf(os.Stderr, "demesne: supervisor: daemon exited: %v (restarting in %s)\n", err, delay)
+			}
+		}
+		select {
+		case <-stop:
+			return
+		case <-time.After(delay):
+		}
+		if delay < 30*time.Second {
+			delay *= 2
+		}
+	}
 }
