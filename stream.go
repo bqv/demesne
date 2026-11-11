@@ -153,8 +153,17 @@ func (d *demesne) streamUpstream(w http.ResponseWriter, r *http.Request, url str
 		}
 	}()
 
+	target := url
+	client := http.DefaultClient
+	if waitFor != nil {
+		if path := unixPath(waitFor.specOf().url); path != "" {
+			client = &http.Client{Transport: unixDialer(path)}
+			target = "http://unix-socket" + r.URL.Path
+		}
+	}
+
 	attempt := func() (*http.Response, error) {
-		req, err := http.NewRequestWithContext(ctx, r.Method, url, bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(ctx, r.Method, target, bytes.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
@@ -164,7 +173,7 @@ func (d *demesne) streamUpstream(w http.ResponseWriter, r *http.Request, url str
 		if auth := r.Header.Get("Authorization"); auth != "" {
 			req.Header.Set("Authorization", auth)
 		}
-		return http.DefaultClient.Do(req)
+		return client.Do(req)
 	}
 
 	resp, err := attempt()
