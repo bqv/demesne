@@ -1081,6 +1081,10 @@ type tenantStatus struct {
 	Group      string  `json:"group,omitempty"`
 	Policy     string  `json:"policy"`
 	VRAMMB     int     `json:"vram_mb,omitempty"`
+	NCtx       int64   `json:"n_ctx,omitempty"`
+	NParams    int64   `json:"n_params,omitempty"`
+	SizeBytes  int64   `json:"size_bytes,omitempty"`
+	Quant      string  `json:"quant,omitempty"`
 	ReloadS    float64 `json:"reload_s,omitempty"`
 	Idle       string  `json:"idle,omitempty"`
 	Owned      bool    `json:"owned"`
@@ -1130,6 +1134,26 @@ func tenantState(spec tenantSpec, t *tenant) string {
 	return "idle"
 }
 
+// configuredCtx is the context the tenant is started with, which is what a meter shows; the
+// architecture's training context is only the fallback for a tenant that does not say.
+func configuredCtx(spec tenantSpec) int64 {
+	for i, a := range spec.args {
+		switch {
+		case a == "-c" || a == "--ctx-size" || a == "-ctx-size":
+			if i+1 < len(spec.args) {
+				if n, err := strconv.ParseInt(spec.args[i+1], 10, 64); err == nil {
+					return n
+				}
+			}
+		case strings.HasPrefix(a, "--ctx-size="):
+			if n, err := strconv.ParseInt(strings.TrimPrefix(a, "--ctx-size="), 10, 64); err == nil {
+				return n
+			}
+		}
+	}
+	return ggufOf(modelPath(spec)).NCtx
+}
+
 func reloadCostSeconds(spec tenantSpec) float64 {
 	n := weightsBytes(spec)
 	if n == 0 {
@@ -1146,6 +1170,8 @@ func tenantStatusOf(s *tenant) tenantStatus {
 		State: tenantState(spec, s), Listen: spec.url, ListenPort: s.port(),
 		Group: spec.group, Policy: spec.policy.String(), Owned: spec.own(),
 		VRAMMB: spec.vramMB, ReloadS: reloadCostSeconds(spec), Idle: idleString(spec),
+		NCtx: configuredCtx(spec), NParams: ggufOf(modelPath(spec)).NParams,
+		SizeBytes: ggufOf(modelPath(spec)).SizeByte, Quant: ggufOf(modelPath(spec)).Quant,
 		Up: s.up, Booting: s.up && s.readyAt.IsZero(), PID: s.pid,
 		InFlight: atomic.LoadInt64(&s.inflight), Restarts: s.restarts,
 		LastError: s.lastErr, LastTransition: downReason(s.stopped, s.up),
