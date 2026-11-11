@@ -50,7 +50,10 @@ import (
 	"time"
 )
 
-const version = "0.3.0" // 0.2.0 was stadi at ad49321; the fork line starts here
+// version is the contract a consumer can gate on. It moves whenever the shape of an API changes,
+// and the change is announced, because a version that only moves for releases makes gating
+// worthless.
+const version = "0.4.0" // 0.3.x: slots[] -> tenants[], per-tenant load rows, argv[0] labels
 
 // The environment keeps stadi's names working, because conf.d/stadi already exports
 // them and a rename that breaks the deployed service at boot is not a rename, it is an
