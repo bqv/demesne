@@ -14,6 +14,10 @@ type ggufFacts struct {
 	NParams  int64
 	SizeByte int64
 	Quant    string
+	Layers   int64
+	Embd     int64
+	Heads    int64
+	HeadsKV  int64
 }
 
 const (
@@ -82,7 +86,7 @@ func readGGUF(path string) (ggufFacts, error) {
 		return ggufFacts{}, err
 	}
 	var fileType uint32
-	var archCtx int64
+	var archCtx, layers, embd, heads, headsKV int64
 	for i := uint64(0); i < kvs; i++ {
 		key, err := readGGUFString(fh)
 		if err != nil {
@@ -103,6 +107,14 @@ func readGGUF(path string) (ggufFacts, error) {
 				fileType = v
 			case strings.HasSuffix(key, ".context_length"):
 				archCtx = int64(v)
+			case strings.HasSuffix(key, ".block_count"):
+				layers = int64(v)
+			case strings.HasSuffix(key, ".embedding_length"):
+				embd = int64(v)
+			case strings.HasSuffix(key, ".attention.head_count"):
+				heads = int64(v)
+			case strings.HasSuffix(key, ".attention.head_count_kv"):
+				headsKV = int64(v)
 			}
 		case ggufTypeI32:
 			var v int32
@@ -157,7 +169,8 @@ func readGGUF(path string) (ggufFacts, error) {
 	if err != nil {
 		return ggufFacts{}, err
 	}
-	return ggufFacts{NCtx: archCtx, NParams: params, SizeByte: fi.Size(), Quant: fileTypeName(fileType)}, nil
+	return ggufFacts{NCtx: archCtx, NParams: params, SizeByte: fi.Size(), Quant: fileTypeName(fileType),
+		Layers: layers, Embd: embd, Heads: heads, HeadsKV: headsKV}, nil
 }
 
 func readGGUFString(r io.Reader) (string, error) {
@@ -229,4 +242,75 @@ func fileTypeName(t uint32) string {
 		return n
 	}
 	return fmt.Sprintf("ftype%d", t)
+}
+
+// kvBytesPerToken is what one token of KV costs, given the model's shape and the cache types the
+// tenant asks for. This is the number that makes a declared footprint honest: weights alone let a
+// 1M-context rung claim 2.6 GiB and then ask the driver for 36.
+func kvBytesPerToken(f ggufFacts, kType, vType string) int64 {
+	if f.Layers <= 0 || f.Embd <= 0 || f.Heads <= 0 {
+		return 0
+	}
+	kvHeads := f.HeadsKV
+	if kvHeads <= 0 {
+		kvHeads = f.Heads
+	}
+	headDim := f.Embd / f.Heads
+	kvDim := kvHeads * headDim
+	return f.Layers * kvDim * (bytesPerElement(kType) + bytesPerElement(vType))
+}
+
+func bytesPerElement(cacheType string) int64 {
+	switch cacheType {
+	case "q4_0", "q4_1":
+		return 1
+	case "q5_0", "q5_1":
+		return 1
+	case "q8_0":
+		return 1
+	case "f16", "bf16":
+		return 2
+	case "f32":
+		return 4
+	}
+	return 2
+}
+
+// effectiveVRAMMB is the slot's real card footprint: weights, the KV its context needs, and a
+// margin for compute buffers. A tenant that declares nothing still gets this estimate, because a
+// declaration that cannot be checked is worse than one computed from the file and the command line.
+func effectiveVRAMMB(spec tenantSpec) int64 {
+	f := ggufOf(modelPath(spec))
+	mb := spec.weightsBytes
+	if mb == 0 {
+		mb = f.SizeByte
+	}
+	total := mb
+	ctx := configuredCtx(spec)
+	if ctx > 0 {
+		total += kvBytesPerToken(f, argValue(spec, "-ctk", "--cache-type-k"), argValue(spec, "-ctv", "--cache-type-v")) * ctx
+	}
+	total = total / (1 << 20)
+	margin := int64(400)
+	if spec.group == "gpu" {
+		margin = 700
+	}
+	if total == 0 {
+		return int64(spec.vramMB)
+	}
+	return total + margin
+}
+
+func argValue(spec tenantSpec, names ...string) string {
+	for i, a := range spec.args {
+		for _, n := range names {
+			if a == n && i+1 < len(spec.args) {
+				return spec.args[i+1]
+			}
+			if strings.HasPrefix(a, n+"=") {
+				return strings.TrimPrefix(a, n+"=")
+			}
+		}
+	}
+	return "f16"
 }

@@ -506,7 +506,7 @@ func buildTenants(c config) []tenantSpec {
 		}
 		return tenantSpec{
 			name: name, url: e.url, bin: e.bin, args: e.args, env: e.env, dir: e.dir,
-			models: e.models, kind: kindModel,
+			models: e.models, kind: kindModel, boot: pol == policyResident,
 			group: group, vram: true, policy: pol, idle: idle,
 			routed: routed, router: true, fallback: true, cgroup: e.cgroup,
 		}
@@ -1190,7 +1190,7 @@ func tenantStatusOf(s *tenant) tenantStatus {
 		Kind: spec.kind.String(), Device: cardLabel(spec),
 		State: tenantState(spec, s), Listen: spec.url, ListenPort: s.port(),
 		Group: spec.group, Policy: spec.policy.String(), Owned: spec.own(),
-		VRAMMB: spec.vramMB, ReloadS: reloadCostSeconds(spec), Idle: idleString(spec),
+		VRAMMB: int(effectiveVRAMMB(spec)), ReloadS: reloadCostSeconds(spec), Idle: idleString(spec),
 		NCtx: configuredCtx(spec), NParams: ggufOf(modelPath(spec)).NParams,
 		SizeBytes: ggufOf(modelPath(spec)).SizeByte, Quant: ggufOf(modelPath(spec)).Quant,
 		Up: s.up, Booting: s.up && s.readyAt.IsZero(), PID: s.pid,
@@ -1580,6 +1580,7 @@ func main() {
 	}
 
 	go d.maintainCgroups()
+	go d.watchTenantsFile()
 
 	// The index is built before the listener opens, so the very first request routes by
 	// model name; the ticker keeps it honest afterwards.

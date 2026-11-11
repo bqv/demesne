@@ -37,13 +37,13 @@ func TestTheFiveDefaultsAreUnchanged(t *testing.T) {
 	want := []tenantSpec{
 		{
 			name: "llama", url: "http://127.0.0.1:55556", bin: "/bin/llama", args: []string{"--llama"},
-			dir: "/srv/llm", models: []string{"m1"}, kind: kindModel, group: "gpu", vram: true,
+			dir: "/srv/llm", models: []string{"m1"}, kind: kindModel, boot: true, group: "gpu", vram: true,
 			policy: policyResident, routed: true, router: true, fallback: true,
 			cgroup: memLimit{leaf: "/sys/fs/cgroup/estate/llama/llm"},
 		},
 		{
 			name: "llamb", url: "http://127.0.0.1:55557", bin: "/bin/llamb", args: []string{"--llamb"},
-			kind: kindModel, group: "aux", vram: true, policy: policyResident,
+			kind: kindModel, boot: true, group: "aux", vram: true, policy: policyResident,
 			routed: true, router: true, fallback: true,
 			cgroup: memLimit{leaf: "/sys/fs/cgroup/estate/llama/aux"},
 		},

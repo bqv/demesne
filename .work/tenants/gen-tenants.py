@@ -7,6 +7,13 @@ BARE = {"jinja", "embeddings", "reranking", "metrics", "cont-batching", "mlock",
 TOGGLE = {"fit"}
 SKIP = {"load-on-startup"}
 
+IDLE_SMALL = {
+    "d1-2B-Q8_0-Decision", "Poro-2-8B-Instruct-Q6_K", "Poro-2-8B-Instruct-Q6_K-tools",
+    "Qwen3.8-14B-Instruct-Turbo-Q4_K_M", "Qwen3.5-9B-Q4_K_M", "Qwen3.5-9B-Q4_K_M-tools",
+    "Spark-X2.5-4B-Q4_K_M", "Spark-X2.5-4B-Q4_K_M-128k", "Spark-X2.5-4B-Q4_K_M-256k",
+    "Spark-X2.5-4B-Q4_K_M-512k", "Spark-X2.5-4B-Q4_K_M-768k",
+}
+
 LLM_INI, LLM_DIR, LLM_SOCK = "/srv/model/llm/models.ini", "/srv/model/llm", "/home/user/tmp/demesne-llm/models"
 AUX_INI, AUX_DIR, AUX_SOCK = "/srv/model/aux/models.ini", "/srv/model/aux", "/home/user/tmp/hnet/models"
 
@@ -35,7 +42,12 @@ def parse(path):
     return rungs, glob
 
 
+OLD_TREE = "/home/user/var/model"
+
+
 def rescope(v, base):
+    if v.startswith("/home/user/var/model/"):
+        return v.replace(OLD_TREE, "/srv/model", 1)
     return v if v.startswith("/") else os.path.normpath(os.path.join(base, v))
 
 
@@ -74,11 +86,12 @@ def emit(out, path, base, sockdir, group, fence, resident, overhead=900, keep_al
     for name, kv in rungs.items():
         args = args_for(kv, glob, base, name) + [
             "--host", os.path.join(sockdir, name + ".sock"), "--alias", name]
-        policy = resident.get(name, "keep" if keep_all else "on-demand")
+        policy = resident.get(name, "on-demand" if name in IDLE_SMALL else
+                              ("keep" if keep_all else "on-demand"))
         if policy in ("resident", "keep"):
             idle = "0"
         else:
-            idle = "45m" if name == "Qwen3.8-27B-abliterated-180k" else ("30m" if name == "Kev-0.8B-Q8_0" else "5m")
+            idle = "30m"
         out.write("[%s]\n" % name)
         out.write("url = unix:%s\n" % os.path.join(sockdir, name + ".sock"))
         out.write("bin = /usr/bin/llama-server\n")

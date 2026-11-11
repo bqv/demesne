@@ -43,6 +43,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/exec"
@@ -484,7 +485,8 @@ func (d *demesne) clearGroupLocked(s *tenant) error {
 	// peers that could be in the way were stopped above. What is left is arithmetic, and a
 	// declared footprint is the only honest basis for it -- without one, try and let the child
 	// say what it could not allocate.
-	if s.specOf().vramMB <= 0 {
+	need := uint64(effectiveVRAMMB(s.specOf())) << 20
+	if need == 0 {
 		return nil
 	}
 	used, err := vramUsed()
@@ -492,7 +494,6 @@ func (d *demesne) clearGroupLocked(s *tenant) error {
 		return nil
 	}
 	total := vramTotal()
-	need := uint64(s.specOf().vramMB) << 20
 	deadline := time.Now().Add(5 * time.Second)
 	for used+need > total && time.Now().Before(deadline) {
 		time.Sleep(200 * time.Millisecond)
@@ -1195,4 +1196,73 @@ func uriPort(base string) int {
 		return 80
 	}
 	return 0
+}
+
+// applyTenantsFile re-reads the tenants file and adopts it: children are stopped (their replacement
+// is a different process by definition), the tenant set, proxies and routing index are rebuilt, and
+// the new set is live for the next request. It is deliberately a soft restart rather than a field
+// diff: a tenant's command line, byte layout and cgroup are not things to mutate under a running
+// child, and "no restart needed" is worth one cold start.
+func (d *demesne) applyTenantsFile() bool {
+	specs, notes, err := tenantsFromConfig(d.cfg)
+	if err != nil {
+		log.Printf("tenants file changed but is not usable (%v); keeping the running set", err)
+		return false
+	}
+	before := len(d.tenants)
+	d.transition.Lock()
+	for _, t := range d.tenants {
+		if up, _ := t.isUp(); up {
+			d.evictLocked(t, stopOperator, "the tenants file changed")
+		}
+	}
+	d.tenants = nil
+	d.index = map[string]*tenant{}
+	d.proxies = map[string]*httputil.ReverseProxy{}
+	d.probes = map[string]*httputil.ReverseProxy{}
+	for _, spec := range specs {
+		t := &tenant{spec: spec, owner: d}
+		d.tenants = append(d.tenants, t)
+		d.index[spec.name] = t
+		d.proxies[spec.name] = reverseProxy(d, t, spec.router)
+		d.probes[spec.name] = reverseProxy(d, t, false)
+	}
+	d.models = newModelIndex()
+	d.seedModels()
+	d.transition.Unlock()
+	for _, note := range notes {
+		log.Printf("%s", note)
+	}
+	log.Printf("tenants file re-read: %d tenants (was %d); children stopped, the next request starts each one", len(d.tenants), before)
+	return true
+}
+
+// watchTenantsFile notices an edit to the configured tenants file and applies it. A stat per tick is
+// cheaper than any watcher, and a tenants file is edited by hand, not by a machine.
+func (d *demesne) watchTenantsFile() {
+	if d.cfg.tenantsFile == "" {
+		return
+	}
+	var last time.Time
+	var size int64 = -1
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-d.done:
+			return
+		case <-t.C:
+			fi, err := os.Stat(d.cfg.tenantsFile)
+			if err != nil {
+				continue
+			}
+			if fi.ModTime().Equal(last) && fi.Size() == size {
+				continue
+			}
+			if !last.IsZero() || size >= 0 {
+				d.applyTenantsFile()
+			}
+			last, size = fi.ModTime(), fi.Size()
+		}
+	}
 }
