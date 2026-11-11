@@ -222,6 +222,7 @@ type tenant struct {
 	pid      int
 	started  time.Time
 	readyAt  time.Time
+	activity *tenantActivity
 	used     time.Time // last request routed to this tenant; drives LRU eviction
 	stopping bool      // the exit was ordered, so do not count it as a crash
 	foreign  bool      // the port answers but the process is not ours

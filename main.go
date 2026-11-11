@@ -53,7 +53,7 @@ import (
 // version is the contract a consumer can gate on. It moves whenever the shape of an API changes,
 // and the change is announced, because a version that only moves for releases makes gating
 // worthless.
-const version = "0.4.0" // 0.3.x: slots[] -> tenants[], per-tenant load rows, argv[0] labels
+const version = "0.5.0" // 0.3.x: slots[] -> tenants[], per-tenant load rows, argv[0] labels; 0.5.0: tenant activity
 
 // The environment keeps stadi's names working, because conf.d/stadi already exports
 // them and a rename that breaks the deployed service at boot is not a rename, it is an
@@ -1074,33 +1074,34 @@ func (d *demesne) cardSiblings(s *tenant) []*tenant {
 // ------------------------------------------------------------------- /status
 
 type tenantStatus struct {
-	Name       string  `json:"name"`
-	Model      string  `json:"model,omitempty"`
-	Alias      string  `json:"alias,omitempty"`
-	Kind       string  `json:"kind"`
-	Device     string  `json:"device"`
-	State      string  `json:"state"`
-	Listen     string  `json:"listen"`
-	ListenPort int     `json:"port"`
-	Group      string  `json:"group,omitempty"`
-	Policy     string  `json:"policy"`
-	VRAMMB     int     `json:"vram_mb,omitempty"`
-	NCtx       int64   `json:"n_ctx,omitempty"`
-	NParams    int64   `json:"n_params,omitempty"`
-	SizeBytes  int64   `json:"size_bytes,omitempty"`
-	Quant      string  `json:"quant,omitempty"`
-	ReloadS    float64 `json:"reload_s,omitempty"`
-	Idle       string  `json:"idle,omitempty"`
-	Owned      bool    `json:"owned"`
-	Up         bool    `json:"up"`
-	Booting    bool    `json:"booting"`
-	PID        int     `json:"pid,omitempty"`
-	Foreign    string  `json:"port_held_elsewhere,omitempty"`
-	InFlight   int64   `json:"in_flight"`
-	IdleSecond float64 `json:"idle_timeout_s,omitempty"`
-	UptimeSecs float64 `json:"uptime_s,omitempty"`
-	Restarts   int     `json:"restarts"`
-	LastError  string  `json:"last_error,omitempty"`
+	Name       string          `json:"name"`
+	Model      string          `json:"model,omitempty"`
+	Alias      string          `json:"alias,omitempty"`
+	Kind       string          `json:"kind"`
+	Device     string          `json:"device"`
+	State      string          `json:"state"`
+	Listen     string          `json:"listen"`
+	ListenPort int             `json:"port"`
+	Group      string          `json:"group,omitempty"`
+	Policy     string          `json:"policy"`
+	VRAMMB     int             `json:"vram_mb,omitempty"`
+	Activity   *tenantActivity `json:"activity,omitempty"`
+	NCtx       int64           `json:"n_ctx,omitempty"`
+	NParams    int64           `json:"n_params,omitempty"`
+	SizeBytes  int64           `json:"size_bytes,omitempty"`
+	Quant      string          `json:"quant,omitempty"`
+	ReloadS    float64         `json:"reload_s,omitempty"`
+	Idle       string          `json:"idle,omitempty"`
+	Owned      bool            `json:"owned"`
+	Up         bool            `json:"up"`
+	Booting    bool            `json:"booting"`
+	PID        int             `json:"pid,omitempty"`
+	Foreign    string          `json:"port_held_elsewhere,omitempty"`
+	InFlight   int64           `json:"in_flight"`
+	IdleSecond float64         `json:"idle_timeout_s,omitempty"`
+	UptimeSecs float64         `json:"uptime_s,omitempty"`
+	Restarts   int             `json:"restarts"`
+	LastError  string          `json:"last_error,omitempty"`
 	// LastTransition is why this tenant's child is not running: idle, chat-claims-card,
 	// operator or failed. Absent while it is running, because then there is nothing to
 	// explain -- it is cleared on readiness for the same reason last_error is.
@@ -1194,7 +1195,7 @@ func tenantStatusOf(s *tenant) tenantStatus {
 		State: tenantState(spec, s), Listen: spec.url, ListenPort: s.port(),
 		Group: spec.group, Policy: spec.policy.String(), Owned: spec.own(),
 		VRAMMB: int(effectiveVRAMMB(spec)), ReloadS: reloadCostSeconds(spec), Idle: idleString(spec),
-		NCtx: configuredCtx(spec), NParams: ggufOf(modelPath(spec)).NParams,
+		Activity: s.activity, NCtx: configuredCtx(spec), NParams: ggufOf(modelPath(spec)).NParams,
 		SizeBytes: ggufOf(modelPath(spec)).SizeByte, Quant: ggufOf(modelPath(spec)).Quant,
 		Up: s.up, Booting: s.up && s.readyAt.IsZero(), PID: s.pid,
 		InFlight: atomic.LoadInt64(&s.inflight), Restarts: s.restarts,
@@ -1583,6 +1584,7 @@ func main() {
 
 	go d.maintainCgroups()
 	go d.watchTenantsFile()
+	go d.followActivity()
 
 	// The index is built before the listener opens, so the very first request routes by
 	// model name; the ticker keeps it honest afterwards.

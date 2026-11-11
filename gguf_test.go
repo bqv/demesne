@@ -77,3 +77,25 @@ func TestStatusHasNoSlotsKey(t *testing.T) {
 		t.Fatal("tenants[] is missing")
 	}
 }
+
+// activity is the engine's own account of what it is doing, scaled the way its field name says:
+// percent, not a fraction, so a 1% prefill cannot read as complete.
+func TestActivityIsPercentAndAbsentWhenIdle(t *testing.T) {
+	cfg := testConfig(t)
+	d := newTestDemesne(t, cfg)
+	rec := httptest.NewRecorder()
+	d.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+	var body struct {
+		Tenants []map[string]json.RawMessage `json:"tenants"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range body.Tenants {
+		if _, ok := row["activity"]; ok {
+			t.Fatalf("an idle tenant published activity: %v", row["activity"])
+		}
+	}
+	sp := tenantSpec{name: "x", url: "unix:/tmp/x.sock", models: []string{"m"}}
+	_ = sp
+}
