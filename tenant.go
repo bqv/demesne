@@ -820,6 +820,26 @@ func (d *demesne) supervise(s *tenant) {
 			return
 		case <-gone:
 		}
+		// A deliberate stop stays stopped: an operator unload, an idle eviction or a request
+		// that took the card is a decision, and a supervisor that undoes it makes the verb a
+		// lie. The tenant comes back when a request asks for it, and supervision resumes then.
+		s.mu.Lock()
+		reason := s.stopped
+		s.mu.Unlock()
+		if reason == stopOperator || reason == stopIdle || reason == stopChat {
+			for {
+				if up, _ := s.isUp(); up {
+					break
+				}
+				select {
+				case <-d.done:
+					return
+				case <-time.After(500 * time.Millisecond):
+				}
+			}
+			attempt, delay = 0, d.cfg.restartDelay
+			continue
+		}
 		// A child that lived a while was healthy; start the delay sequence again.
 		if time.Since(started) > 60*time.Second {
 			delay = d.cfg.restartDelay
