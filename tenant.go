@@ -485,7 +485,13 @@ func (d *demesne) clearGroupLocked(s *tenant) error {
 	// peers that could be in the way were stopped above. What is left is arithmetic, and a
 	// declared footprint is the only honest basis for it -- without one, try and let the child
 	// say what it could not allocate.
-	need := uint64(effectiveVRAMMB(s.specOf())) << 20
+	// The computed footprint is published and is the right shape, but it is not yet calibrated
+	// against a measured load (it reads 36 GiB for a 27B that occupies 18), so admission still
+	// trusts the declared number: a gate that refuses working rungs is worse than no gate.
+	need := uint64(0)
+	if specMB := s.specOf().vramMB; specMB > 0 {
+		need = uint64(specMB) << 20
+	}
 	if need == 0 {
 		return nil
 	}
