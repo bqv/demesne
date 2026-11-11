@@ -473,13 +473,34 @@ func (d *demesne) clearGroupLocked(s *tenant) error {
 	if !s.specOf().vram {
 		return nil
 	}
-	d.unloadLLM()
-	if err := waitVRAMBelow(d.cfg.freeBelow, d.cfg.vramWait); err != nil {
-		// Not fatal: the child may still get the card (see README on --auto-fit).
-		log.Printf("warning: %v (continuing: the child may still get the card)", err)
+	// Nothing to ask a router to unload any more: a tenant's model is its own process, and the
+	// peers that could be in the way were stopped above. What is left is arithmetic, and a
+	// declared footprint is the only honest basis for it -- without one, try and let the child
+	// say what it could not allocate.
+	if s.specOf().vramMB <= 0 {
+		return nil
+	}
+	used, err := vramUsed()
+	if err != nil {
+		return nil
+	}
+	total := vramTotal()
+	need := uint64(s.specOf().vramMB) << 20
+	deadline := time.Now().Add(5 * time.Second)
+	for used+need > total && time.Now().Before(deadline) {
+		time.Sleep(200 * time.Millisecond)
+		if u, err := vramUsed(); err == nil {
+			used = u
+		}
+	}
+	if used+need > total {
+		return fmt.Errorf("%s needs %s but only %s of %s is free (see /status: tenants[])",
+			s.specOf().name, gib(need), gib(total-used), gib(total))
 	}
 	return nil
 }
+
+func gib(n uint64) string { return fmt.Sprintf("%.1f GiB", float64(n)/(1<<30)) }
 
 func (d *demesne) spawnLocked(s *tenant) error {
 	if d.closing.Load() {
