@@ -178,13 +178,36 @@ func (d *demesne) streamUpstream(w http.ResponseWriter, r *http.Request, url str
 
 	resp, err := attempt()
 	if waitFor != nil {
-		// A cold engine has no socket yet, and the dial would fail immediately. Wait for it
-		// rather than answer an error: the ticker above is already telling the client it is
-		// loading, and a stream that arrives is worth more than one that gives up.
+		// A tenant that has only just bound its socket answers 503 "Loading model" until the
+		// weights are in. That is not an answer to relay: wait it out with the keep-alives
+		// running, which is what the caller asked for by streaming.
 		deadline := time.Now().Add(d.cfg.loadWait)
-		for err != nil && time.Now().Before(deadline) && r.Context().Err() == nil {
+		for err == nil && resp != nil && resp.StatusCode == http.StatusServiceUnavailable &&
+			time.Now().Before(deadline) && r.Context().Err() == nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
+			resp.Body.Close()
 			select {
-			case <-time.After(200 * time.Millisecond):
+			case <-time.After(500 * time.Millisecond):
+			case <-r.Context().Done():
+			}
+			resp, err = attempt()
+		}
+	}
+	if waitFor != nil {
+		// A cold tenant has no socket yet, and one that has just bound it answers 503
+		// "Loading model" until the weights are in. Neither is an answer to relay: wait them
+		// out with the keep-alives running, which is what the caller asked for by streaming.
+		deadline := time.Now().Add(d.cfg.loadWait)
+		for time.Now().Before(deadline) && r.Context().Err() == nil {
+			if err == nil && resp != nil && resp.StatusCode != http.StatusServiceUnavailable {
+				break
+			}
+			if resp != nil {
+				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
+				resp.Body.Close()
+			}
+			select {
+			case <-time.After(500 * time.Millisecond):
 			case <-r.Context().Done():
 			}
 			resp, err = attempt()
