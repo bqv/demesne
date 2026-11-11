@@ -1073,6 +1073,7 @@ func (d *demesne) cardSiblings(s *tenant) []*tenant {
 type tenantStatus struct {
 	Name       string  `json:"name"`
 	Model      string  `json:"model,omitempty"`
+	Alias      string  `json:"alias,omitempty"`
 	Kind       string  `json:"kind"`
 	Device     string  `json:"device"`
 	State      string  `json:"state"`
@@ -1114,6 +1115,15 @@ func (d *demesne) tenantStatuses() []tenantStatus {
 
 // tenantStatusOf reads one tenant without the transition lock, so a status poll is never
 // stuck behind an eight-minute cold load.
+// firstAlias is the name a caller is meant to use when it differs from the model id the engine
+// reports: an alias is what a person types, the model id is what llama-server calls itself.
+func firstAlias(spec tenantSpec) string {
+	if len(spec.aliases) > 0 {
+		return spec.aliases[0]
+	}
+	return ""
+}
+
 func firstModel(spec tenantSpec) string {
 	if len(spec.models) > 0 {
 		return spec.models[0]
@@ -1166,7 +1176,8 @@ func tenantStatusOf(s *tenant) tenantStatus {
 	s.mu.Lock()
 	spec := s.specOf()
 	st := tenantStatus{
-		Name: spec.name, Model: firstModel(spec), Kind: spec.kind.String(), Device: cardLabel(spec),
+		Name: spec.name, Model: firstModel(spec), Alias: firstAlias(spec),
+		Kind: spec.kind.String(), Device: cardLabel(spec),
 		State: tenantState(spec, s), Listen: spec.url, ListenPort: s.port(),
 		Group: spec.group, Policy: spec.policy.String(), Owned: spec.own(),
 		VRAMMB: spec.vramMB, ReloadS: reloadCostSeconds(spec), Idle: idleString(spec),

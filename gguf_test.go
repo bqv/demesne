@@ -45,3 +45,13 @@ func TestConfiguredCtxComesFromTheCommandLine(t *testing.T) {
 		t.Fatalf("ctx = %d", got)
 	}
 }
+
+func TestAliasIsPreferredOverTheModelID(t *testing.T) {
+	sp := tenantSpec{name: "spark", models: []string{"Spark-X2.5-4B-Q4_K_M-256k"}, aliases: []string{"spark", "spark-4b"}}
+	if got := firstAlias(sp); got != "spark" {
+		t.Fatalf("alias = %q", got)
+	}
+	if got := firstAlias(tenantSpec{models: []string{"x"}}); got != "" {
+		t.Fatalf("a tenant without aliases must not invent one: %q", got)
+	}
+}
