@@ -486,6 +486,13 @@ func (d *demesne) clearGroupLocked(s *tenant) error {
 	// peers that could be in the way were stopped above. What is left is arithmetic, and a
 	// declared footprint is the only honest basis for it -- without one, try and let the child
 	// say what it could not allocate.
+	// The card this check can see is the biggest DRM card, i.e. the 7900 XT: an aux tenant's
+	// footprint must not be measured against it. Refusing Kev because the 27B is resident on the
+	// other card is worse than not checking at all, and the child's own allocation error is the
+	// honest answer for a card demesne cannot measure yet.
+	if s.specOf().group != "gpu" {
+		return nil
+	}
 	// The computed footprint is published and is the right shape, but it is not yet calibrated
 	// against a measured load (it reads 36 GiB for a 27B that occupies 18), so admission still
 	// trusts the declared number: a gate that refuses working rungs is worse than no gate.
