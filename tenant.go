@@ -773,16 +773,26 @@ func (d *demesne) evictLocked(s *tenant, reason stopReason, why string) {
 		log.Printf("stopping %s (pid %d): %s, vram %s", s.specOf().name, pid, why, vramString())
 	}
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
+	// Liveness is the PROCESS, not the port: a child that never bound its socket (a load that timed
+	// out, a startup that failed) has no port at all, so a port test reads "already gone" and skips
+	// the kill -- which is how a 19.8 GiB orphan survived being forgotten about on 2026-11-13.
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		if !portAlive(s.specOf().url) {
+		if syscall.Kill(pid, 0) != nil {
 			break
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	if portAlive(s.specOf().url) {
+	if syscall.Kill(pid, 0) == nil {
 		log.Printf("%s (pid %d) ignored SIGTERM; killing", s.specOf().name, pid)
 		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		for i := 0; i < 20 && syscall.Kill(pid, 0) == nil; i++ {
+			time.Sleep(250 * time.Millisecond)
+		}
+		if syscall.Kill(pid, 0) == nil {
+			log.Printf("%s (pid %d) survived SIGKILL; it is still holding the card", s.specOf().name, pid)
+			return
+		}
 	}
 
 	s.mu.Lock()
