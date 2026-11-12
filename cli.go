@@ -12,6 +12,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -132,12 +133,24 @@ func tenantArg(sub string) string {
 // cold load of an engine (~8 minutes for sd), so there is deliberately no client timeout:
 // the operator can ^C, and a timeout here would lie about what happened.
 func call(cfg config, method, path string) (string, []string) {
+	return callBody(cfg, method, path, nil)
+}
+
+// callBody is call with a request body, which only the reservation verbs need.
+func callBody(cfg config, method, path string, body []byte) (string, []string) {
 	var errs []string
 	for _, w := range waysIn(cfg) {
-		req, err := http.NewRequest(method, w.base+path, nil)
+		var rdr io.Reader
+		if body != nil {
+			rdr = bytes.NewReader(body)
+		}
+		req, err := http.NewRequest(method, w.base+path, rdr)
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", w.how, err))
 			continue
+		}
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
 		}
 		started := time.Now()
 		resp, err := w.client.Do(req)

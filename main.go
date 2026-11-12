@@ -90,6 +90,7 @@ type config struct {
 	whisperIdle                       time.Duration
 	busyWait                          time.Duration // a chat request waits this long for a render
 	vramWait                          time.Duration // bound on waiting for the card to return
+	reserveWait                       time.Duration // bound on waiting behind somebody's reservation
 	loadWait                          time.Duration // bound on a child's port appearing
 	freeBelow                         uint64        // bytes: "the card is free" threshold
 	orphanAbove                       uint64        // bytes: VRAM still held while the port is dead
@@ -315,6 +316,7 @@ func loadConfig() config {
 		fIdle        = flag.String("idle", "", "evict an on-demand child after this long with no request (env "+envPrefix+"IDLE)")
 		fWhisperIdle = flag.String("whisper-idle", "", "the same for whisper (env "+envPrefix+"WHISPER_IDLE)")
 		fBusyWait    = flag.String("busy-wait", "", "how long a chat request waits for a render (env "+envPrefix+"BUSY_WAIT)")
+		fReserveWait = flag.String("reserve-wait", "", "bound on waiting behind a reservation (env "+envPrefix+"RESERVE_WAIT)")
 		fVramWait    = flag.String("vram-wait", "", "bound on waiting for the card to come back (env "+envPrefix+"VRAM_WAIT)")
 		fLoadWait    = flag.String("load-wait", "", "bound on a child's port appearing (env "+envPrefix+"LOAD_WAIT)")
 		fFreeGiB     = flag.Float64("free-gib", 2, "treat the card as free below this many GiB used")
@@ -437,6 +439,7 @@ func loadConfig() config {
 		whisperIdle:   envDur(*fWhisperIdle, "WHISPER_IDLE", 10*time.Minute),
 		busyWait:      envDur(*fBusyWait, "BUSY_WAIT", 2*time.Minute),
 		vramWait:      envDur(*fVramWait, "VRAM_WAIT", 45*time.Second),
+		reserveWait:   envDur(*fReserveWait, "RESERVE_WAIT", 60*time.Second),
 		loadWait:      envDur(*fLoadWait, "LOAD_WAIT", 15*time.Minute),
 		freeBelow:     uint64(freeGiB * float64(1<<30)),
 		orphanAbove:   uint64(1 << 30),
@@ -582,6 +585,7 @@ type demesne struct {
 	history *history   // the last transitions, for the cards
 
 	startedAt   time.Time
+	reserves    *reserveBoard
 	tenantNotes []string
 	tenantsErr  error
 	specNotes   []string
@@ -599,6 +603,7 @@ func newDemesne(cfg config) *demesne {
 		probes:    map[string]*httputil.ReverseProxy{},
 		watches:   map[string]*llmWatch{},
 		loads:     newLoadBoard(cfg.logDir),
+		reserves:  newReserveBoard(),
 		hub:       newEventHub(),
 		history:   &history{},
 		startedAt: time.Now(),
@@ -843,6 +848,12 @@ func (d *demesne) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.handleMetrics(w, r)
 	case p == "/estate/events":
 		d.handleEvents(w, r)
+	case p == "/reserve", strings.HasPrefix(p, "/reserve/"):
+		if p == "/reserve" {
+			d.handleReserve(w, r)
+		} else {
+			d.handleReserveRelease(w, r)
+		}
 	case p == "/release":
 		d.handleRelease(w, r)
 	case p == "/slots", strings.HasPrefix(p, "/slots/"):
@@ -1262,6 +1273,7 @@ func (d *demesne) status(w http.ResponseWriter) {
 		"llm_health":      d.llm.snapshot(),
 		"tenants":         statuses,
 		"loads":           d.loads.snapshot(),
+		"reservations":    d.reserves.snapshot(),
 
 		// stadi's field names, kept because DSH and the habit of a year read them.
 		"tenant":         tenantName(up),

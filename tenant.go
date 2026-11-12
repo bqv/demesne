@@ -486,40 +486,41 @@ func (d *demesne) clearGroupLocked(s *tenant) error {
 	// peers that could be in the way were stopped above. What is left is arithmetic, and a
 	// declared footprint is the only honest basis for it -- without one, try and let the child
 	// say what it could not allocate.
-	// The card this check can see is the biggest DRM card, i.e. the 7900 XT: an aux tenant's
-	// footprint must not be measured against it. Refusing Kev because the 27B is resident on the
-	// other card is worse than not checking at all, and the child's own allocation error is the
-	// honest answer for a card demesne cannot measure yet.
-	if s.specOf().group != "gpu" {
-		return nil
-	}
-	// The computed footprint is published and is the right shape, but it is not yet calibrated
-	// against a measured load (it reads 36 GiB for a 27B that occupies 18), so admission still
-	// trusts the declared number: a gate that refuses working rungs is worse than no gate.
-	need := uint64(0)
-	if specMB := s.specOf().vramMB; specMB > 0 {
-		need = uint64(specMB) << 20
-	}
+	// A card is measured before a tenant is admitted, and a reservation is part of "free": that is
+	// the difference between an external bench holding VRAM and the estate racing it. A request that
+	// fits except for a reservation WAITS for it, because the holder is expected to finish; a request
+	// that does not fit with nothing reserved in the way is refused, as before.
+	need := uint64(s.specOf().vramMB) << 20
 	if need == 0 {
 		return nil
 	}
-	used, err := vramUsed()
+	dev := deviceOf(s.specOf())
+	free, err := freeVRAM(dev)
 	if err != nil {
 		return nil
 	}
-	total := vramTotal()
-	deadline := time.Now().Add(5 * time.Second)
-	for used+need > total && time.Now().Before(deadline) {
-		time.Sleep(200 * time.Millisecond)
-		if u, err := vramUsed(); err == nil {
-			used = u
+	deadline := time.Now().Add(d.cfg.reserveWait)
+	for {
+		reserved := d.reserves.total(dev)
+		if free >= need && free-reserved >= need {
+			return nil
+		}
+		if free < need || reserved == 0 || !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+		if f, err := freeVRAM(dev); err == nil {
+			free = f
 		}
 	}
-	if used+need > total {
+	if free < need {
 		return fmt.Errorf("%s needs %s but only %s of %s is free (see /status: tenants[])",
-			s.specOf().name, gib(need), gib(total-used), gib(total))
+			s.specOf().name, gib(need), gib(free), gib(vramTotal()))
 	}
-	return nil
+	holder, until := d.reserves.holder(dev)
+	return fmt.Errorf("%s needs %s and %s is free, but %s is reserved on %s until %s "+
+		"(see /status: reservations[])", s.specOf().name, gib(need), gib(free), holder, dev,
+		until.Format("15:04:05"))
 }
 
 func gib(n uint64) string { return fmt.Sprintf("%.1f GiB", float64(n)/(1<<30)) }
