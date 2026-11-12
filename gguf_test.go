@@ -99,3 +99,23 @@ func TestActivityIsPercentAndAbsentWhenIdle(t *testing.T) {
 	sp := tenantSpec{name: "x", url: "unix:/tmp/x.sock", models: []string{"m"}}
 	_ = sp
 }
+
+// Two rungs live in the aux directory and name the Radeon; a label taken from the group would file
+// them under the GT 1030 chip while they run on the big card. The command line wins.
+func TestTheDeviceLabelFollowsTheDeviceFlag(t *testing.T) {
+	cases := []struct {
+		spec tenantSpec
+		want string
+	}{
+		{tenantSpec{group: "aux", args: []string{"--device", "ROCm0", "-ngl", "99"}}, "RX7900"},
+		{tenantSpec{group: "aux", args: []string{"--device", "CUDA0", "-ngl", "99"}}, "GT1030"},
+		{tenantSpec{group: "aux", args: []string{"-ngl", "99"}}, "GT1030"},
+		{tenantSpec{group: "gpu", args: []string{"--device=ROCm0", "-ngl", "99"}}, "RX7900"},
+		{tenantSpec{group: "aux", args: []string{"--device", "CUDA0", "-ngl", "0"}}, "CPU"},
+	}
+	for _, c := range cases {
+		if got := cardLabel(c.spec); got != c.want {
+			t.Fatalf("cardLabel(%v) = %q, want %q", c.spec.args, got, c.want)
+		}
+	}
+}

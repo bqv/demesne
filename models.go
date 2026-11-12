@@ -283,6 +283,14 @@ func cardLabel(spec tenantSpec) string {
 	if gpuLayers(spec) == 0 && spec.group != "" {
 		return "CPU"
 	}
+	// The command line wins over the group: a rung in the aux directory can name the Radeon (two of
+	// them do), and a label derived from the group would then file a 7900 model under the 1030 chip.
+	switch explicitDevice(spec) {
+	case "ROCm0":
+		return "RX7900"
+	case "CUDA0":
+		return "GT1030"
+	}
 	switch spec.group {
 	case "gpu":
 		return "RX7900"
@@ -290,6 +298,18 @@ func cardLabel(spec tenantSpec) string {
 		return "GT1030"
 	}
 	return "CPU"
+}
+
+func explicitDevice(spec tenantSpec) string {
+	for i, a := range spec.args {
+		if (a == "--device" || a == "-dev") && i+1 < len(spec.args) {
+			return spec.args[i+1]
+		}
+		if strings.HasPrefix(a, "--device=") {
+			return strings.TrimPrefix(a, "--device=")
+		}
+	}
+	return ""
 }
 
 // gpuLayers is how many layers the tenant's own command line offloads. -1 means it did not
