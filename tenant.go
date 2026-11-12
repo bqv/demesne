@@ -476,6 +476,7 @@ func (d *demesne) clearGroupLocked(s *tenant) error {
 			continue
 		}
 		if up, _ := other.isUp(); up {
+			d.drainPeer(other)
 			d.evictLocked(other, stopChat, s.specOf().name+" wants the "+s.specOf().group)
 		}
 	}
@@ -524,6 +525,29 @@ func (d *demesne) clearGroupLocked(s *tenant) error {
 }
 
 func gib(n uint64) string { return fmt.Sprintf("%.1f GiB", float64(n)/(1<<30)) }
+
+// drainPeer waits for a tenant's in-flight request to finish before it is evicted, so that the
+// answer somebody is reading is not destroyed by a request for another model. It is bounded, because
+// a newcomer must not hang for the length of a long generation: past the bound the eviction happens
+// anyway and says so, which is visible rather than silent.
+func (d *demesne) drainPeer(t *tenant) {
+	if atomic.LoadInt64(&t.inflight) == 0 {
+		return
+	}
+	limit := d.cfg.busyWait
+	if limit <= 0 {
+		limit = 30 * time.Second
+	}
+	deadline := time.Now().Add(limit)
+	for atomic.LoadInt64(&t.inflight) > 0 && time.Now().Before(deadline) {
+		time.Sleep(200 * time.Millisecond)
+	}
+	if n := atomic.LoadInt64(&t.inflight); n > 0 {
+		log.Printf("%s is still answering (%d request(s)) after %s; evicting anyway", t.specOf().name, n, limit)
+		return
+	}
+	log.Printf("%s finished its request; taking the card", t.specOf().name)
+}
 
 func (d *demesne) spawnLocked(s *tenant) error {
 	if d.closing.Load() {

@@ -245,6 +245,7 @@ func (d *demesne) stopOnDemandOn(device string) []string {
 		if deviceOf(t.specOf()) != device {
 			continue
 		}
+		d.drainPeer(t)
 		d.evict(t, stopOperator, "a reservation on "+device+" wants the card")
 		stopped = append(stopped, t.specOf().name)
 	}

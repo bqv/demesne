@@ -1033,6 +1033,7 @@ func (d *demesne) claimCard(w http.ResponseWriter, r *http.Request, s *tenant) b
 	// the group -- least recently used first -- but never from the tenant it is being routed
 	// to, and never from a resident one: resident is the operator saying keep it.
 	for _, other := range d.cardSiblings(s) {
+		d.drainPeer(other)
 		d.evict(other, stopChat, "a request for "+s.specOf().name+" wants the card")
 	}
 	return true
