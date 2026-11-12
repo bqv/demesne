@@ -1260,7 +1260,16 @@ func (d *demesne) applyTenantsFile() bool {
 	for _, note := range notes {
 		log.Printf("%s", note)
 	}
-	log.Printf("tenants file re-read: %d tenants (was %d); children stopped, the next request starts each one", len(d.tenants), before)
+	// The supervisors were watching the tenants that were just replaced, so they went with them.
+	// A tenant that is meant to be up from boot needs a new one, or a reload quietly turns a
+	// resident embedder into a cold model that nothing restarts until somebody asks.
+	for _, t := range d.tenants {
+		if t.specOf().boot {
+			t.setSupervised(true)
+			go d.supervise(t)
+		}
+	}
+	log.Printf("tenants file re-read: %d tenants (was %d); children stopped, boot tenants restarting", len(d.tenants), before)
 	return true
 }
 
