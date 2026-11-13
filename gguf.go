@@ -291,7 +291,7 @@ func effectiveVRAMMB(spec tenantSpec) int64 {
 		total += kvBytesPerToken(f, argValue(spec, "-ctk", "--cache-type-k"), argValue(spec, "-ctv", "--cache-type-v")) * ctx
 	}
 	total = total / (1 << 20)
-	margin := int64(400)
+	margin := int64(200)
 	if spec.group == "gpu" {
 		margin = 700
 	}

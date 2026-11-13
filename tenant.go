@@ -491,11 +491,19 @@ func (d *demesne) clearGroupLocked(s *tenant) error {
 	// the difference between an external bench holding VRAM and the estate racing it. A request that
 	// fits except for a reservation WAITS for it, because the holder is expected to finish; a request
 	// that does not fit with nothing reserved in the way is refused, as before.
+	dev := deviceOf(s.specOf())
+	// The aux card is small enough that a declared margin decides whether a model fits at all: Kev
+	// declared 1174 MiB against 960 measured and was refused with "needs 1.1 GiB but only 1.1 GiB is
+	// free" while the embedder held the rest, which it then answered 503 for every time. So the aux
+	// card admits on the computed footprint (weights + KV + a small margin); the big card keeps the
+	// declared figure until the computed one is calibrated there.
 	need := uint64(s.specOf().vramMB) << 20
+	if dev != "RX7900" {
+		need = uint64(effectiveVRAMMB(s.specOf())) << 20
+	}
 	if need == 0 {
 		return nil
 	}
-	dev := deviceOf(s.specOf())
 	free, err := freeVRAM(dev)
 	if err != nil {
 		return nil
@@ -516,7 +524,7 @@ func (d *demesne) clearGroupLocked(s *tenant) error {
 	}
 	if free < need {
 		return fmt.Errorf("%s needs %s but only %s of %s is free (see /status: tenants[])",
-			s.specOf().name, gib(need), gib(free), gib(vramTotal()))
+			s.specOf().name, gib(need), gib(free), gib(free+need))
 	}
 	holder, until := d.reserves.holder(dev)
 	return fmt.Errorf("%s needs %s and %s is free, but %s is reserved on %s until %s "+
