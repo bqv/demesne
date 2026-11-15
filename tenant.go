@@ -234,6 +234,7 @@ type tenant struct {
 	timer    *time.Timer
 
 	inflight int64 // requests in flight (atomic): keeps the idle timer off
+	starting bool  // a spawn is under way; guards against two children for one tenant
 
 	owner       *demesne
 	requests    atomic.Int64
@@ -561,6 +562,27 @@ func (d *demesne) spawnLocked(s *tenant) error {
 	if d.closing.Load() {
 		return errors.New("demesne is shutting down")
 	}
+	// A child that exists but has not bound its socket yet is invisible to the port test below, so
+	// two spawns ten seconds apart both pass it: that is how Kev ran twice on 2026-11-15, both
+	// holding /dev/nvidia0, one of them untracked. A spawn while this daemon already has a child for
+	// the tenant is a refusal, whatever the socket says.
+	// The claim is taken under the tenant's own lock, in one step, because two callers can reach
+	// here without the global transition lock and a check-then-spawn is exactly the race that put two
+	// Kev processes on the 1030 on 2026-11-15.
+	s.mu.Lock()
+	if s.child != nil || s.pid != 0 || s.starting {
+		pid := s.pid
+		s.mu.Unlock()
+		return fmt.Errorf("%s already has a child (pid %d) or a spawn in progress; refusing a second one",
+			s.specOf().name, pid)
+	}
+	s.starting = true
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.starting = false
+		s.mu.Unlock()
+	}()
 	// A port already answered by a process demesne does not own is a REFUSAL, not a race:
 	// spawning anyway gets a child that cannot bind, dies with a bare "exit status 1", and
 	// takes the supervisor into a crash loop that reads as the engine's fault. The orphan
