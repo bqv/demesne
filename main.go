@@ -1233,7 +1233,7 @@ func tenantStatusOf(s *tenant) tenantStatus {
 		State: tenantState(spec, s), Listen: spec.url, ListenPort: s.port(),
 		Group: spec.group, Policy: spec.policy.String(), Owned: spec.own(),
 		VRAMMB: int(effectiveVRAMMB(spec)), ReloadS: reloadCostSeconds(spec), Idle: idleString(spec),
-		Activity: activityOfForStatus(s), NCtx: configuredCtx(spec), NParams: ggufOf(modelPath(spec)).NParams,
+		Activity: s.activity, NCtx: configuredCtx(spec), NParams: ggufOf(modelPath(spec)).NParams,
 		SizeBytes: ggufOf(modelPath(spec)).SizeByte, Quant: ggufOf(modelPath(spec)).Quant,
 		Up: s.up, Booting: s.up && s.readyAt.IsZero(), PID: s.pid,
 		InFlight: atomic.LoadInt64(&s.inflight), Restarts: s.restarts,

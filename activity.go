@@ -100,11 +100,3 @@ func (d *demesne) followActivity() {
 		}
 	}
 }
-
-// activityOfForStatus reads the pointer under the same lock the poller writes it with; a status read
-// that raced the poller was a data race the detector would flag, however benign the pointer.
-func activityOfForStatus(s *tenant) *tenantActivity {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.activity
-}
