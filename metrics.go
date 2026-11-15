@@ -198,7 +198,7 @@ func (d *demesne) metrics() metricsDoc {
 		sortStrings(doc.Models[tenant])
 	}
 
-	for _, s := range d.tenants {
+	for _, s := range d.tenantSnapshot() {
 		spec := s.specOf()
 		st := tenantStatusOf(s)
 		m := tenantMetrics{

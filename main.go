@@ -569,7 +569,8 @@ type demesne struct {
 	tenants []*tenant
 	index   map[string]*tenant
 
-	transition sync.Mutex // one transition at a time; never held across a proxy
+	transition sync.Mutex   // one transition at a time; never held across a proxy
+	stateMu    sync.RWMutex // guards the tenant tables: reloads replace them while requests read
 	proxies    map[string]*httputil.ReverseProxy
 	// probes is the same proxy without the health watch. A request that does not claim the
 	// card must not be able to condemn the engine either: a monitoring loop polling /metrics
@@ -628,7 +629,7 @@ func newDemesne(cfg config) *demesne {
 	} else {
 		d.llm = newLLMWatch()
 	}
-	for _, s := range d.tenants {
+	for _, s := range d.tenantSnapshot() {
 		d.proxies[s.specOf().name] = reverseProxy(d, s, s.specOf().router)
 		d.probes[s.specOf().name] = reverseProxy(d, s, false)
 		// A resident tenant is somebody's responsibility from the start. A reload can hand
@@ -641,7 +642,31 @@ func newDemesne(cfg config) *demesne {
 	return d
 }
 
-func (d *demesne) tenantByName(name string) *tenant { return d.index[name] }
+func (d *demesne) tenantByName(name string) *tenant {
+	d.stateMu.RLock()
+	defer d.stateMu.RUnlock()
+	return d.index[name]
+}
+
+// tenantSnapshot is the list a background loop or a status read may walk: a reload replaces d.tenants
+// under the write lock, and appending to a slice another goroutine is ranging over is a torn read.
+func (d *demesne) tenantSnapshot() []*tenant {
+	d.stateMu.RLock()
+	defer d.stateMu.RUnlock()
+	return append([]*tenant(nil), d.tenants...)
+}
+
+func (d *demesne) proxyFor(name string) *httputil.ReverseProxy {
+	d.stateMu.RLock()
+	defer d.stateMu.RUnlock()
+	return d.proxies[name]
+}
+
+func (d *demesne) probeFor(name string) *httputil.ReverseProxy {
+	d.stateMu.RLock()
+	defer d.stateMu.RUnlock()
+	return d.probes[name]
+}
 
 // ------------------------------------------------------------------- the card
 
@@ -885,7 +910,7 @@ func (d *demesne) route(w http.ResponseWriter, r *http.Request, in intent) {
 			writeModelNotFound(w, pk.model, d.knownModels())
 			return
 		}
-		if pk.model != "" && d.index[in.tenant].specOf().own() {
+		if pk.model != "" && d.tenantByName(in.tenant).specOf().own() {
 			d.loads.noteRequest(in.tenant, pk.model)
 		}
 	}
@@ -922,7 +947,7 @@ func (d *demesne) route(w http.ResponseWriter, r *http.Request, in intent) {
 			return
 		}
 		atomic.AddInt64(&s.inflight, 1)
-		d.proxies[s.specOf().name].ServeHTTP(w, r)
+		d.proxyFor(s.specOf().name).ServeHTTP(w, r)
 		atomic.AddInt64(&s.inflight, -1)
 		// Re-arm from the END of the request. ensure() touches BEFORE the render, and a
 		// cold render takes ~8-10 min, so a 5-minute timer armed there would kill the
@@ -936,10 +961,10 @@ func (d *demesne) route(w http.ResponseWriter, r *http.Request, in intent) {
 				http.StatusServiceUnavailable)
 			return
 		}
-		d.proxies[s.specOf().name].ServeHTTP(w, r)
+		d.proxyFor(s.specOf().name).ServeHTTP(w, r)
 
 	case kindMetadata, kindProxy:
-		d.probes[s.specOf().name].ServeHTTP(w, r)
+		d.probeFor(s.specOf().name).ServeHTTP(w, r)
 
 	default: // kindChat
 		if !d.claimCard(w, r, s) {
@@ -963,7 +988,7 @@ func (d *demesne) route(w http.ResponseWriter, r *http.Request, in intent) {
 				return
 			}
 		}
-		d.proxies[s.specOf().name].ServeHTTP(w, r)
+		d.proxyFor(s.specOf().name).ServeHTTP(w, r)
 	}
 }
 
@@ -1046,7 +1071,7 @@ func (d *demesne) defaultTenant() *tenant {
 	if s := d.tenantByName("llama"); s != nil {
 		return s
 	}
-	for _, s := range d.tenants {
+	for _, s := range d.tenantSnapshot() {
 		if s.specOf().router && s.specOf().routed {
 			return s
 		}
@@ -1062,7 +1087,7 @@ func (d *demesne) cardSiblings(s *tenant) []*tenant {
 		return nil
 	}
 	var out []*tenant
-	for _, other := range d.tenants {
+	for _, other := range d.tenantSnapshot() {
 		spec := other.specOf()
 		if other == s || spec.group != group || !spec.vram || spec.policy == policyResident {
 			continue
@@ -1122,8 +1147,9 @@ type tenantStatus struct {
 }
 
 func (d *demesne) tenantStatuses() []tenantStatus {
-	out := make([]tenantStatus, 0, len(d.tenants))
-	for _, s := range d.tenants {
+	tenants := d.tenantSnapshot()
+	out := make([]tenantStatus, 0, len(tenants))
+	for _, s := range d.tenantSnapshot() {
 		out = append(out, tenantStatusOf(s))
 	}
 	return out
@@ -1207,7 +1233,7 @@ func tenantStatusOf(s *tenant) tenantStatus {
 		State: tenantState(spec, s), Listen: spec.url, ListenPort: s.port(),
 		Group: spec.group, Policy: spec.policy.String(), Owned: spec.own(),
 		VRAMMB: int(effectiveVRAMMB(spec)), ReloadS: reloadCostSeconds(spec), Idle: idleString(spec),
-		Activity: s.activity, NCtx: configuredCtx(spec), NParams: ggufOf(modelPath(spec)).NParams,
+		Activity: activityOfForStatus(s), NCtx: configuredCtx(spec), NParams: ggufOf(modelPath(spec)).NParams,
 		SizeBytes: ggufOf(modelPath(spec)).SizeByte, Quant: ggufOf(modelPath(spec)).Quant,
 		Up: s.up, Booting: s.up && s.readyAt.IsZero(), PID: s.pid,
 		InFlight: atomic.LoadInt64(&s.inflight), Restarts: s.restarts,
@@ -1353,7 +1379,7 @@ func (d *demesne) card(w http.ResponseWriter, r *http.Request) {
 // cannot drift apart: one builds it, the other wraps it.
 func (d *demesne) cardDocument(group string) estateCard {
 	out := estateCard{Group: group, Holders: []string{}, Tenants: []cardTenant{}}
-	for _, s := range d.tenants {
+	for _, s := range d.tenantSnapshot() {
 		if s.specOf().group != group {
 			continue
 		}
@@ -1418,7 +1444,7 @@ func (d *demesne) handleRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	released := []string{}
-	for _, s := range d.tenants {
+	for _, s := range d.tenantSnapshot() {
 		if name != "" && s.specOf().name != name {
 			continue
 		}
@@ -1545,7 +1571,7 @@ func main() {
 
 	// A port answering before demesne started the engine is either a leftover or
 	// another supervisor; either way it is the collision this program refuses to race.
-	for _, s := range d.tenants {
+	for _, s := range d.tenantSnapshot() {
 		if s.specOf().url == "" || s.specOf().policy == policyExternal {
 			continue
 		}
@@ -1556,7 +1582,7 @@ func main() {
 	}
 
 	d.prepareCgroupRoot()
-	for _, s := range d.tenants {
+	for _, s := range d.tenantSnapshot() {
 		d.prepareCgroup(s)
 	}
 
@@ -1589,7 +1615,7 @@ func main() {
 		os.Exit(0)
 	}()
 
-	for _, s := range d.tenants {
+	for _, s := range d.tenantSnapshot() {
 		if s.specOf().boot {
 			go d.supervise(s)
 		}

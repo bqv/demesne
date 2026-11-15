@@ -66,7 +66,7 @@ func newModelIndex() modelIndex {
 // what makes a declared model routable on the first request rather than after a refresh.
 func (d *demesne) seedModels() {
 	byModel := make(map[string]string)
-	for _, s := range d.tenants {
+	for _, s := range d.tenantSnapshot() {
 		if !s.specOf().router || !s.specOf().routed {
 			continue
 		}
@@ -90,7 +90,7 @@ func (d *demesne) refreshModels() {
 	next := make(map[string]string)
 	loaded := make(map[string]int)
 	known := make(map[string]bool)
-	for _, s := range d.tenants {
+	for _, s := range d.tenantSnapshot() {
 		if !s.specOf().router || !s.specOf().routed {
 			continue
 		}
@@ -112,7 +112,7 @@ func (d *demesne) refreshModels() {
 	// unknown after every restart and a request for one falls through to the router instead of
 	// reaching the tenant (or refusing). A live answer wins a clash, because it is the engine's
 	// own word; the configured list is what the engine is known to serve.
-	for _, s := range d.tenants {
+	for _, s := range d.tenantSnapshot() {
 		if !s.specOf().routed {
 			continue
 		}
@@ -141,8 +141,8 @@ func (d *demesne) logModelIndex(byModel map[string]string) {
 	for id, tenant := range byModel {
 		per[tenant] = append(per[tenant], id)
 	}
-	parts := make([]string, 0, len(d.tenants))
-	for _, s := range d.tenants {
+	parts := make([]string, 0, len(d.tenantSnapshot()))
+	for _, s := range d.tenantSnapshot() {
 		if ids := per[s.specOf().name]; len(ids) > 0 {
 			parts = append(parts, s.specOf().name+"("+strings.Join(ids, " ")+")")
 		}
@@ -391,7 +391,7 @@ func writeModelNotFound(w http.ResponseWriter, model string, known []string) {
 func (d *demesne) modelsHandler(w http.ResponseWriter, r *http.Request) {
 	data := []json.RawMessage{}
 	seen := map[string]bool{}
-	for _, s := range d.tenants {
+	for _, s := range d.tenantSnapshot() {
 		if !s.specOf().routed {
 			continue
 		}

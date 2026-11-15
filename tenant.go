@@ -469,20 +469,32 @@ func (d *demesne) clearGroupLocked(s *tenant) error {
 	if s.specOf().group == "" {
 		return nil
 	}
-	for _, other := range d.tenants {
-		if other == s || other.specOf().group != s.specOf().group {
-			continue
-		}
-		if other.specOf().policy == policyResident {
-			continue
-		}
-		if up, _ := other.isUp(); up {
-			d.drainPeer(other)
-			d.evictLocked(other, stopChat, s.specOf().name+" wants the "+s.specOf().group)
-		}
-	}
+	// Peers are evicted only while the newcomer does not FIT, oldest use first, and never merely
+	// because it is a peer: Kev (998 MiB) and the embedder (921) share a 2048 MiB card comfortably,
+	// and evicting every sibling unconditionally made them kill each other in a loop -- each request
+	// for one stopped the other, which then came back and stopped it in turn, for as long as anything
+	// polled either of them.
 	if !s.specOf().vram {
 		return nil
+	}
+	dev := deviceOf(s.specOf())
+	needHere := uint64(s.specOf().vramMB) << 20
+	if dev != "RX7900" {
+		needHere = uint64(effectiveVRAMMB(s.specOf())) << 20
+	}
+	if free, err := freeVRAM(dev); err == nil && needHere > 0 && free < needHere {
+		for _, other := range d.cardSiblings(s) {
+			if other == s || other.specOf().policy == policyResident {
+				continue
+			}
+			if up, _ := other.isUp(); up {
+				d.drainPeer(other)
+				d.evictLocked(other, stopChat, s.specOf().name+" wants the "+s.specOf().group)
+				if free += uint64(other.specOf().vramMB) << 20; free >= needHere {
+					break
+				}
+			}
+		}
 	}
 	// Nothing to ask a router to unload any more: a tenant's model is its own process, and the
 	// peers that could be in the way were stopped above. What is left is arithmetic, and a
@@ -492,7 +504,6 @@ func (d *demesne) clearGroupLocked(s *tenant) error {
 	// the difference between an external bench holding VRAM and the estate racing it. A request that
 	// fits except for a reservation WAITS for it, because the holder is expected to finish; a request
 	// that does not fit with nothing reserved in the way is refused, as before.
-	dev := deviceOf(s.specOf())
 	// The aux card is small enough that a declared margin decides whether a model fits at all: Kev
 	// declared 1174 MiB against 960 measured and was refused with "needs 1.1 GiB but only 1.1 GiB is
 	// free" while the embedder held the rest, which it then answered 503 for every time. So the aux
@@ -965,7 +976,7 @@ func backoff(crashes int) time.Duration {
 func (d *demesne) stopAll(why string) {
 	d.transition.Lock()
 	defer d.transition.Unlock()
-	for _, s := range d.tenants {
+	for _, s := range d.tenantSnapshot() {
 		if up, _ := s.isUp(); up {
 			d.evictLocked(s, stopOperator, why)
 		}
@@ -1108,7 +1119,7 @@ func (d *demesne) maintainCgroups() {
 		case <-d.done:
 			return
 		case <-t.C:
-			for _, s := range d.tenants {
+			for _, s := range d.tenantSnapshot() {
 				d.maintainCgroup(s)
 			}
 		}
@@ -1308,13 +1319,14 @@ func (d *demesne) applyTenantsFile() bool {
 		log.Printf("tenants file changed but is not usable (%v); keeping the running set", err)
 		return false
 	}
-	before := len(d.tenants)
+	before := len(d.tenantSnapshot())
 	d.transition.Lock()
-	for _, t := range d.tenants {
+	for _, t := range d.tenantSnapshot() {
 		if up, _ := t.isUp(); up {
 			d.evictLocked(t, stopOperator, "the tenants file changed")
 		}
 	}
+	d.stateMu.Lock()
 	d.tenants = nil
 	d.index = map[string]*tenant{}
 	d.proxies = map[string]*httputil.ReverseProxy{}
@@ -1326,6 +1338,7 @@ func (d *demesne) applyTenantsFile() bool {
 		d.proxies[spec.name] = reverseProxy(d, t, spec.router)
 		d.probes[spec.name] = reverseProxy(d, t, false)
 	}
+	d.stateMu.Unlock()
 	d.models = newModelIndex()
 	d.seedModels()
 	d.transition.Unlock()
@@ -1335,13 +1348,13 @@ func (d *demesne) applyTenantsFile() bool {
 	// The supervisors were watching the tenants that were just replaced, so they went with them.
 	// A tenant that is meant to be up from boot needs a new one, or a reload quietly turns a
 	// resident embedder into a cold model that nothing restarts until somebody asks.
-	for _, t := range d.tenants {
+	for _, t := range d.tenantSnapshot() {
 		if t.specOf().boot {
 			t.setSupervised(true)
 			go d.supervise(t)
 		}
 	}
-	log.Printf("tenants file re-read: %d tenants (was %d); children stopped, boot tenants restarting", len(d.tenants), before)
+	log.Printf("tenants file re-read: %d tenants (was %d); children stopped, boot tenants restarting", len(d.tenantSnapshot()), before)
 	return true
 }
 

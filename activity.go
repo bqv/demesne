@@ -40,7 +40,7 @@ func (d *demesne) slotsClient(s *tenant) (*http.Client, string) {
 // which is cheaper than the /v1/models polling the router path used to do and tells a meter what a
 // load board cannot.
 func (d *demesne) pollActivity() {
-	for _, s := range d.tenants {
+	for _, s := range d.tenantSnapshot() {
 		up, _ := s.isUp()
 		if !up || s.booting() {
 			continue
@@ -99,4 +99,12 @@ func (d *demesne) followActivity() {
 			d.pollActivity()
 		}
 	}
+}
+
+// activityOfForStatus reads the pointer under the same lock the poller writes it with; a status read
+// that raced the poller was a data race the detector would flag, however benign the pointer.
+func activityOfForStatus(s *tenant) *tenantActivity {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.activity
 }

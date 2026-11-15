@@ -211,7 +211,7 @@ func (d *demesne) handleReserveRelease(w http.ResponseWriter, r *http.Request) {
 func (d *demesne) reclaimableOn(device string) (uint64, []*tenant) {
 	var bytes uint64
 	var out []*tenant
-	for _, t := range d.tenants {
+	for _, t := range d.tenantSnapshot() {
 		up, _ := t.isUp()
 		if !up || t.specOf().policy != policyOnDemand {
 			continue
@@ -237,7 +237,7 @@ func (d *demesne) reclaimableBytes(ts []*tenant) uint64 {
 // that quietly took somebody's model away would be indistinguishable from a crash.
 func (d *demesne) stopOnDemandOn(device string) []string {
 	var stopped []string
-	for _, t := range d.tenants {
+	for _, t := range d.tenantSnapshot() {
 		up, _ := t.isUp()
 		if !up || t.specOf().policy != policyOnDemand {
 			continue
@@ -252,7 +252,7 @@ func (d *demesne) stopOnDemandOn(device string) []string {
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		busy := false
-		for _, t := range d.tenants {
+		for _, t := range d.tenantSnapshot() {
 			if up, _ := t.isUp(); up && deviceOf(t.specOf()) == device {
 				busy = true
 				break

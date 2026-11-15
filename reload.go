@@ -172,8 +172,8 @@ func (d *demesne) reload() (reloadReport, error) {
 	d.transition.Lock()
 	defer d.transition.Unlock()
 
-	names := make([]string, 0, len(d.tenants))
-	for _, s := range d.tenants {
+	names := make([]string, 0, len(d.tenantSnapshot()))
+	for _, s := range d.tenantSnapshot() {
 		names = append(names, s.specOf().name)
 	}
 	sort.Strings(names)

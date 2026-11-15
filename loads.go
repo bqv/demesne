@@ -695,7 +695,7 @@ func (d *demesne) routerModels(s *tenant) (map[string]string, error) {
 
 func (d *demesne) pollLoads() {
 	var active []string
-	for _, s := range d.tenants {
+	for _, s := range d.tenantSnapshot() {
 		if !s.specOf().router {
 			continue
 		}

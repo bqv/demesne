@@ -217,8 +217,8 @@ func (d *demesne) unknownTenant(name string) *rpcError {
 }
 
 func (d *demesne) tenantNames() []string {
-	out := make([]string, 0, len(d.tenants))
-	for _, s := range d.tenants {
+	out := make([]string, 0, len(d.tenantSnapshot()))
+	for _, s := range d.tenantSnapshot() {
 		out = append(out, s.specOf().name)
 	}
 	return out
