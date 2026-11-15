@@ -1054,12 +1054,23 @@ func (d *demesne) claimCard(w http.ResponseWriter, r *http.Request, s *tenant) b
 			d.evict(sd, stopChat, "a chat request wants the card")
 		}
 	}
-	// Sibling MODEL tenants share the card too. A request may take it from any other tenant in
-	// the group -- least recently used first -- but never from the tenant it is being routed
-	// to, and never from a resident one: resident is the operator saying keep it.
-	for _, other := range d.cardSiblings(s) {
-		d.drainPeer(other)
-		d.evict(other, stopChat, "a request for "+s.specOf().name+" wants the card")
+	// Sibling MODEL tenants share the card too, but only a request that does NOT FIT may take it
+	// from them: evicting every sibling unconditionally is what made Kev and the embedder kill each
+	// other on a card where they fit together (998 + 921 MiB on 2048). Same rule as the admission
+	// path: measure, then evict least-recently-used until the newcomer fits.
+	dev := deviceOf(s.specOf())
+	need := uint64(s.specOf().vramMB) << 20
+	if dev != "RX7900" {
+		need = uint64(effectiveVRAMMB(s.specOf())) << 20
+	}
+	if free, err := freeVRAM(dev); err == nil && need > 0 && free < need {
+		for _, other := range d.cardSiblings(s) {
+			d.drainPeer(other)
+			d.evict(other, stopChat, "a request for "+s.specOf().name+" wants the card")
+			if free += uint64(other.specOf().vramMB) << 20; free >= need {
+				break
+			}
+		}
 	}
 	return true
 }
