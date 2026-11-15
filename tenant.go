@@ -477,6 +477,13 @@ func (d *demesne) clearGroupLocked(s *tenant) error {
 	if !s.specOf().vram {
 		return nil
 	}
+	// A tenant that is already up needs no room, so it needs no peer evicted: its own memory is
+	// already part of "used", which makes `free < need` TRUE for it by construction and evicted a
+	// sibling to make room that was never wanted. That is what stopped the embedder at 17:25 {"a
+	// request for Kev wants the card"} with the card holding 27 MiB and nothing else.
+	if up, _ := s.isUp(); up {
+		return nil
+	}
 	dev := deviceOf(s.specOf())
 	needHere := uint64(s.specOf().vramMB) << 20
 	if dev != "RX7900" {

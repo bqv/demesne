@@ -1058,10 +1058,14 @@ func (d *demesne) claimCard(w http.ResponseWriter, r *http.Request, s *tenant) b
 	// from them: evicting every sibling unconditionally is what made Kev and the embedder kill each
 	// other on a card where they fit together (998 + 921 MiB on 2048). Same rule as the admission
 	// path: measure, then evict least-recently-used until the newcomer fits.
+	// Only a tenant that is not already up can want room; an up one is already paid for in "used".
 	dev := deviceOf(s.specOf())
 	need := uint64(s.specOf().vramMB) << 20
 	if dev != "RX7900" {
 		need = uint64(effectiveVRAMMB(s.specOf())) << 20
+	}
+	if up, _ := s.isUp(); up {
+		need = 0
 	}
 	if free, err := freeVRAM(dev); err == nil && need > 0 && free < need {
 		for _, other := range d.cardSiblings(s) {
