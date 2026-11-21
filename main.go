@@ -862,6 +862,32 @@ func (d *demesne) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// "does this endpoint exist" free: 200 for a path the estate serves, 404 otherwise.
 	if r.Method == http.MethodHead {
 		w.Header().Set("X-Demesne", version)
+		// A HEAD on /tenants/<name> IS a per-model probe: the name is in the path, so no body is
+		// needed to say which model is being asked about. It answers from the estate's book --
+		// declared, cold, loading, ready, failed -- and never spawns anything. The model name and
+		// its aliases resolve here too, so a caller can ask about the name it uses in a request.
+		if name, ok := strings.CutPrefix(p, "/tenants/"); ok && name != "" && !strings.Contains(name, "/") {
+			tenant := d.tenantByName(name)
+			if tenant == nil {
+				if resolved := d.tenantForModel(name); resolved != "" {
+					tenant = d.tenantByName(resolved)
+				}
+			}
+			if tenant == nil {
+				w.Header().Set("X-Demesne-Known", "no")
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			st := tenantStatusOf(tenant)
+			w.Header().Set("X-Demesne-Tenant", st.Name)
+			w.Header().Set("X-Demesne-State", st.State)
+			w.Header().Set("X-Demesne-Device", st.Device)
+			w.Header().Set("X-Demesne-Kind", st.Kind)
+			w.Header().Set("X-Demesne-Policy", st.Policy)
+			w.Header().Set("X-Demesne-VramMB", strconv.Itoa(st.VRAMMB))
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		if d.servesPath(p) {
 			w.WriteHeader(http.StatusOK)
 			return
