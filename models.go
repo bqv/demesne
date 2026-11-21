@@ -432,3 +432,18 @@ func (d *demesne) modelsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})
 }
+
+// servesPath reports whether this URL path is one the estate answers, without touching a tenant.
+func (d *demesne) servesPath(p string) bool {
+	switch {
+	case p == "/status", p == "/v1/models", p == "/estate/card", p == "/estate/metrics",
+		p == "/reload", p == "/rpc", p == "/reserve":
+		return true
+	}
+	for _, prefix := range []string{"/v1/", "/tenants/", "/slots/", "/reserve/", "/sdapi/", "/inference/"} {
+		if strings.HasPrefix(p, prefix) {
+			return true
+		}
+	}
+	return false
+}

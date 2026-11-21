@@ -856,6 +856,28 @@ func clientWentAway(r *http.Request, err error) bool {
 
 func (d *demesne) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Path
+	// A HEAD is a question about the PATH, not about a model -- it carries no body, so it cannot
+	// name one. Routing it anyway sent it to the default tenant, which spawned a model (a 20-40 s
+	// cold load, evicting whatever was resident) to answer a liveness check. Answering here keeps
+	// "does this endpoint exist" free: 200 for a path the estate serves, 404 otherwise.
+	if r.Method == http.MethodHead {
+		w.Header().Set("X-Demesne", version)
+		if d.servesPath(p) {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	// An inference path answers POST (and sd's own verbs); a GET there is a question about the
+	// endpoint, not a request that could be fulfilled, and answering it by spawning a model is the
+	// same mistake HEAD made. 405 with Allow, no tenant touched.
+	if p != "/v1/models" && d.servesPath(p) && (r.Method == http.MethodGet || r.Method == http.MethodOptions) &&
+		strings.HasPrefix(p, "/v1/") {
+		w.Header().Set("Allow", "POST")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
 	switch {
 	case p == "/status":
 		d.status(w)
